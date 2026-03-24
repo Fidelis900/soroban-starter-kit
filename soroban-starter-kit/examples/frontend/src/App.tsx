@@ -6,7 +6,7 @@ import { SyncStatus, OfflineIndicator } from './components/SyncStatus';
 import { useConnectivity } from './context/ConnectivityContext';
 import { useStorage } from './context/StorageContext';
 import { useTransactionQueue } from './context/TransactionQueueContext';
-import { MarketplaceContainer } from './components/marketplace/MarketplaceContainer';
+
 /**
  * Main App Component
  * Demonstrates offline functionality with balances and transactions
@@ -25,7 +25,7 @@ function App(): JSX.Element {
     resolveConflict,
   } = useTransactionQueue();
 
-  const [activeTab, setActiveTab] = useState<'balances' | 'pending' | 'history' | 'marketplace'>('balances');
+  const [activeTab, setActiveTab] = useState<'balances' | 'pending' | 'history'>('balances');
   const [isDemoLoading, setIsDemoLoading] = useState(false);
 
   // Demo function to simulate transaction submission
@@ -138,13 +138,6 @@ function App(): JSX.Element {
           >
             ✓ Synced History ({syncedTransactions.length})
           </button>
-          <button
-            onClick={() => setActiveTab('marketplace')}
-            className={activeTab === 'marketplace' ? 'btn btn-primary' : 'btn btn-secondary'}
-            style={{ backgroundColor: activeTab === 'marketplace' ? 'var(--color-highlight)' : 'transparent', marginLeft: 'auto' }}
-          >
-            🛍️ Marketplace
-          </button>
         </div>
 
         {/* Content Area */}
@@ -206,14 +199,10 @@ function App(): JSX.Element {
                 />
               </>
             )}
-
-            {activeTab === 'marketplace' && (
-              <MarketplaceContainer />
-            )}
           </div>
 
           {/* Sidebar */}
-          <div style={{ display: activeTab === 'marketplace' ? 'none' : 'block' }}>
+          <div>
             <SyncStatus />
             
             {/* Storage Info */}

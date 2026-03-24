@@ -1,9 +1,5 @@
 # Soroban Contract Templates
 
-[![Built for Soroban](https://img.shields.io/badge/Built%20for-Soroban-blue)](https://soroban.stellar.org/)
-[![Stellar Wave Ready](https://img.shields.io/badge/Stellar%20Wave-Ready-green)](https://www.drips.network/wave)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-
 A curated, well-documented collection of production-ready, modular Soroban smart contract templates and examples. These help new and experienced developers quickly bootstrap common use cases on Soroban (Stellar's smart contract platform), lowering the barrier to building dApps, DeFi, NFTs, payments, and more.
 
 This repository aims to fill gaps beyond the official [stellar/soroban-examples](https://github.com/stellar/soroban-examples) by including more real-world patterns, best practices, comprehensive tests, deployment scripts, and frontend integration stubs.

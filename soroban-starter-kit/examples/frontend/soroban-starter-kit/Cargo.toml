@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "contracts/token",
+    "contracts/escrow",
+]
+resolver = "2"
+
+[workspace.dependencies]
+soroban-sdk = "21"
+
+[workspace.metadata]
+name = "soroban-contract-templates"
+description = "Production-ready Soroban smart contract templates"
+authors = ["Soroban Templates Contributors"]
+license = "Apache-2.0"

@@ -4,18 +4,14 @@ import App from './App';
 import { ConnectivityProvider } from './context/ConnectivityContext';
 import { StorageProvider } from './context/StorageContext';
 import { TransactionQueueProvider } from './context/TransactionQueueContext';
-import { MarketplaceProvider } from './context/MarketplaceContext';
 import './styles/index.css';
-import './styles/marketplace.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConnectivityProvider>
       <StorageProvider>
         <TransactionQueueProvider>
-          <MarketplaceProvider>
-            <App />
-          </MarketplaceProvider>
+          <App />
         </TransactionQueueProvider>
       </StorageProvider>
     </ConnectivityProvider>
