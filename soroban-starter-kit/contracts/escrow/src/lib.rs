@@ -83,11 +83,15 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::BuyerApproved, &false);
         env.storage().instance().set(&DataKey::SellerDelivered, &false);
 
-        // Emit event
-        env.events().publish(
-            (Symbol::new(&env, "escrow_created"), buyer.clone(), seller.clone()),
-            amount,
-        );
+         // Emit enhanced event for logging and analysis
+         env.events().publish(
+             (Symbol::new(&env, "escrow_created"), buyer.clone(), seller.clone(), token_contract.clone()),
+             (
+                 amount,
+                 deadline_ledger,
+                 arbiter.clone()
+             )
+         );
 
         Ok(())
     }
@@ -115,8 +119,8 @@ impl EscrowContract {
         // Update state
         env.storage().instance().set(&DataKey::State, &EscrowState::Funded);
 
-        // Emit event
-        env.events().publish((Symbol::new(&env, "escrow_funded"), buyer), amount);
+         // Emit enhanced event for logging and analysis
+         env.events().publish((Symbol::new(&env, "escrow_funded"), buyer, token_contract), amount);
 
         Ok(())
     }
@@ -138,8 +142,8 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::SellerDelivered, &true);
         env.storage().instance().set(&DataKey::State, &EscrowState::Delivered);
 
-        // Emit event
-        env.events().publish((Symbol::new(&env, "delivery_marked"), seller), ());
+         // Emit enhanced event for logging and analysis
+         env.events().publish((Symbol::new(&env, "delivery_marked"), seller, token_contract), ());
 
         Ok(())
     }
@@ -260,8 +264,8 @@ impl EscrowContract {
         // Update state
         env.storage().instance().set(&DataKey::State, &EscrowState::Completed);
 
-        // Emit event
-        env.events().publish((Symbol::new(&env, "funds_released"), seller), amount);
+         // Emit enhanced event for logging and analysis
+         env.events().publish((Symbol::new(&env, "funds_released"), seller, token_contract), amount);
 
         Ok(())
     }

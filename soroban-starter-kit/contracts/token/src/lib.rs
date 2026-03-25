@@ -75,8 +75,8 @@ impl TokenContract {
         // Initialize total supply to 0
         env.storage().instance().set(&DataKey::TotalSupply, &0i128);
 
-        // Emit initialization event
-        env.events().publish((Symbol::new(&env, "initialize"), admin.clone()), (name, symbol, decimals));
+         // Emit enhanced initialization event for logging and analysis
+         env.events().publish((Symbol::new(&env, "initialize"), admin.clone()), (name, symbol, decimals));
 
         Ok(())
     }
@@ -104,8 +104,8 @@ impl TokenContract {
             .unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalSupply, &(total_supply + amount));
 
-        // Emit event
-        env.events().publish((Symbol::new(&env, "mint"), to), amount);
+         // Emit enhanced event for logging and analysis
+         env.events().publish((Symbol::new(&env, "mint"), to, admin), amount);
 
         Ok(())
     }
@@ -137,8 +137,8 @@ impl TokenContract {
             .unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalSupply, &(total_supply - amount));
 
-        // Emit event
-        env.events().publish((Symbol::new(&env, "burn"), from), amount);
+         // Emit enhanced event for logging and analysis
+         env.events().publish((Symbol::new(&env, "burn"), from, admin), amount);
 
         Ok(())
     }

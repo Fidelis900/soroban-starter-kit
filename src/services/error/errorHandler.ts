@@ -3,6 +3,8 @@
  * Manages error categorization, logging, and recovery
  */
 
+import { loggingService } from '../../services/logging';
+
 export type ErrorCategory = 'network' | 'validation' | 'auth' | 'permission' | 'server' | 'client' | 'unknown';
 export type ErrorSeverity = 'low' | 'medium' | 'high' | 'critical';
 
@@ -110,8 +112,16 @@ class ErrorHandler {
    * Log error
    */
   private logError(error: ErrorInfo): void {
+    // Log to console
     const logLevel = error.severity === 'critical' ? 'error' : 'warn';
-    console[logLevel as any](`[${error.category}] ${error.message}`, error);
+    if (logLevel === 'error') {
+      console.error(`[${error.category}] ${error.message}`, error);
+    } else {
+      console.warn(`[${error.category}] ${error.message}`, error);
+    }
+    
+    // Also send to logging service
+    loggingService.logError(error, 'ErrorHandler');
   }
 
   /**
