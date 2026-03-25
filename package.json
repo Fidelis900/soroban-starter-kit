@@ -17,6 +17,7 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
+    "@axe-core/react": "^4.11.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -24,10 +25,21 @@
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.1",
+    "@vitest/coverage-v8": "^4.1.1",
+    "@vitest/ui": "^4.1.1",
+    "axe-core": "^4.11.1",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.0.1",
+    "msw": "^2.12.14",
     "typescript": "^5.3.3",
     "vite": "^5.0.10",
     "vite-plugin-pwa": "^0.17.4",
-    "vitest": "^4.1.1"
+    "vitest": "^4.1.1",
+    "workbox-background-sync": "^7.4.0",
+    "workbox-cacheable-response": "^7.4.0",
+    "workbox-expiration": "^7.4.0",
+    "workbox-precaching": "^7.4.0",
+    "workbox-routing": "^7.4.0",
+    "workbox-strategies": "^7.4.0"
   }
 }
