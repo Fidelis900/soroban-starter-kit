@@ -1,12 +1,13 @@
 {
   "name": "fidelis-soroban-frontend",
   "version": "1.0.0",
-  "description": "Fidelis Soroban DApp with offline support",
+  "description": "Fidelis Soroban DApp with offline support & API Explorer",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "explorer": "npx serve . -p 3000"
   },
   "dependencies": {
     "@stellar/freighter-api": "^1.7.1",
@@ -31,6 +32,7 @@
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.0.1",
     "msw": "^2.12.14",
+    "serve": "^14.2.3",
     "typescript": "^5.3.3",
     "vite": "^5.0.10",
     "vite-plugin-pwa": "^0.17.4",
@@ -41,5 +43,8 @@
     "workbox-precaching": "^7.4.0",
     "workbox-routing": "^7.4.0",
     "workbox-strategies": "^7.4.0"
-  }
+  },
+  "keywords": ["soroban", "stellar", "smart-contracts", "api-explorer", "fidelis", "dapp"],
+  "license": "Apache-2.0"
 }
+
