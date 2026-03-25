@@ -16,3 +16,7 @@ export { transactionQueue } from './transactionQueue';
 
 // Sync Service
 export { syncService } from './sync';
+
+// Security Service
+export { securityService, encryptData, decryptData } from './security';
+export type { SecuritySession, AuditLogEntry, SecurityAlert, SecurityConfig, SecurityState, AuthMethod, AlertSeverity } from './security';
