@@ -24,3 +24,6 @@ export { AdvancedBalanceDisplay } from './AdvancedBalanceDisplay';
 export { TransactionFormBuilder } from './TransactionFormBuilder';
 export { TokenTransferWizard } from './TokenTransferWizard';
 export { PortfolioDashboard } from './PortfolioDashboard';
+export { SecurityDashboard } from './SecurityDashboard';
+export { TransactionHistory } from './TransactionHistory';
+export { ContractInteraction } from './ContractInteraction';
