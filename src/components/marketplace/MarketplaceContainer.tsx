@@ -4,14 +4,26 @@ import { IntegrationDiscovery } from './IntegrationDiscovery';
 import { DeveloperHub } from './DeveloperHub';
 
 export const MarketplaceContainer: React.FC = () => {
+  const { checkForUpdates, isLoading } = useMarketplace();
   const [activeSubTab, setActiveSubTab] = useState<'discover' | 'installed' | 'developer'>('discover');
   
   return (
     <div className="marketplace-container">
       {/* Premium Header */}
       <div className="marketplace-header">
-        <h2 className="marketplace-title">Marketplace</h2>
-        <p className="marketplace-subtitle">Discover powerful plugins and integrations to extend Fidelis.</p>
+        <div className="flex justify-between align-center">
+          <div>
+            <h2 className="marketplace-title">Marketplace</h2>
+            <p className="marketplace-subtitle">Discover powerful plugins and integrations to extend Fidelis.</p>
+          </div>
+          <button 
+            className="btn btn-secondary btn-sm" 
+            onClick={checkForUpdates}
+            disabled={isLoading}
+          >
+            {isLoading ? 'Checking...' : 'Check for Updates'}
+          </button>
+        </div>
       </div>
       
       {/* Sub Navigation */}

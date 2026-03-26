@@ -7,6 +7,7 @@ import { useConnectivity } from './context/ConnectivityContext';
 import { useStorage } from './context/StorageContext';
 import { useTransactionQueue } from './context/TransactionQueueContext';
 import { MarketplaceContainer } from './components/marketplace/MarketplaceContainer';
+import { ActiveWidgets } from './components/marketplace/PluginWidgets';
 /**
  * Main App Component
  * Demonstrates offline functionality with balances and transactions
@@ -151,6 +152,8 @@ function App(): JSX.Element {
         <div className="grid" style={{ gridTemplateColumns: '1fr 300px' }}>
           {/* Main Panel */}
           <div>
+            {(activeTab === 'balances' || activeTab === 'pending' || activeTab === 'history') && <ActiveWidgets />}
+
             {activeTab === 'balances' && (
               <>
                 <h2 className="mb-md">Token Balances</h2>
