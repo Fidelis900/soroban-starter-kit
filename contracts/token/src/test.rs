@@ -179,6 +179,27 @@ fn test_approve_and_transfer_from() {
 }
 
 #[test]
+#[should_panic]
+fn test_approve_rejects_non_future_expiration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let (client, _) = create_token_contract(&env);
+
+    client.initialize(
+        &admin,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+        &18u32,
+    );
+
+    client.approve(&user, &spender, &100i128, &env.ledger().sequence());
+}
+
+#[test]
 fn test_set_admin() {
     let env = Env::default();
     env.mock_all_auths();

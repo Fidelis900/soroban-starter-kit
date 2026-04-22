@@ -46,6 +46,7 @@ pub enum TokenError {
     Unauthorized = 3,
     AlreadyInitialized = 4,
     NotInitialized = 5,
+    InvalidExpirationLedger = 6,
 }
 
 #[contractimpl]
@@ -205,6 +206,9 @@ impl token::Interface for TokenContract {
 
     fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
         from.require_auth();
+        if expiration_ledger <= env.ledger().sequence() {
+            env.panic_with_error(TokenError::InvalidExpirationLedger);
+        }
 
         let key = DataKey::Allowance(AllowanceDataKey {
             from: from.clone(),
@@ -212,9 +216,7 @@ impl token::Interface for TokenContract {
         });
 
         env.storage().temporary().set(&key, &amount);
-        if expiration_ledger > env.ledger().sequence() {
-            env.storage().temporary().extend_ttl(&key, expiration_ledger, expiration_ledger);
-        }
+        env.storage().temporary().extend_ttl(&key, expiration_ledger, expiration_ledger);
 
         env.events().publish(
             (Symbol::new(&env, "approve"), from, spender),
