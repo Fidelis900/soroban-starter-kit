@@ -6,6 +6,7 @@ mod admin;
 mod errors;
 mod events;
 mod storage;
+mod prop_test;
 
 pub use errors::EscrowError;
 pub use storage::{DataKey, EscrowInfo, EscrowState};

@@ -12,6 +12,7 @@ mod storage;
 
 #[cfg(test)]
 mod test;
+mod prop_test;
 
 use admin::require_admin;
 use errors::TokenError;
