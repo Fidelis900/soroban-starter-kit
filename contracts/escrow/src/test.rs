@@ -202,3 +202,61 @@ fn test_arbiter_resolve_to_buyer() {
 
     assert_eq!(client.get_state(), Some(EscrowState::Refunded));
 }
+
+// ── Property-based tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// For any valid partial release amount, the remaining escrow amount decreases by exactly that amount.
+    #[test]
+    fn prop_partial_release_reduces_amount() {
+        proptest!(|(total in 2i128..=1_000_000i128, pct in 1u32..=99u32)| {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let buyer = Address::generate(&env);
+            let seller = Address::generate(&env);
+            let arbiter = Address::generate(&env);
+            let token_address = setup_token(&env, &buyer, total);
+            let deadline = env.ledger().sequence() + 200;
+
+            let (client, _) = create_escrow_contract(&env);
+            client.initialize(&buyer, &seller, &arbiter, &token_address, &total, &deadline);
+            client.fund();
+
+            let partial = (total * pct as i128) / 100;
+            if partial == 0 || partial >= total { return Ok(()); }
+
+            client.release_partial(&partial);
+
+            let info = client.get_escrow_info();
+            prop_assert_eq!(info.amount, total - partial);
+            prop_assert_eq!(info.state, EscrowState::Funded);
+        });
+    }
+
+    /// Escrow initialized with any valid positive amount always starts in Created state.
+    #[test]
+    fn prop_initialize_always_creates_state() {
+        proptest!(|(amount in 1i128..=1_000_000i128)| {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let buyer = Address::generate(&env);
+            let seller = Address::generate(&env);
+            let arbiter = Address::generate(&env);
+            let token_address = setup_token(&env, &buyer, amount);
+            let deadline = env.ledger().sequence() + 200;
+
+            let (client, _) = create_escrow_contract(&env);
+            client.initialize(&buyer, &seller, &arbiter, &token_address, &amount, &deadline);
+
+            let info = client.get_escrow_info();
+            prop_assert_eq!(info.state, EscrowState::Created);
+            prop_assert_eq!(info.amount, amount);
+        });
+    }
+}

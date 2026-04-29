@@ -180,3 +180,76 @@ fn test_set_admin() {
 
     assert_eq!(client.admin(), new_admin);
 }
+
+// ── Property-based tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// For any valid amount, mint then burn the same amount returns balance to zero.
+    #[test]
+    fn prop_mint_then_burn_restores_balance() {
+        proptest!(|(amount in 1i128..=i128::MAX / 2)| {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let user = Address::generate(&env);
+            let client = init_token(&env, &admin);
+
+            client.mint(&user, &amount);
+            let balance_after_mint = client.balance(&user);
+            client.burn_admin(&user, &amount);
+
+            prop_assert_eq!(balance_after_mint, amount);
+            prop_assert_eq!(client.balance(&user), 0);
+            prop_assert_eq!(client.total_supply(), 0);
+        });
+    }
+
+    /// total_supply always equals the sum of all individual balances after minting to multiple users.
+    #[test]
+    fn prop_total_supply_matches_sum_of_balances() {
+        proptest!(|(a in 1i128..=1_000_000i128, b in 1i128..=1_000_000i128, c in 1i128..=1_000_000i128)| {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let client = init_token(&env, &admin);
+
+            let u1 = Address::generate(&env);
+            let u2 = Address::generate(&env);
+            let u3 = Address::generate(&env);
+            client.mint(&u1, &a);
+            client.mint(&u2, &b);
+            client.mint(&u3, &c);
+
+            let expected = a + b + c;
+            prop_assert_eq!(client.total_supply(), expected);
+            prop_assert_eq!(client.balance(&u1) + client.balance(&u2) + client.balance(&u3), expected);
+        });
+    }
+
+    /// Transfer is conservative: sender loses exactly what receiver gains, total supply unchanged.
+    #[test]
+    fn prop_transfer_is_conservative() {
+        proptest!(|(mint in 1i128..=1_000_000i128, transfer_pct in 1u32..=100u32)| {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let sender = Address::generate(&env);
+            let receiver = Address::generate(&env);
+            let client = init_token(&env, &admin);
+
+            client.mint(&sender, &mint);
+            let transfer = (mint * transfer_pct as i128) / 100;
+            if transfer == 0 { return Ok(()); }
+
+            client.transfer(&sender, &receiver, &transfer);
+
+            prop_assert_eq!(client.balance(&sender), mint - transfer);
+            prop_assert_eq!(client.balance(&receiver), transfer);
+            prop_assert_eq!(client.total_supply(), mint);
+        });
+    }
+}
