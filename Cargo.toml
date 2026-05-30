@@ -9,7 +9,7 @@ serde = "=1.0.228"
 proc-macro2 = "=1.0.106"
 quote = "=1.0.45"
 soroban-sdk-testutils = { version = "=21.7.7", package = "soroban-sdk", features = ["testutils"] }
-proptest = "=1.6.0"
+proptest = "=1.11.0"
 
 [profile.release]
 opt-level = "z"
