@@ -2,6 +2,10 @@
 
 _Last verified: 2026-05-30 · Protocol 22_
 
+> **Ledger timing:** The Stellar network targets **5 seconds per ledger**. All
+> time estimates in this document use 5 seconds per ledger (e.g. 12 ledgers ≈ 60
+> seconds, 1 minute ≈ 12 ledgers, 1 hour ≈ 720 ledgers).
+
 Soroban charges **compute units (CUs)** per transaction. Each contract
 invocation consumes CUs based on CPU instructions, memory, ledger I/O, and
 host-function calls. The figures below are measured using the Soroban test
