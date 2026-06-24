@@ -268,7 +268,8 @@ cargo bench
 # Fuzz (requires nightly)
 cargo fuzz run token_fuzz
 
-# Reproduce a proptest failure
+# Reproduce a proptest failure (property tests)
+# Note: "proptests" are referred to as "property tests" throughout this guide.
 PROPTEST_REGRESSIONS=contracts/token/proptest-regressions/prop_test.txt \
   cargo test -p soroban-token-template <test_name>
 ```
