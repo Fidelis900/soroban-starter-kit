@@ -28,7 +28,7 @@ soroban-sdk = "=21.7.7"
 soroban-common = { path = "contracts/common", version = "0.1.0" }
 soroban-sdk-testutils = { version = "=21.7.7", package = "soroban-sdk", features = ["testutils"] }
 proptest = "=1.6.0"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.release]
 opt-level = "z"
