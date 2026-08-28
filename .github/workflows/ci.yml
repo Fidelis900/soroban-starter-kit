@@ -7,6 +7,7 @@ on:
     branches: [main, develop]
   schedule:
     - cron: '0 0 * * 0' # Runs every Sunday at midnight; drives the `nightly` job only.
+  workflow_dispatch:
 
 jobs:
   fmt:
@@ -660,13 +661,17 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Report failure
         if: ${{ failure() }}
-        uses: actions/create-issue@v2
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
-          title: "Nightly build failed"
-          body: "The nightly build failed. Please investigate."
-          labels: "bug"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Nightly build failed',
+              body: `The nightly build failed. Please investigate: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug'],
+            });
 
   soroban-sdk-next:
     name: Soroban SDK Next Version Compatibility
