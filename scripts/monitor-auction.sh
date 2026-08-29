@@ -171,15 +171,17 @@ if [[ "$HIGHEST_BIDDER" == "none" || -z "$HIGHEST_BIDDER" ]]; then
   HIGHEST_BIDDER="(no bids yet)"
 fi
 
-# Determine cancelled state (not in get_info; try invoking a sentinel)
-CANCELLED_RAW=$(stellar contract invoke "${STELLAR_ARGS[@]}" -- end 2>&1 | grep -i "cancelled\|AuctionEnded" | head -1 || echo "")
-if [[ -n "$CANCELLED_RAW" ]]; then
-  # Distinguish between "auction ended (deadline)" and "cancelled"
-  if echo "$CANCELLED_RAW" | grep -qi "cancel"; then
-    IS_CANCELLED="true"
-  else
-    IS_CANCELLED="false"
-  fi
+# Determine cancelled state via the read-only is_cancelled() query.
+# This reads DataKey::Cancelled directly — no auth required, no transaction
+# submitted. Calling the real end() function here (the previous approach) was
+# dangerous: end() is permissionless and moves funds, so invoking it as a
+# status probe would inadvertently settle any overdue auction it was run against.
+CANCELLED_RAW=$(stellar contract invoke "${STELLAR_ARGS[@]}" -- is_cancelled 2>&1)
+CANCELLED_EXIT=$?
+if [[ $CANCELLED_EXIT -ne 0 ]] || echo "$CANCELLED_RAW" | grep -qi "error\|not found\|unknown\|invalid"; then
+  IS_CANCELLED="unknown"
+elif echo "$CANCELLED_RAW" | grep -qi "true"; then
+  IS_CANCELLED="true"
 else
   IS_CANCELLED="false"
 fi
@@ -196,6 +198,8 @@ TIME_DISPLAY=$(ledgers_to_time "$REMAINING")
 # ── status label ─────────────────────────────────────────────────────────────
 if [[ "$IS_CANCELLED" == "true" ]]; then
   STATUS="${RED}Cancelled${RESET}"
+elif [[ "$IS_CANCELLED" == "unknown" ]]; then
+  STATUS="${YELLOW}Unknown${RESET}"
 elif [[ "$SETTLED" == "true" ]]; then
   STATUS="${GREEN}Settled${RESET}"
 elif [[ "$REMAINING" != "N/A" && "$REMAINING" -lt 0 ]]; then
@@ -234,7 +238,10 @@ echo -e "Current ledger:    ${BOLD}${CURRENT_LEDGER}${RESET}"
 echo -e "Time remaining:    ${BOLD}${TIME_DISPLAY}${RESET}"
 
 # ── warning banners ───────────────────────────────────────────────────────────
-if [[ "$IS_CANCELLED" == "true" ]]; then
+if [[ "$IS_CANCELLED" == "unknown" ]]; then
+  echo ""
+  echo -e "${YELLOW}${BOLD}WARNING: Could not determine cancelled state (is_cancelled query failed). Contract may be an older deployment.${RESET}"
+elif [[ "$IS_CANCELLED" == "true" ]]; then
   echo ""
   echo -e "${RED}${BOLD}INFO: Auction was cancelled by the seller (no bids had been placed).${RESET}"
 elif [[ "$SETTLED" == "true" ]]; then

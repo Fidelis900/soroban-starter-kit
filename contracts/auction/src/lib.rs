@@ -416,8 +416,20 @@ mod contract {
                     .unwrap_or(0),
             })
         }
+
+        /// Return `true` when the auction has been cancelled, `false` otherwise.
+        ///
+        /// This is a read-only query — no signer or admin authentication required.
+        /// Use this instead of invoking `end` or `cancel` from monitoring scripts,
+        /// which would submit a real transaction and potentially settle the auction.
+        #[must_use]
+        pub fn is_cancelled(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::Cancelled)
+                .unwrap_or(false)
+        }
     }
-}
 
 mod test;
 

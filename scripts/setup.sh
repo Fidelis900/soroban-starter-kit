@@ -32,8 +32,9 @@ if [[ -f rust-toolchain.toml ]]; then
   RUST_CHANNEL=$(grep -E '^channel\s*=' rust-toolchain.toml | sed 's/.*=\s*"\(.*\)"/\1/')
 fi
 
-# Pinned Stellar CLI version — update when upgrading the project toolchain
-STELLAR_CLI_VERSION="21.4.1"
+# Pinned Stellar CLI version — update when upgrading the project toolchain.
+# Must match the version installed in .devcontainer/devcontainer.json.
+STELLAR_CLI_VERSION="21.7.7"
 
 # ── Check-only mode ───────────────────────────────────────────────────────────
 check_tools() {

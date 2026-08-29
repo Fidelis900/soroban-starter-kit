@@ -39,23 +39,27 @@ TOTAL_SUPPLY=$(invoke total_supply)
 MAX_SUPPLY=$(invoke max_supply 2>/dev/null || echo "uncapped")
 VERSION=$(invoke version)
 
-# Paused state: attempt to call pause (read-only simulate); if the contract
-# responds with "already paused" or similar the flag is set; otherwise assume
-# not paused. We simply report "n/a" for contracts without the pausable feature.
-PAUSED=$(stellar contract invoke \
+# Paused state: call the read-only is_paused() query added in the pausable
+# feature block. This function requires no admin auth and simply reads
+# DataKey::Paused from instance storage.
+# - If the contract was compiled with `--features pausable`, is_paused returns
+#   "true" or "false" (JSON booleans).
+# - If the function selector is unknown (compiled without the feature), the CLI
+#   returns an error, which we map to "n/a" rather than a false negative.
+PAUSED_RAW=$(stellar contract invoke \
   --id "$CONTRACT_ID" \
   --rpc-url "$RPC_URL" \
   --network-passphrase "$PASSPHRASE" \
   --network "$NETWORK" \
-  --simulate-only \
-  -- pause 2>&1 | grep -qi '"true"' && echo "true" || \
-  stellar contract invoke \
-    --id "$CONTRACT_ID" \
-    --rpc-url "$RPC_URL" \
-    --network-passphrase "$PASSPHRASE" \
-    --network "$NETWORK" \
-    --simulate-only \
-    -- unpause 2>&1 | grep -qi 'NotAuthorized\|error' && echo "false" || echo "n/a")
+  -- is_paused 2>&1)
+PAUSED_EXIT=$?
+if [[ $PAUSED_EXIT -ne 0 ]] || echo "$PAUSED_RAW" | grep -qi "error\|not found\|unknown\|invalid"; then
+  PAUSED="n/a"
+elif echo "$PAUSED_RAW" | grep -qi "true"; then
+  PAUSED="true"
+else
+  PAUSED="false"
+fi
 
 echo "=============================="
 echo " Token Contract Monitor"
