@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Generates TypeScript bindings from deployed Soroban contracts using the
 # Stellar CLI and writes them to the sdk/ directory.
+#
+# Reads contract IDs from .contract-ids (format written by deploy.sh):
+#   name: CONTRACT_ID
 set -euo pipefail
 
 CONTRACT_IDS_FILE="${1:-.contract-ids}"
@@ -14,10 +17,17 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-while IFS='=' read -r name contract_id || [[ -n "$name" ]]; do
+# deploy.sh writes "name: CONTRACT_ID" (colon-space separated).
+# Use IFS=': ' so that $name and $contract_id split correctly on that format.
+while IFS=': ' read -r name contract_id || [[ -n "$name" ]]; do
   [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
-  name="${name// /}"
-  contract_id="${contract_id// /}"
+  # Trim any residual whitespace that IFS may leave.
+  name="${name#"${name%%[![:space:]]*}"}"
+  name="${name%"${name##*[![:space:]]}"}"
+  contract_id="${contract_id#"${contract_id%%[![:space:]]*}"}"
+  contract_id="${contract_id%"${contract_id##*[![:space:]]}"}"
+
+  [[ -z "$contract_id" ]] && continue
 
   echo "Generating TypeScript bindings for $name ($contract_id)..."
 
