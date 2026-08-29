@@ -19,11 +19,18 @@ stellar contract invoke \
 Verify the paused state:
 
 ```bash
+# Escrow contract — use get_state (returns the full escrow state including paused flag):
 stellar contract invoke \
   --id <CONTRACT_ID> \
   --source-account <ADMIN_KEY> \
   --network <testnet|mainnet> \
   -- get_state
+
+# Token contract — there is currently no dedicated read-only is_paused query.
+# Use stellar contract info to inspect on-chain state, or check your off-chain
+# monitoring (see scripts/monitor-token.sh) for the paused flag.
+# A universal is_paused / get_state function across all contracts is a known gap
+# (tracked separately) — the exact verification command differs per contract.
 ```
 
 > If the contract does not support pausing, proceed immediately to upgrading to a patched WASM (§3).
