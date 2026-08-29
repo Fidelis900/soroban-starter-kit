@@ -264,9 +264,9 @@ WASM Hash: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 After deploying contracts, run the initialization script to call each contract's `initialize` function:
 
 ```bash
-# Populate .contract-ids with deployed IDs (one per line: name=CONTRACT_ID)
-echo "token=CABC..." >> .contract-ids
-echo "escrow=CDEF..." >> .contract-ids
+# Populate .contract-ids with deployed IDs (format written by deploy.sh: name: CONTRACT_ID)
+echo "token: CABC..." >> .contract-ids
+echo "escrow: CDEF..." >> .contract-ids
 
 # Initialize all contracts on the current network
 ./scripts/initialize.sh testnet   # or local / mainnet
@@ -613,7 +613,7 @@ After deploying, confirm that every contract in `.contract-ids` is alive:
 ./scripts/check-contract-ids.sh
 ```
 
-The script reads `.contract-ids` (format: `name=<CONTRACT_ID>`), invokes `get_state`
+The script reads `.contract-ids` (format: `name: <CONTRACT_ID>`, written by `deploy.sh`), invokes `contract_version`
 on each contract, and categorises results:
 
 | Status | Meaning |

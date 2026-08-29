@@ -5,19 +5,21 @@
 #   name=CONTRACT_ID|METHOD
 #   name=CONTRACT_ID METHOD
 #
-# If METHOD is omitted, HEALTH_CHECK_METHOD (default: get_state) is used. The
-# default is suitable for deployments that expose get_state; production
-# deployments should record the cheapest read-only method they expose.
+# If METHOD is omitted, HEALTH_CHECK_METHOD (default: contract_version) is used.
+# contract_version is a universal read-only query present on every contract in
+# this workspace — it requires no auth and returns a u32, confirming the
+# contract is alive. Override with HEALTH_CHECK_METHOD for contracts that expose
+# a cheaper or more representative read-only entry point.
 #
 # Usage:
 #   ./scripts/health-check.sh [.contract-ids]
-#   CONTRACT_IDS='token=C...|get_admin,escrow=D...|get_info' \
+#   CONTRACT_IDS='token=C...|contract_version,escrow=D...|get_info' \
 #     ./scripts/health-check.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NETWORK="${STELLAR_NETWORK:-testnet}"
-DEFAULT_METHOD="${HEALTH_CHECK_METHOD:-get_state}"
+DEFAULT_METHOD="${HEALTH_CHECK_METHOD:-contract_version}"
 TIMEOUT_SECONDS="${HEALTH_CHECK_TIMEOUT:-15}"
 INPUT_FILE="${1:-${CONTRACT_IDS_FILE:-$ROOT/.contract-ids}}"
 

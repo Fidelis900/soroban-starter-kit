@@ -7,7 +7,7 @@
 | Node.js | 20+ | https://nodejs.org |
 | Docker | 24+ | https://docs.docker.com/get-docker/ |
 | Rust | 1.78+ | https://rustup.rs |
-| Stellar CLI | latest | `cargo install --locked stellar-cli --features opt` |
+| Stellar CLI | 21.7.7 | `cargo install --locked stellar-cli@21.7.7 --features opt` |
 | just (optional) | latest | `cargo install just` |
 
 ### Installing `just`

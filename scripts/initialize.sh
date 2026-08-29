@@ -2,7 +2,8 @@
 # initialize.sh — run post-deploy initialization on deployed Soroban contracts
 # Usage: ./scripts/initialize.sh [testnet|mainnet|local]
 #
-# Reads contract IDs from .contract-ids (one "name=CONTRACT_ID" per line),
+# Reads contract IDs from .contract-ids (format written by deploy.sh):
+#   name: CONTRACT_ID
 # then calls `stellar contract invoke --id <id> -- initialize` for each.
 #
 # Override per-contract init args via env:  INIT_ARGS_<NAME>="--arg val"
@@ -42,9 +43,14 @@ INITIALIZED=0
 SKIPPED=0
 FAILED=0
 
-while IFS='=' read -r name contract_id || [[ -n "$name" ]]; do
+while IFS=': ' read -r name contract_id || [[ -n "$name" ]]; do
   # skip blank lines and comments
   [[ -z "$name" || "$name" == \#* ]] && continue
+  # Trim any residual whitespace that IFS may leave.
+  name="${name#"${name%%[![:space:]]*}"}"
+  name="${name%"${name##*[![:space:]]}"}"
+  contract_id="${contract_id#"${contract_id%%[![:space:]]*}"}"
+  contract_id="${contract_id%"${contract_id##*[![:space:]]}"}"
   contract_id="${contract_id:-}"
   if [[ -z "$contract_id" ]]; then
     echo "WARN: no contract ID for '$name', skipping."
