@@ -1,6 +1,6 @@
 # ADR-0005: Feature Flag Design
 
-- **Status**: Accepted
+- **Status**: Superseded — runtime `FeatureKey` system was never implemented; compile-time Cargo features are the actual mechanism in use (see Audit note below)
 - **Date**: 2026-06-01
 
 ## Context
@@ -15,6 +15,8 @@ Soroban contracts are immutable once deployed. Upgrading logic requires either a
 Without a deliberate flag strategy, developers either hard-code behaviour (inflexible) or scatter ad-hoc boolean checks across the codebase (unmaintainable).
 
 ## Decision
+
+> ⚠️ **Status note**: The runtime `FeatureKey` / `set_flag` / `require_feature` system described below was designed but never implemented in any contract. The mechanism actually in use across the codebase is **Cargo compile-time features** (`#[cfg(feature = "...")]` blocks declared in each contract's `Cargo.toml`). The two mechanisms are fundamentally different: compile-time features are baked in at build time and are not admin-toggleable post-deployment, and they carry none of the storage / TTL / cleanup considerations discussed here. See the Audit note at the end of this document for full details. If the runtime-toggle system is still desired, it should be implemented in `contracts/common` (matching the pattern of other cross-contract helpers there) and this ADR's status updated to `Accepted` at that point.
 
 ### Flag storage
 
