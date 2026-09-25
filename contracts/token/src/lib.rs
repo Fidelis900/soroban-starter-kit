@@ -50,7 +50,7 @@ pub(crate) fn require_not_paused(env: &Env) -> Result<(), TokenError> {
 pub(crate) fn require_not_frozen(env: &Env, account: &Address) -> Result<(), TokenError> {
     if env
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::Frozen(account.clone()))
         .unwrap_or(false)
     {
@@ -470,9 +470,14 @@ mod contract {
             let admin = require_admin(&env)?;
             admin.require_auth();
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Frozen(account.clone()), &true);
-            extend_ttl_instance(&env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            extend_ttl_persistent(
+                &env,
+                &DataKey::Frozen(account.clone()),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
             events::account_frozen(&env, &account);
             Ok(())
         }
@@ -481,9 +486,8 @@ mod contract {
             let admin = require_admin(&env)?;
             admin.require_auth();
             env.storage()
-                .instance()
-                .set(&DataKey::Frozen(account.clone()), &false);
-            extend_ttl_instance(&env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+                .persistent()
+                .remove(&DataKey::Frozen(account.clone()));
             events::account_unfrozen(&env, &account);
             Ok(())
         }
