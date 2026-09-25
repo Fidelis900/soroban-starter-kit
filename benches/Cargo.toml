@@ -14,8 +14,13 @@ harness = false
 name = "token_ops"
 harness = false
 
+[[bench]]
+name = "merkle_ops"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
+soroban-common = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 soroban-escrow-template = { path = "../contracts/escrow" }
 soroban-token-template = { path = "../contracts/token" }

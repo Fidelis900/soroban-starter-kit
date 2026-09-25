@@ -22,6 +22,20 @@ pub enum AirdropError {
     InvalidAmount = 7,
     /// The claim deadline has passed; no further claims are accepted.
     ClaimWindowClosed = 8,
+    /// The contract does not hold enough unlocked balance of the token to pay the claim.
+    InsufficientBalance = 9,
+    /// Vesting parameters are out of range.
+    InvalidVestingConfig = 10,
+    /// No vesting schedule exists for this recipient and token.
+    NoVestingSchedule = 11,
+    /// No vested tokens are currently releasable.
+    NothingToRelease = 12,
+    /// A batch contains the same `(recipient, token)` pair more than once.
+    DuplicateEntry = 13,
+    /// An arithmetic operation overflowed.
+    ArithmeticOverflow = 14,
+    /// `claim_batch` was called with no entries.
+    EmptyBatch = 15,
 }
 
 #[cfg(test)]

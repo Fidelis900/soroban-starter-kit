@@ -163,24 +163,66 @@ Complete public API documentation for all Soroban starter kit contracts.
 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
-| `initialize` | `env: Env, admin: Address, token: Address, claim_deadline: u32` | `Result<(), AirdropError>` | `AlreadyInitialized` |
+| `initialize` | `env: Env, admin: Address, claim_deadline: u32, vesting: Option<VestingConfig>` | `Result<(), AirdropError>` | `AlreadyInitialized`, `InvalidVestingConfig` |
 | `set_root` | `env: Env, root: BytesN<32>` | `Result<(), AirdropError>` | `NotInitialized`, `Unauthorized` |
-| `claim` | `env: Env, recipient: Address, amount: i128, proof: Vec<BytesN<32>>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `InvalidAmount`, `ClaimWindowClosed`, `AlreadyClaimed`, `InvalidProof` |
-| `claim_batch` | `env: Env, entries: Vec<(Address, i128, Vec<BytesN<32>>)>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `InvalidAmount`, `AlreadyClaimed`, `InvalidProof` |
-| `is_claimed` | `env: Env, address: Address` | `bool` | None |
+| `claim` | `env: Env, recipient: Address, token: Address, amount: i128, proof: Vec<BytesN<32>>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `InvalidAmount`, `AlreadyClaimed`, `InvalidProof`, `InsufficientBalance` |
+| `claim_batch` | `env: Env, entries: Vec<(Address, Address, i128)>, proof: Vec<BytesN<32>>, proof_flags: Vec<bool>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `EmptyBatch`, `InvalidAmount`, `DuplicateEntry`, `AlreadyClaimed`, `InvalidProof`, `InsufficientBalance` |
+| `release` | `env: Env, recipient: Address, token: Address` | `Result<i128, AirdropError>` | `NoVestingSchedule`, `NothingToRelease` |
+| `is_claimed` | `env: Env, address: Address, token: Address` | `bool` | None |
 | `get_root` | `env: Env` | `Option<Bytes>` | None |
+| `get_vesting_config` | `env: Env` | `Option<VestingConfig>` | None |
+| `get_vesting` | `env: Env, recipient: Address, token: Address` | `Option<VestingSchedule>` | None |
+| `releasable` | `env: Env, recipient: Address, token: Address` | `i128` | None |
+| `total_locked` | `env: Env, token: Address` | `i128` | None |
+
+### Leaf format
+
+Each leaf commits to the network, the airdrop contract instance, the recipient, the token, and the amount. Proofs therefore cannot be replayed across networks (Testnet vs. Mainnet), across airdrop contracts, or across tokens:
+
+```text
+leaf = sha256(
+    "SOROBAN_AIRDROP_LEAF_V1"      // 23-byte ASCII domain separator
+ || network_id                     // 32 bytes: sha256(network passphrase)
+ || xdr(ScVal::Address(contract))  // the airdrop contract address
+ || xdr(ScVal::Address(recipient))
+ || xdr(ScVal::Address(token))
+ || amount                         // i128, 16-byte big-endian
+)
+node = sha256(min(left, right) || max(left, right))
+```
+
+Because the contract address is part of every leaf, the tree can only be built **after** the contract is deployed (or from its pre-computed address).
+
+### Multi-token distributions
+
+A single tree may contain leaves for any number of tokens. Each `(recipient, token)` pair can be claimed once. Fund the contract with every distributed token; claims fail with `InsufficientBalance` when the contract's balance of a token, minus tokens already locked for vesting, cannot cover the claim.
+
+### Batch claims (multi-proof)
+
+`claim_batch` verifies all entries against one Merkle **multi-proof** (the `OpenZeppelin` `multiProofVerify` format, with SHA-256), implemented in `soroban_common::verify_merkle_multi_proof`. Intermediate nodes shared by several entries are hashed only once, so a batch costs `leaves + proof - 1` hashes instead of `leaves × depth`. For 50 leaves in a 1024-leaf tree this is 56 hashes instead of 500, about 87% fewer CPU instructions (`cargo bench -p contract-benchmarks --bench merkle_ops`). `entries` must be supplied in the leaf order emitted by the multi-proof generator.
 
 `claim_batch` uses all-or-nothing semantics: every entry is validated before any transfer executes, so a single bad entry aborts the whole batch.
+
+### Vesting
+
+When `initialize` receives `Some(VestingConfig { initial_unlock_bps, vesting_duration_ledgers })`, each claim transfers `amount * initial_unlock_bps / 10_000` immediately and locks the remainder in a per-`(recipient, token)` schedule that vests linearly over `vesting_duration_ledgers` ledgers from the claim ledger. Recipients withdraw vested tokens with `release`, which keeps working after the claim deadline.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `initialize` called twice
 - `NotInitialized` (2) — Operation before initialize
 - `Unauthorized` (3) — Caller not admin
 - `RootNotSet` (4) — No merkle root configured yet
-- `InvalidProof` (5) — Merkle proof does not verify
-- `AlreadyClaimed` (6) — Address already claimed
+- `InvalidProof` (5) — Merkle proof or multi-proof does not verify
+- `AlreadyClaimed` (6) — `(recipient, token)` already claimed
 - `InvalidAmount` (7) — Claim amount <= 0
 - `ClaimWindowClosed` (8) — Current ledger past `claim_deadline`
+- `InsufficientBalance` (9) — Contract's unlocked token balance cannot cover the claim
+- `InvalidVestingConfig` (10) — `initial_unlock_bps > 10_000`, or locked portion with zero duration
+- `NoVestingSchedule` (11) — No schedule for `(recipient, token)`
+- `NothingToRelease` (12) — Nothing new has vested
+- `DuplicateEntry` (13) — Same `(recipient, token)` twice in one batch
+- `ArithmeticOverflow` (14) — Checked arithmetic overflowed
+- `EmptyBatch` (15) — `claim_batch` called with no entries
 
 ---
 

@@ -114,7 +114,9 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Event | Symbol | Topics | Data Type | When Fired |
 |-------|--------|--------|-----------|-----------|
 | Merkle Root Set | `root_set` | `(Symbol,)` → event name | `Bytes` → new Merkle root | `set_root()` called by admin |
-| Claimed | `claimed` | `(Symbol,)` → event name | `(Address, i128)` → recipient, amount | `claim()` called with valid Merkle proof |
+| Claimed | `claimed` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, total amount | `claim()` / `claim_batch()` succeeded for an entry |
+| Locked | `locked` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, amount locked for vesting | Claim with vesting enabled locked a non-zero portion |
+| Released | `released` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, amount released | `release()` called |
 
 ---
 
