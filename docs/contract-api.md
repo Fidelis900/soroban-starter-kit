@@ -500,10 +500,11 @@ Commit-reveal randomness: `commit` locks in `hash(secret ++ salt)` and a reveal 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
 | `initialize` | `env: Env, provider: Address, token: Address` | `Result<(), SubscriptionError>` | `AlreadyInitialized` |
-| `register_plan` | `env: Env, plan_id: Symbol, amount: i128, interval_ledgers: u32` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `InvalidInterval`, `PlanAlreadyExists` |
+| `register_plan` | `env: Env, plan_id: Symbol, amount: i128, interval_ledgers: u32, unit_price: i128, prepay_discount_bps: u32` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `InvalidInterval`, `InvalidDiscount`, `PlanAlreadyExists` |
 | `set_plan_active` | `env: Env, plan_id: Symbol, active: bool` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `PlanNotFound` |
-| `subscribe` | `env: Env, subscriber: Address, plan_id: Symbol, trial_ledgers: Option<u32>` | `Result<(), SubscriptionError>` | `NotInitialized`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed` |
-| `charge` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `NotSubscribed`, `SubscriptionInactive`, `IntervalNotElapsed`, `InsufficientAllowance` |
+| `subscribe` | `env: Env, subscriber: Address, plan_id: Symbol, trial_ledgers: Option<u32>, prepay_intervals: Option<u32>` | `Result<(), SubscriptionError>` | `NotInitialized`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed`, `ArithmeticOverflow` |
+| `charge` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `NotSubscribed`, `SubscriptionInactive`, `IntervalNotElapsed`, `InsufficientAllowance`, `ArithmeticOverflow` |
+| `report_usage` | `env: Env, subscriber: Address, units: u64` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `NotSubscribed`, `SubscriptionInactive`, `ArithmeticOverflow` |
 | `cancel` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotSubscribed`, `SubscriptionInactive` |
 | `get_subscription` | `env: Env, subscriber: Address` | `Option<SubscriptionInfo>` | None |
 | `get_provider` | `env: Env` | `Option<Address>` | None |
@@ -511,6 +512,10 @@ Commit-reveal randomness: `commit` locks in `hash(secret ++ salt)` and a reveal 
 | `get_plan` | `env: Env, plan_id: Symbol` | `Option<Plan>` | None |
 
 The subscriber must pre-approve this contract as a token spender (`token.approve(subscriber, subscription_contract, amount * periods, expiry_ledger)`) before the provider can `charge`. An optional `trial_ledgers` on `subscribe` delays the first real charge; `charge` during the trial window only marks the trial complete without transferring funds.
+
+**Metered billing:** plans with a non-zero `unit_price` bill `amount + usage_units * unit_price` per interval. The provider accumulates usage with `report_usage`; the meter resets to zero on each successful `charge` (and is discarded on `cancel`).
+
+**Prepaid billing:** passing `prepay_intervals: Some(n)` to `subscribe` transfers `amount * n` less the plan's `prepay_discount_bps` into contract escrow. Each `charge` releases one interval's share to the provider (usage fees are still pulled from the allowance). `cancel` refunds the unconsumed escrow balance.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `initialize` called twice
@@ -526,6 +531,8 @@ The subscriber must pre-approve this contract as a token spender (`token.approve
 - `PlanAlreadyExists` (11) — Plan ID already registered
 - `PlanNotFound` (12) — Unknown plan ID
 - `PlanInactive` (13) — Plan deactivated
+- `InvalidDiscount` (14) — `prepay_discount_bps` > 10,000
+- `ArithmeticOverflow` (15) — A billing calculation overflowed
 
 ---
 

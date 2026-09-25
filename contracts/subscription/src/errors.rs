@@ -32,6 +32,10 @@ pub enum SubscriptionError {
     PlanNotFound = 12,
     /// Plan is not active and cannot be subscribed to.
     PlanInactive = 13,
+    /// Prepay discount is outside 0..=10_000 basis points.
+    InvalidDiscount = 14,
+    /// A billing calculation overflowed.
+    ArithmeticOverflow = 15,
 }
 
 #[cfg(test)]

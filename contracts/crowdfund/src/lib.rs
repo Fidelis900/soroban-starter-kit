@@ -40,7 +40,8 @@ fn get_instance<T: soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val>>(
 /// - Contributors call `pledge` to deposit tokens before the deadline.
 /// - If the goal is met, the creator calls `claim` to collect all funds after the deadline.
 /// - If the goal is not met after the deadline, each contributor calls `refund` to recover their pledge.
-/// - A contributor can call `withdraw` to pull back their pledge before the deadline.
+/// - A contributor can call `withdraw` to pull back their pledge before the deadline,
+///   as long as the goal has not yet been reached. Once reached, pledges are locked.
 pub use contract::*;
 
 // The `#[contract]` / `#[contractimpl]` macros generate an undocumented public
@@ -193,6 +194,8 @@ mod contract {
         ///
         /// - [`CrowdfundError::NotInitialized`] if not set up.
         /// - [`CrowdfundError::DeadlinePassed`] if the deadline has already passed.
+        /// - [`CrowdfundError::GoalAlreadyMet`] if total pledged >= goal; pledges are
+        ///   locked once the goal is reached so a successful campaign cannot be sabotaged.
         /// - [`CrowdfundError::NothingToWithdraw`] if the caller has no active pledge.
         pub fn withdraw(env: Env, pledger: Address) -> Result<(), CrowdfundError> {
             get_instance::<Address>(&env, &DataKey::Creator)?; // ensure initialized
@@ -200,6 +203,12 @@ mod contract {
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
             if env.ledger().sequence() > deadline {
                 return Err(CrowdfundError::DeadlinePassed);
+            }
+
+            let goal: i128 = get_instance(&env, &DataKey::Goal)?;
+            let total: i128 = get_instance(&env, &DataKey::TotalPledged)?;
+            if total >= goal {
+                return Err(CrowdfundError::GoalAlreadyMet);
             }
 
             pledger.require_auth();
@@ -217,7 +226,6 @@ mod contract {
                 .persistent()
                 .remove(&DataKey::Pledge(pledger.clone()));
 
-            let total: i128 = get_instance(&env, &DataKey::TotalPledged)?;
             env.storage()
                 .instance()
                 .set(&DataKey::TotalPledged, &(total - pledge));
