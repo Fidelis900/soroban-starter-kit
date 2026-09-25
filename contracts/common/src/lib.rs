@@ -3,10 +3,15 @@
 //! Shared helpers for the Soroban contract templates.
 //!
 //! Provides admin-storage helpers, TTL/lifetime constants, deadline validation,
-//! basis-point fee calculation, commit-reveal hashing, and the [`AdminKey`]
+//! basis-point fee calculation, commit-reveal hashing, Merkle single- and
+//! multi-proof verification ([`merkle`]), and the [`AdminKey`]
 //! storage key reused across the contract crates.
 
 use soroban_sdk::{Address, Bytes, BytesN, Env, contracttype, crypto::Hash};
+
+pub mod merkle;
+
+pub use merkle::{hash_pair_sorted, verify_merkle_multi_proof, verify_merkle_proof};
 
 /// Minimum number of ledgers the deadline must be ahead of the current ledger
 /// when initializing an escrow. Enforced by the contract; tests must respect

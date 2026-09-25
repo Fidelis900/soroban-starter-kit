@@ -7,6 +7,24 @@ pub fn root_set(env: &Env, round_id: u32, root: &Bytes) {
     );
 }
 
+pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("claimed"),),
+        (recipient.clone(), token.clone(), amount),
+    );
+}
+
+pub fn locked(env: &Env, recipient: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("locked"),),
+        (recipient.clone(), token.clone(), amount),
+    );
+}
+
+pub fn released(env: &Env, recipient: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("released"),),
+        (recipient.clone(), token.clone(), amount),
 pub fn claimed(env: &Env, round_id: u32, recipient: &Address, amount: i128) {
     env.events().publish(
         (Symbol::new(env, "claimed"), round_id),

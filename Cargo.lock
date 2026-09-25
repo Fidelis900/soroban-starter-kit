@@ -415,6 +415,7 @@ name = "contract-benchmarks"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "soroban-common",
  "soroban-escrow-template",
  "soroban-sdk",
  "soroban-token-template",

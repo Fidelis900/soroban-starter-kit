@@ -352,6 +352,58 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 ---
 
+### `InsufficientBalance` (code 9)
+
+**Description:** The contract's balance of the claimed token, minus tokens already locked in vesting schedules, is smaller than the claim (or, for `claim_batch`, the batch total for that token).
+
+**Common cause:** The contract was not funded with every token in a multi-token tree, or was under-funded.
+
+**Resolution:** Transfer enough of each distributed token to the airdrop contract.
+
+---
+
+### `InvalidVestingConfig` (code 10)
+
+**Description:** `initial_unlock_bps` exceeds 10 000, or part of each claim would be locked while `vesting_duration_ledgers` is 0.
+
+**Resolution:** Use `initial_unlock_bps` in `0..=10_000` and a non-zero duration whenever `initial_unlock_bps < 10_000`.
+
+---
+
+### `NoVestingSchedule` (code 11)
+
+**Description:** `release` was called for a `(recipient, token)` pair that has no vesting schedule.
+
+**Common cause:** Vesting is disabled, the pair has not claimed yet, or the whole claim was liquid.
+
+---
+
+### `NothingToRelease` (code 12)
+
+**Description:** No additional tokens have vested since the last `release`.
+
+**Resolution:** Wait for more ledgers to pass; query `releasable` first.
+
+---
+
+### `DuplicateEntry` (code 13)
+
+**Description:** A `claim_batch` call listed the same `(recipient, token)` pair more than once.
+
+---
+
+### `ArithmeticOverflow` (code 14)
+
+**Description:** A checked arithmetic operation overflowed while computing a claim, batch total, or vesting amount.
+
+---
+
+### `EmptyBatch` (code 15)
+
+**Description:** `claim_batch` was called with no entries.
+
+---
+
 ## Auction Contract — `AuctionError`
 
 ### `AlreadyInitialized` (code 1)
