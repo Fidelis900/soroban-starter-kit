@@ -78,4 +78,7 @@ AirdropError::ClaimWindowClosed = {}\n",
     InvalidAmount = 8,
     AlreadyClaimed = 9,
     InvalidProof = 10,
+    RootNotSet = 11,
+    RoundActive = 12,
+    InvalidSignature = 13,
 }

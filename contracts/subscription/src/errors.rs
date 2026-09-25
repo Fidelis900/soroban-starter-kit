@@ -20,6 +20,16 @@ pub enum SubscriptionError {
     PlanAlreadyExists = 11,
     PlanNotFound = 12,
     PlanInactive = 13,
+    /// Prepay discount is outside 0..=10_000 basis points.
+    InvalidDiscount = 14,
+    /// A billing calculation overflowed.
+    ArithmeticOverflow = 15,
+    /// Subscription was suspended for non-payment after its grace period expired.
+    SubscriptionSuspended = 14,
+    /// The current billing period is due or overdue and must be charged first.
+    PaymentOverdue = 15,
+    /// An arithmetic operation overflowed.
+    ArithmeticOverflow = 16,
 }
 
 impl_display_error!(
