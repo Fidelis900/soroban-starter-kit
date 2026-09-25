@@ -29,9 +29,15 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Approved | `approve` | `(Symbol, Address, Address)` → event name, owner, spender | `i128` → allowance amount | `approve()` called |
 | Revoked | `revoke` | `(Symbol, Address, Address)` → event name, owner, spender | `()` | `approve()` called with amount 0 |
 | Transferred | `transfer` | `(Symbol, Address, Address)` → event name, from, to | `i128` → amount transferred | `transfer()` or `transfer_from()` called |
+| Account Frozen | `account_frozen` | `(Symbol, Address)` → event name, account | `()` | `freeze_account()` called |
+| Account Unfrozen | `account_unfrozen` | `(Symbol, Address)` → event name, account | `()` | `unfreeze_account()` called |
 | Paused | `paused` | `(Symbol, Address)` → event name, admin | `()` | `pause()` called (pausable feature) |
 | Unpaused | `unpaused` | `(Symbol, Address)` → event name, admin | `()` | `unpause()` called (pausable feature) |
 | Upgraded | `upgraded` | `(Symbol, Address)` → event name, admin | `BytesN<32>` → new WASM hash | `execute_upgrade()` called (upgradeable feature) |
+| Transfer Hook Set | `hook_set` | `(Symbol, Address)` → event name, admin | `Option<Address>` → hook address (`None` to clear) | `set_transfer_hook()` called |
+| Snapshot Taken | `snapshot` | `(Symbol, Address, u32)` → event name, account, ledger | `i128` → recorded balance | `snapshot()` called (governance balance snapshots) |
+| Permit Signer Set | `permit_signer_set` | `(Symbol, Address)` → event name, owner | `()` | `set_permit_signer()` called |
+| Permit Used | `permit_used` | `(Symbol, Address, Address)` → event name, owner, spender | `(i128, u32)` → amount, nonce | `approve_with_signature()` succeeds |
 
 ---
 
@@ -46,19 +52,16 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Funds Released | `released` | `(Symbol, Address)` → event name, seller | `i128` → amount released | `release()` called |
 | Partial Release | `released_partial` | `(Symbol, Address)` → event name, seller | `i128` → partial amount | `partial_release()` called |
 | Funds Refunded | `refunded` | `(Symbol, Address)` → event name, buyer | `i128` → amount refunded | `refund()` called (deadline passed) |
+| Amount Updated | `amount_updated` | `(Symbol, Address)` → event name, buyer | `i128` → new amount | `update_amount()` called |
+| Escrow Cancelled | `escrow_cancelled` | `(Symbol, Address)` → event name, buyer | `()` | `cancel()` called |
+| Deadline Extended | `deadline_extended` | `(Symbol, Address)` → event name, buyer | `u32` → new deadline ledger | `extend_deadline()` called |
+| Dispute Raised | `dispute_raised` | `(Symbol, Address)` → event name, caller | `()` | `raise_dispute()` called |
+| Dispute Timeout Claimed | `dispute_timeout` | `(Symbol, Address)` → event name, buyer | `i128` → amount claimed | `claim_dispute_timeout()` called |
+| Milestone Released | `milestone_released` | `(Symbol, Address, u32)` → event name, seller, milestone index | `(i128, i128)` → amount, fee | `release_milestone()` called |
+| Fee Config Set | `fee_config_set` | `(Symbol, Address)` → event name, admin | `(u32, Address)` → fee bps, treasury | `set_fee_config()` called |
 | Paused | `paused` | `(Symbol, Address)` → event name, admin | `()` | `pause()` called |
 | Unpaused | `unpaused` | `(Symbol, Address)` → event name, admin | `()` | `unpause()` called |
 | Upgraded | `upgraded` | `(Symbol, Address)` → event name, admin | `BytesN<32>` → new WASM hash | `execute_upgrade()` called |
-
----
-
-## Vesting Contract
-
-| Event | Symbol | Topics | Data Type | When Fired |
-|-------|--------|--------|-----------|-----------|
-| Initialized | `initialized` | `(Symbol, Address)` → event name, beneficiary | `(i128, u32, u32)` → amount, cliff ledger, end ledger | `initialize()` called |
-| Claimed | `claimed` | `(Symbol, Address)` → event name, beneficiary | `i128` → amount claimed | `claim()` called |
-| Revoked | `revoked` | `(Symbol, Address)` → event name, admin | `i128` → amount returned to admin | `revoke()` called |
 
 ---
 
@@ -71,6 +74,10 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Unstaked | `unstaked` | `(Symbol, Address)` → event name, staker | `(i128, i128)` → amount unstaked, remaining stake | `unstake()` called |
 | Rewards Claimed | `claimed_rewards` | `(Symbol, Address)` → event name, staker | `i128` → reward amount claimed | `claim_rewards()` called |
 | Rewards Added | `added_rewards` | `(Symbol, Address)` → event name, admin | `(i128, i128)` → reward amount, new total | `add_rewards()` called |
+| Compounded | `compounded` | `(Symbol, Address)` → event name, staker | `(i128, i128)` → reward compounded, new stake | `compound()` called (auto-compounding) |
+| Slashed | `slashed` | `(Symbol, Address, Address)` → event name, admin, staker | `(i128, Address)` → amount slashed, destination | `slash()` called by admin |
+| Unbond Requested | `unbond_requested` | `(Symbol, Address)` → event name, staker | `(i128, u32)` → amount queued, available-at ledger | `unstake()` called when `unbonding_period > 0` |
+| Withdrawn | `withdrawn` | `(Symbol, Address)` → event name, staker | `i128` → amount withdrawn | `withdraw()` called after unbonding period |
 
 ---
 
@@ -79,11 +86,20 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Event | Symbol | Topics | Data Type | When Fired |
 |-------|--------|--------|-----------|-----------|
 | Initialized | `initialized` | `(Symbol, u32)` → event name, threshold | `u32` → signer count | `initialize()` called |
-| Signer Added | `added` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `add_signer()` called |
-| Signer Removed | `removed` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `remove_signer()` called |
+| Signer Added | `added` | `(Symbol, Address)` → event name, signer | `(u32, u32)` → signer weight, new threshold | `add_signer()` or `execute_signer_change()` called |
+| Signer Weight Updated | `weight_updated` | `(Symbol, Address)` → event name, signer | `(u32, u32)` → old weight, new weight | `update_signer_weight()` or `execute_signer_change()` called |
+| Threshold Changed | `threshold_changed` | `(Symbol,)` → event name | `(u32, u32)` → old threshold, new threshold | `execute_signer_change()` with `ChangeThreshold` |
+| Signer Removed | `removed` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `remove_signer()` or `execute_signer_change()` called |
 | Transaction Proposed | `proposed` | `(Symbol, Address)` → event name, proposer | `u64` → transaction ID | `propose()` called |
 | Transaction Signed | `signed` | `(Symbol, Address, u64)` → event name, signer, tx ID | `u32` → signature count | `sign()` called |
 | Transaction Executed | `executed` | `(Symbol, u64)` → event name, tx ID | `()` | `execute()` called (threshold met) |
+| Proposal Expired | `expired` | `(Symbol, u64)` → event name, tx ID | `()` | `cleanup_expired()` called |
+| Transaction Cancelled | `cancelled` | `(Symbol, Address)` → event name, proposer | `u64` → transaction ID | `cancel_proposal()` called |
+| Signature Revoked | `revoked` | `(Symbol, Address, u64)` → event name, signer, tx ID | `(u32, u32)` → signature count, accumulated weight | `revoke_signature()` called |
+| Signer Change Proposed | `signer_change_proposed` | `(Symbol, Address)` → event name, proposer | `u64` → signer proposal ID | `propose_signer_change()` called |
+| Signer Change Signed | `signer_change_signed` | `(Symbol, Address, u64)` → event name, signer, proposal ID | `u32` → signature count | `sign_signer_change()` called |
+| Signer Change Executed | `signer_change_executed` | `(Symbol, u64)` → event name, proposal ID | `()` | `execute_signer_change()` called |
+| Batch Executed | `batch_executed` | `(Symbol,)` → event name | `(Vec<u64>, u32)` → executed IDs, skipped count | `execute_batch()` called |
 
 ---
 
@@ -96,6 +112,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Voted | `voted` | `(Symbol, Address)` → event name, voter | `(u32, bool, i128)` → proposal ID, support, voting weight | `vote()` called |
 | Proposal Executed | `executed` | `(Symbol,)` → event name | `u32` → proposal ID | `execute()` called (quorum + majority met) |
 | Proposal Cancelled | `cancelled` | `(Symbol, Address)` → event name, admin | `u32` → proposal ID | `cancel_proposal()` called (admin) |
+| Proposer Cancelled | `prop_cancelled` | `(Symbol, Address)` → event name, proposer | `u32` → proposal ID | `proposer_cancel_proposal()` called (proposer self-cancellation) |
 
 ---
 
@@ -106,6 +123,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Initialized | `initialized` | `(Symbol, Address, Address)` → event name, admin, beneficiary | `(u32, i128)` → release ledger, amount | `initialize()` called |
 | Released | `released` | `(Symbol, Address)` → event name, beneficiary | `i128` → amount released | `release()` called |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, admin | `i128` → amount returned to admin | `cancel()` called |
+| Beneficiary Reassigned | `beneficiary_reassigned` | `(Symbol, Address, Address, Address)` → event name, admin, old beneficiary, new beneficiary | `()` | `reassign_beneficiary()` called |
 
 ---
 
@@ -124,12 +142,19 @@ env.events().publish((topic_1, topic_2, ...), data);
 |-------|--------|--------|-----------|-----------|
 | Started | `started` | `(Symbol, Address)` → event name, seller | `(i128, u32)` → start price, deadline ledger | `start()` called |
 | Bid Placed | `bid_placed` | `(Symbol, Address)` → event name, bidder | `i128` → bid amount | `bid()` called |
+| Outbid | `outbid` | `(Symbol, Address)` → event name, outbid bidder | `(i128, i128)` → outbid amount, new highest bid | `bid()` called when an existing highest bidder is displaced |
+| Refund Queued | `refund_queued` | `(Symbol, Address)` → event name, refunded bidder | `i128` → refund amount queued | `bid()` called when previous highest bid is moved to pending refunds |
 | Ended (winner) | `ended` | `(Symbol, Address)` → event name, winner | `i128` → winning amount | `end()` called, winner exists |
 | Ended (no bids) | `ended_no_bids` | `(Symbol,)` → event name | `()` | `end()` called with no bids |
 | Ended (reserve not met) | `ended_reserve_not_met` | `(Symbol, Address)` → event name, highest bidder | `(i128, i128)` → highest bid, reserve price | `end()` called, bid < reserve |
 | Bid Withdrawn | `withdrawn` | `(Symbol, Address)` → event name, bidder | `i128` → amount returned | `withdraw()` called by losing bidder |
 | Deadline Extended | `deadline_extended` | `(Symbol,)` → event name | `u32` → new deadline ledger | Anti-snipe window triggered during `bid()` |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, seller | `()` | `cancel()` called by seller (no bids placed) |
+| Credit Applied | `credit_applied` | `(Symbol, Address)` → event name, bidder | `(i128, i128)` → credit used, amount transferred | `bid_with_credit()` called |
+| Dutch Started | `dutch_started` | `(Symbol, Address)` → event name, seller | `(i128, i128, u32, u32)` → start price, floor price, start ledger, duration ledgers | `start_dutch()` called |
+| Dutch Bought | `dutch_bought` | `(Symbol, Address)` → event name, buyer | `i128` → price paid | `buy()` settles a Dutch auction |
+| NFT Escrowed | `nft_escrowed` | `(Symbol, Address)` → event name, NFT contract | `u32` → token id | `start()` / `start_dutch()` with a custodial NFT |
+| NFT Released | `nft_released` | `(Symbol, Address)` → event name, recipient | `u32` → token id | NFT delivered to the winner/buyer or returned to the seller |
 
 ---
 
@@ -238,6 +263,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Initialized | `initialized` | `(Symbol, Address, Address)` → event name, admin, beneficiary | `(u32, i128)` → release ledger, amount | `initialize()` called |
 | Released | `released` | `(Symbol, Address)` → event name, beneficiary | `i128` → amount released | `release()` called after release ledger |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, admin | `i128` → amount returned to admin | `cancel()` called by admin before release ledger |
+| Beneficiary Reassigned | `beneficiary_reassigned` | `(Symbol, Address, Address, Address)` → event name, admin, old beneficiary, new beneficiary | `()` | `reassign_beneficiary()` called |
 
 ---
 
@@ -245,7 +271,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 
 | Event | Symbol | Topics | Data Type | When Fired |
 |-------|--------|--------|-----------|-----------|
-| Initialized | `initialized` | `(Symbol, Address)` → event name, beneficiary | `(i128, u32, u32)` → amount, cliff ledger, end ledger | `initialize()` called |
+| Initialized | `initialized` | `(Symbol, Address)` → event name, beneficiary | `(i128, u32, u32)` → amount, cliff ledger, end ledger | `create_schedule()` called (`initialize()` only configures admin and token) |
 | Claimed | `claimed` | `(Symbol, Address)` → event name, beneficiary | `i128` → amount claimed | `claim()` called |
 | Revoked | `revoked` | `(Symbol, Address)` → event name, beneficiary | `(Address, i128)` → admin, amount returned to admin | `revoke()` called by admin |
 | Admin Released | `admin_released` | `(Symbol, Address)` → event name, admin | `i128` → amount released to admin | `admin_release()` called after vesting end |

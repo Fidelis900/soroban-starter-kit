@@ -1,18 +1,18 @@
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Symbol};
 
 pub fn initialized(env: &Env, admin: &Address, token: &Address) {
-    let topics = (Symbol::new(env, "initialized"),);
-    env.events().publish(topics, (admin.clone(), token.clone()));
+    env.events()
+        .publish((Symbol::new(env, "initialized"),), (admin.clone(), token.clone()));
 }
 
 pub fn wrapped(env: &Env, user: &Address, amount: i128, total: i128) {
-    let topics = (Symbol::new(env, "wrapped"),);
-    env.events().publish(topics, (user.clone(), amount, total));
+    env.events()
+        .publish((Symbol::new(env, "wrapped"),), (user.clone(), amount, total));
 }
 
 pub fn unwrapped(env: &Env, user: &Address, amount: i128, total: i128) {
-    let topics = (Symbol::new(env, "unwrapped"),);
-    env.events().publish(topics, (user.clone(), amount, total));
+    env.events()
+        .publish((Symbol::new(env, "unwrapped"),), (user.clone(), amount, total));
 }
 
 /// Emitted when the contract is paused. Only used when the `pausable` feature is enabled.
@@ -28,5 +28,3 @@ pub fn unpaused(env: &Env, admin: &Address) {
     env.events()
         .publish((Symbol::new(env, "unpaused"), admin.clone()), ());
 }
-
-use soroban_sdk::Symbol;

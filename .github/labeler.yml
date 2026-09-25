@@ -1,14 +1,38 @@
+"contract: auction":
+  - contracts/auction/**/*
+"contract: ballot":
+  - contracts/ballot/**/*
+"contract: bonding-curve":
+  - contracts/bonding-curve/**/*
 "contract: common":
   - contracts/common/**/*
+"contract: crowdfund":
+  - contracts/crowdfund/**/*
 "contract: dao":
   - contracts/dao/**/*
 "contract: escrow":
   - contracts/escrow/**/*
+"contract: lottery":
+  - contracts/lottery/**/*
+"contract: marketplace":
+  - contracts/marketplace/**/*
 "contract: multisig":
   - contracts/multisig/**/*
 "contract: nft":
   - contracts/nft/**/*
+"contract: oracle":
+  - contracts/oracle/**/*
 "contract: staking":
   - contracts/staking/**/*
+"contract: subscription":
+  - contracts/subscription/**/*
+"contract: swap":
+  - contracts/swap/**/*
+"contract: timelock":
+  - contracts/timelock/**/*
 "contract: token":
   - contracts/token/**/*
+"contract: vesting":
+  - contracts/vesting/**/*
+"contract: wrapped-token":
+  - contracts/wrapped-token/**/*

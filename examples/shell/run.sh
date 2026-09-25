@@ -16,26 +16,30 @@ NETWORK_PASSPHRASE="${NETWORK_PASSPHRASE:-Standalone Network ; February 2017}"
 
 MINT_AMOUNT=1000000
 ESCROW_AMOUNT=500000
-DEADLINE=$(( $(date +%s) + 3600 ))
+DISPUTE_TIMEOUT_LEDGERS=100
 
 echo "=== Generating keypairs ==="
 stellar keys generate admin   --network "$NETWORK" --overwrite
 stellar keys generate buyer   --network "$NETWORK" --overwrite
 stellar keys generate seller  --network "$NETWORK" --overwrite
+stellar keys generate arbiter --network "$NETWORK" --overwrite
 
 ADMIN_KEY=$(stellar keys address admin)
 BUYER_KEY=$(stellar keys address buyer)
 SELLER_KEY=$(stellar keys address seller)
+ARBITER_KEY=$(stellar keys address arbiter)
 
-echo "Admin:  $ADMIN_KEY"
-echo "Buyer:  $BUYER_KEY"
-echo "Seller: $SELLER_KEY"
+echo "Admin:   $ADMIN_KEY"
+echo "Buyer:   $BUYER_KEY"
+echo "Seller:  $SELLER_KEY"
+echo "Arbiter: $ARBITER_KEY"
 
 echo ""
 echo "=== Funding accounts via friendbot ==="
-curl -sf "http://localhost:8000/friendbot?addr=$ADMIN_KEY"  > /dev/null
-curl -sf "http://localhost:8000/friendbot?addr=$BUYER_KEY"  > /dev/null
-curl -sf "http://localhost:8000/friendbot?addr=$SELLER_KEY" > /dev/null
+curl -sf "http://localhost:8000/friendbot?addr=$ADMIN_KEY"   > /dev/null
+curl -sf "http://localhost:8000/friendbot?addr=$BUYER_KEY"   > /dev/null
+curl -sf "http://localhost:8000/friendbot?addr=$SELLER_KEY"  > /dev/null
+curl -sf "http://localhost:8000/friendbot?addr=$ARBITER_KEY" > /dev/null
 echo "Funded all accounts"
 
 echo ""
@@ -63,7 +67,7 @@ stellar contract invoke --id "$TOKEN_ID" --source admin --network "$NETWORK" \
   --admin "$ADMIN_KEY" \
   --name "DemoToken" \
   --symbol "DEMO" \
-  --decimal 7
+  --decimals 7
 
 echo ""
 echo "=== Minting tokens to buyer ==="
@@ -74,14 +78,29 @@ stellar contract invoke --id "$TOKEN_ID" --source admin --network "$NETWORK" \
 echo "Minted $MINT_AMOUNT DEMO to buyer"
 
 echo ""
+echo "=== Computing escrow deadline ==="
+# The contract measures deadlines in ledger sequence numbers, not Unix time.
+# A local standalone network closes a ledger roughly every 5s, so ~720
+# ledgers is roughly one hour out.
+LATEST_LEDGER=$(curl -sf -X POST "$RPC_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger","params":{}}' \
+  | grep -o '"sequence":[0-9]*' | head -1 | cut -d: -f2)
+DEADLINE_LEDGER=$(( LATEST_LEDGER + 720 ))
+echo "Latest ledger: $LATEST_LEDGER, deadline ledger: $DEADLINE_LEDGER"
+
+echo ""
 echo "=== Creating escrow ==="
 stellar contract invoke --id "$ESCROW_ID" --source buyer --network "$NETWORK" \
-  -- create \
-  --buyer  "$BUYER_KEY" \
-  --seller "$SELLER_KEY" \
-  --token  "$TOKEN_ID" \
+  -- initialize \
+  --admin   "$ADMIN_KEY" \
+  --buyer   "$BUYER_KEY" \
+  --seller  "$SELLER_KEY" \
+  --arbiter "$ARBITER_KEY" \
+  --token_contract "$TOKEN_ID" \
   --amount "$ESCROW_AMOUNT" \
-  --deadline "$DEADLINE"
+  --deadline_ledger "$DEADLINE_LEDGER" \
+  --dispute_timeout_ledgers "$DISPUTE_TIMEOUT_LEDGERS"
 echo "Escrow created"
 
 echo ""
@@ -93,13 +112,13 @@ echo "Escrow funded"
 echo ""
 echo "=== Marking delivery ==="
 stellar contract invoke --id "$ESCROW_ID" --source seller --network "$NETWORK" \
-  -- mark_delivery
+  -- mark_delivered
 echo "Delivery marked"
 
 echo ""
-echo "=== Releasing funds to seller ==="
+echo "=== Approving delivery (releasing funds to seller) ==="
 stellar contract invoke --id "$ESCROW_ID" --source buyer --network "$NETWORK" \
-  -- release
+  -- approve_delivery
 echo "Funds released"
 
 echo ""

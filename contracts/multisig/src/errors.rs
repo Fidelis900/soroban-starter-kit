@@ -34,6 +34,28 @@ pub enum MultisigError {
     InvalidWeight = 12,
     /// `cleanup_expired` was called before the proposal's expiry ledger was reached.
     NotYetExpired = 13,
+    /// A reentrant call was made while an external invocation was in progress.
+    Reentrant = 14,
+    /// The proposal is queued but its timelock delay has not yet elapsed.
+    TimelockNotElapsed = 15,
+    /// A timelock is configured and the proposal has not been queued yet.
+    NotQueued = 16,
+    /// The proposal has been cancelled.
+    TransactionCancelled = 17,
+    /// No daily spending allowance has been configured.
+    SpendingNotConfigured = 18,
+    /// The caller is not the configured spending operator.
+    NotSpendingOperator = 19,
+    /// The spend would exceed the daily allowance.
+    DailyLimitExceeded = 20,
+    /// Too many allowance spends in the current window.
+    RateLimited = 21,
+    /// Amounts must be positive (limits must be non-negative).
+    InvalidAmount = 22,
+    /// Only the original proposer may cancel a proposal.
+    NotProposer = 14,
+    /// The signer has not signed the proposal, so there is nothing to revoke.
+    NotSigned = 15,
 }
 
 impl_display_error!(
@@ -51,4 +73,15 @@ impl_display_error!(
     ProposalExpired     => "proposal expired",
     InvalidWeight       => "invalid weight",
     NotYetExpired       => "not yet expired",
+    Reentrant           => "reentrant call",
+    TimelockNotElapsed  => "timelock not elapsed",
+    NotQueued           => "not queued",
+    TransactionCancelled => "transaction cancelled",
+    SpendingNotConfigured => "spending not configured",
+    NotSpendingOperator => "not spending operator",
+    DailyLimitExceeded  => "daily limit exceeded",
+    RateLimited         => "rate limited",
+    InvalidAmount       => "invalid amount",
+    NotProposer         => "not proposer",
+    NotSigned           => "not signed",
 );

@@ -393,3 +393,15 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 ---
 
 **Ready to build on Soroban?** Start with any template and customize it for your use case! 🚀
+
+## Handsoff notes
+
+<!-- handsoff-issue-1025 -->
+- #1025: Root Cargo.toml lists "contracts/ballot" as a workspace member twice
+<!-- handsoff-issue-1030 -->
+- #1030: CONTRIBUTING.md contains two entire, inconsistent contributing guides concatenated together — the first ~220 lines are an orphaned pre-19-contract-era version
+<!-- handsoff-issue-1119 -->
+- #1119: contracts/multisig: Off-chain EIP-712 / SEP-format typed signature batch verification
+
+<!-- handsoff-issue-1132 -->
+- #1132: contracts/staking: Time-weighted lockup boosting for staking rewards

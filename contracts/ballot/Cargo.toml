@@ -1,20 +1,15 @@
 [package]
 name = "ballot"
 version = "0.1.0"
-edition = "2024"
-authors.workspace = true
-license.workspace = true
-publish = false
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+edition = "2021"
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-common = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = "1.4"
+proptest-state-machine = "0.1"
 
-[lints]
-workspace = true
+[features]
+testutils = ["soroban-sdk/testutils"]

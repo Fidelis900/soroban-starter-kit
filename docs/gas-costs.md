@@ -111,6 +111,13 @@ are **estimated**, not measured — see [Methodology](#methodology-for-newer-con
 for how they were derived. Treat them as order-of-magnitude guides only, and
 prefer the measured Token/Escrow figures above when precision matters.
 
+> **Tracked as [#970](https://github.com/Fidelis900/soroban-starter-kit/issues/970).**
+> `auction`, `marketplace`, `staking`, `swap`, `dao`, and `lottery` are the
+> priority contracts to move from this estimated section into real Criterion
+> benches — they're the highest-traffic, money-math-heavy templates, and the
+> ones where an undetected compute-unit regression would most directly affect
+> minimum fees / mainnet feasibility.
+
 ### Airdrop Contract
 
 | Function | Estimated CUs (approx.) | Storage ops | Token transfers | Notes |
@@ -264,7 +271,10 @@ Unlike the Token and Escrow tables above (measured via the Criterion benches in
    `benches/benches/`. Adding one per contract (following the pattern of
    `token_ops.rs` / `escrow_ops.rs`) and wiring it into
    `.github/workflows/bench.yml` would let these figures move from *estimated*
-   to *measured* — tracked as follow-up work, not yet filed as an issue.
+   to *measured* — tracked as [#970](https://github.com/Fidelis900/soroban-starter-kit/issues/970).
+   As each contract gains a real bench, move its table out of this section and
+   into the measured tables above, and drop it from the priority list in the
+   [Newer Contracts](#newer-contracts) intro.
 
 Because these figures are model-derived rather than measured, treat them as
 directionally useful for comparing "cheap read" vs. "expensive multi-transfer

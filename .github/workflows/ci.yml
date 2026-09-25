@@ -7,6 +7,7 @@ on:
     branches: [main, develop]
   schedule:
     - cron: '0 0 * * 0' # Runs every Sunday at midnight; drives the `nightly` job only.
+  workflow_dispatch:
 
 jobs:
   fmt:
@@ -23,6 +24,15 @@ jobs:
 
       - name: Check formatting
         run: ./scripts/format-check.sh
+
+  editions:
+    name: Contract editions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check Rust edition consistency
+        run: ./scripts/check-editions.sh
 
   clippy:
     name: Clippy
@@ -46,6 +56,37 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  unsafe-audit:
+    name: Unsafe code audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cargo-geiger-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+
+      - name: Scan workspace for unsafe code
+        run: cargo geiger --workspace --all-features | tee cargo-geiger-report.md
+
+      - name: Upload cargo-geiger report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-geiger-report
+          path: cargo-geiger-report.md
+          if-no-files-found: ignore
+          retention-days: 14
 
   clippy-all-features:
     name: Clippy (all feature combos)
@@ -71,7 +112,7 @@ jobs:
     outputs:
       contracts: ${{ steps.list-contracts.outputs.contracts }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - id: list-contracts
         name: List contracts
         run: echo "contracts=$(ls -d contracts/*/ | xargs -n 1 basename | jq -R . | jq -sc .)" >> $GITHUB_OUTPUT
@@ -85,15 +126,15 @@ jobs:
       matrix:
         contract: ${{ fromJson(needs.list-contracts.outputs.contracts) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: cargo-tests-${{ hashFiles('**/Cargo.lock') }}
 
@@ -104,15 +145,15 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run integration tests
         run: cargo test -p soroban-integration-tests
@@ -210,7 +251,7 @@ jobs:
 
       - name: Comment coverage on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const current = parseFloat('${{ steps.coverage.outputs.percent }}');
@@ -296,7 +337,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: nightly
 
@@ -368,15 +409,15 @@ jobs:
       matrix:
         contract: ${{ fromJson(needs.list-contracts.outputs.contracts) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check DataKey discriminants
         run: cargo test -p ${{ matrix.contract }} -- discriminant_tests --nocapture
@@ -405,13 +446,13 @@ jobs:
     name: Unused dependencies (cargo-machete)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
@@ -423,17 +464,17 @@ jobs:
     name: Unused dependencies (cargo-udeps)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Pin the nightly toolchain so unused-dependency results are reproducible
       # across runs (cargo-udeps requires nightly).
       - name: Install pinned nightly Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2025-06-15
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cargo-udeps
         run: cargo install cargo-udeps --locked
@@ -461,11 +502,18 @@ jobs:
       - name: Check Cargo.lock is up to date
         run: cargo update --locked --workspace
 
-  semver:
-    name: Semver Checks
+  semver-check:
+    name: Semver Checks (${{ matrix.contract }})
+    needs: [list-contracts]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        contract: ${{ fromJson(needs.list-contracts.outputs.contracts) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -474,15 +522,39 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cargo-semver-${{ matrix.contract }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked
 
-      - name: Check soroban-token-template for breaking changes
-        run: cargo semver-checks -p soroban-token-template
+      # cargo-semver-checks needs something to diff against. We use the
+      # default branch (`origin/main`) as the baseline rather than the
+      # last crates.io release, since these contract crates aren't
+      # published there. If a contract doesn't exist yet on `origin/main`
+      # (e.g. it was just added in this PR), there is nothing to compare
+      # against — treat that as a first-time check and skip cleanly
+      # instead of failing CI setup.
+      - name: Check for baseline on default branch
+        id: baseline
+        run: |
+          git fetch origin main --depth=1
+          if git show "origin/main:contracts/${{ matrix.contract }}/Cargo.toml" > /dev/null 2>&1; then
+            echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Check soroban-escrow-template for breaking changes
-        run: cargo semver-checks -p soroban-escrow-template
+      - name: Check ${{ matrix.contract }} for breaking changes
+        if: steps.baseline.outputs.has_baseline == 'true'
+        run: |
+          cargo semver-checks --manifest-path "contracts/${{ matrix.contract }}/Cargo.toml" \
+            --baseline-rev origin/main
+
+      - name: Skip semver check (no baseline yet)
+        if: steps.baseline.outputs.has_baseline == 'false'
+        run: |
+          echo "No 'origin/main' baseline found for contracts/${{ matrix.contract }} — this is its first semver check, so there is nothing to diff against yet. Skipping; future changes will be checked against this commit."
 
   smoke-test:
     name: Smoke Test (local node)
@@ -576,42 +648,46 @@ jobs:
     # not, so it stays as a slower, weekly, non-blocking cross-check.
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Compile all contracts
         run: cargo build --workspace --all-targets
       - name: Test all contracts
         run: cargo test --workspace --all-targets
       - name: Report failure
         if: ${{ failure() }}
-        uses: actions/create-issue@v2
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
-          title: "Nightly build failed"
-          body: "The nightly build failed. Please investigate."
-          labels: "bug"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Nightly build failed',
+              body: `The nightly build failed. Please investigate: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug'],
+            });
 
   soroban-sdk-next:
     name: Soroban SDK Next Version Compatibility
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
           components: clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: cargo-next-sdk-${{ hashFiles('**/Cargo.lock') }}
 

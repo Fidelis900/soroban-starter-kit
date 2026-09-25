@@ -28,17 +28,9 @@ Definitions for Soroban and Stellar terms used across this repository's contract
 | **SEP-41** | The Stellar Ecosystem Proposal defining the standard token interface (`transfer`, `approve`, `balance`, `allowance`, etc.) that this repo's `token` contract implements for interoperability with wallets and other contracts. |
 | **State archival** | The Soroban mechanism (introduced under Protocol 23, CAP-62/66) by which persistent and temporary ledger entries whose TTL expires are removed from active state and must be explicitly restored before use again. This is why every contract in this repo calls `extend_ttl` on its hot storage keys. |
 | **`stellar` / `soroban` CLI** | The command-line tool (`stellar-cli`, formerly `soroban-cli`) used throughout this repo's `scripts/` and `Makefile`/`justfile` targets to build, deploy, and invoke contracts. |
-| **Temporary storage** | The Soroban storage tier for short-lived, scratch data that is deliberately allowed to be deleted once its TTL expires, with no restoration path. Cheapest of the three tiers; unused by the current templates but available for scratch/nonce-style data. |
+| **Temporary storage** | The Soroban storage tier for short-lived, scratch data that is deliberately allowed to be deleted once its TTL expires, with no restoration path. Cheapest of the three tiers; used by the `token` contract's SEP-41 allowance system, which stores `Allowance` entries here since they have a natural expiry and need not survive archival (see `contracts/token/src/allowance.rs`). |
 | **TTL (Time To Live)** | The number of ledgers remaining before a storage entry becomes eligible for archival. Contracts in this repo call `extend_ttl` (wrapped as `bump_instance` / `bump_token` / similar helpers) on every interaction to keep active data alive; see `LEDGER_LIFETIME_THRESHOLD` and `LEDGER_BUMP_AMOUNT` in [architecture.md](architecture.md#ttl--bump-strategy). |
 | **Upgrade (contract upgrade)** | Replacing a deployed contract's WASM bytecode via the `update_current_contract_wasm` host function while preserving its contract ID and storage. Some templates in this repo (e.g. `token`, `escrow` under the `upgradeable`/`pausable` feature) gate this behind an admin-proposed, time-locked flow — see [upgrade-guide.md](upgrade-guide.md). |
 | **WASM (WebAssembly)** | The compiled bytecode format Soroban contracts run as. `cargo build` in this repo targets `wasm32-unknown-unknown`; `stellar contract build` produces the optimized `.wasm` that gets deployed. |
 | **XDR** | External Data Representation — the binary encoding Stellar uses for ledger entries, transactions, and contract values (`ScVal`) on the wire and in storage. Tools like Stellar Laboratory decode/encode XDR for human inspection. |
-| **XLM / stroop** | XLM (lumens) is Stellar's native asset, used to pay transaction and resource fees. A stroop is the smallest unit, `1 XLM = 10,000,000 stroops`. |
-
-## See Also
-
-- [Architecture](architecture.md) — storage tiers, admin model, and TTL strategy in context
-- [Threat Model](threat-model.md) — per-contract trusted roles
-- [Storage Layout](storage-layout.md)
-- [Soroban Documentation](https://soroban.stellar.org/docs)
-- [Stellar Glossary](https://developers.stellar.org/docs/learn/glossary) — the canonical upstream glossary for terms not specific to this repo
+| **XLM / stroop** | XLM (lumens) is Stellar's native asset, used to pay transaction and resource fees. A stroop is the smallest unit of XLM (1 XLM = 10,000,000 stroops), and Soroban resource fees are denominated in stroops. |

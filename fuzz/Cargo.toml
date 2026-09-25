@@ -1,68 +1,22 @@
 [package]
-name = "soroban-token-fuzz"
-version = "0.1.0"
-edition = "2024"
-authors.workspace = true
-license.workspace = true
+name = "fuzz"
+version = "0.0.0"
 publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
 
 [dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
-soroban-token-template = { path = "../contracts/token" }
-soroban-escrow-template = { path = "../contracts/escrow" }
-soroban-swap-template = { path = "../contracts/swap" }
-soroban-airdrop-template = { path = "../contracts/airdrop" }
-soroban-lottery-template = { path = "../contracts/lottery" }
-soroban-oracle-template = { path = "../contracts/oracle" }
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.multisig]
+path = ".."
 
 [[bin]]
-name = "token_fuzz"
-path = "fuzz_targets/token_fuzz.rs"
+name = "multisig_state_machine"
+path = "fuzz_targets/multisig_state_machine.rs"
 test = false
 doc = false
-
-[[bin]]
-name = "escrow_initialize"
-path = "fuzz_targets/escrow_initialize.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "token_mint_burn"
-path = "fuzz_targets/token_mint_burn.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "swap_state_machine"
-path = "fuzz_targets/swap_state_machine.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "airdrop_merkle_proof"
-path = "fuzz_targets/airdrop_merkle_proof.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "lottery_draw"
-path = "fuzz_targets/lottery_draw.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "oracle_median"
-path = "fuzz_targets/oracle_median.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "escrow_state_machine"
-path = "fuzz_targets/escrow_state_machine.rs"
-test = false
-doc = false
-
-[lints]
-workspace = true
+bench = false

@@ -100,6 +100,9 @@ fuzz_target!(|data: &[u8]| {
     // Register swap contract
     let swap_addr = env.register_contract(None, SwapContract);
     let swap = soroban_swap_template::SwapContractClient::new(&env, &swap_addr);
+    let swap_admin = Address::generate(&env);
+    let swap_treasury = Address::generate(&env);
+    let _ = swap.try_initialize(&swap_admin, &swap_treasury, &0u32);
 
     // Create a pool of addresses
     let pool = [
@@ -196,8 +199,8 @@ fuzz_target!(|data: &[u8]| {
                     if let Ok(Ok(swap_info)) = swap.try_get_swap(&swap_id) {
                         assert_eq!(
                             swap_info.state,
-                            soroban_swap_template::SwapState::Completed,
-                            "swap should be in Completed state after accept"
+                            soroban_swap_template::SwapState::Executed,
+                            "swap should be in Executed state after accept"
                         );
                     }
 

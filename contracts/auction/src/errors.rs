@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuctionError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
@@ -20,8 +20,17 @@ pub enum AuctionError {
     NothingToWithdraw = 11,
     /// The auction ended but the highest bid did not meet the reserve price.
     ReserveNotMet = 12,
-    /// `cancel` was called after at least one bid has been placed.
+    /// `cancel` was called after at least one bid has been placed and the
+    /// cancellation grace window is disabled or has elapsed.
     BidAlreadyPlaced = 13,
+    /// A checked arithmetic operation on bid, refund, or price values overflowed.
+    Overflow = 14,
+    /// The call does not apply to this auction's mode (English vs. Dutch).
+    WrongMode = 15,
+    /// `buy` was called before the Dutch auction's `start_ledger`.
+    AuctionNotStarted = 16,
+    /// Exactly one of `nft_contract` / `token_id` was supplied.
+    InvalidNftParams = 17,
 }
 
 impl_display_error!(
@@ -38,7 +47,12 @@ impl_display_error!(
     InvalidDeadline    => "invalid deadline",
     NothingToWithdraw  => "nothing to withdraw",
     ReserveNotMet      => "reserve price not met",
+    BidAlreadyPlaced   => "cannot cancel after a bid outside the grace window",
     BidAlreadyPlaced   => "cannot cancel after a bid has been placed",
+    Overflow           => "arithmetic overflow",
+    WrongMode          => "operation not supported in this auction mode",
+    AuctionNotStarted  => "auction has not started",
+    InvalidNftParams   => "nft_contract and token_id must be supplied together",
 );
 
 #[cfg(test)]
@@ -65,7 +79,11 @@ AuctionError::InvalidAmount = {}\n\
 AuctionError::InvalidDeadline = {}\n\
 AuctionError::NothingToWithdraw = {}\n\
 AuctionError::ReserveNotMet = {}\n\
-AuctionError::BidAlreadyPlaced = {}\n",
+AuctionError::BidAlreadyPlaced = {}\n\
+AuctionError::Overflow = {}\n\
+AuctionError::WrongMode = {}\n\
+AuctionError::AuctionNotStarted = {}\n\
+AuctionError::InvalidNftParams = {}\n",
             AuctionError::AlreadyInitialized as u32,
             AuctionError::NotInitialized as u32,
             AuctionError::AuctionEnded as u32,
@@ -79,6 +97,10 @@ AuctionError::BidAlreadyPlaced = {}\n",
             AuctionError::NothingToWithdraw as u32,
             AuctionError::ReserveNotMet as u32,
             AuctionError::BidAlreadyPlaced as u32,
+            AuctionError::Overflow as u32,
+            AuctionError::WrongMode as u32,
+            AuctionError::AuctionNotStarted as u32,
+            AuctionError::InvalidNftParams as u32,
         )
     }
 

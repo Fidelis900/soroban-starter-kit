@@ -35,7 +35,7 @@ cat > "$DEST/Cargo.toml" <<TOML
 [package]
 name = "soroban-${NAME}"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors.workspace = true
 description = "${NAME} Soroban contract"
 license.workspace = true

@@ -80,14 +80,19 @@ All token events are emitted by `contracts/token` and follow this structure:
 | `mint` | `Symbol("mint")` | `Address` (recipient) | — | `i128` (amount) |
 | `burn` | `Symbol("burn")` | `Address` (account) | — | `i128` (amount) |
 | `transfer` | `Symbol("transfer")` | `Address` (from) | `Address` (to) | `i128` (amount) |
+| `account_frozen` | `Symbol("account_frozen")` | `Address` (account) | — | `()` |
+| `account_unfrozen` | `Symbol("account_unfrozen")` | `Address` (account) | — | `()` |
 | `approve` | `Symbol("approve")` | `Address` (owner) | `Address` (spender) | `i128` (amount) |
 | `revoke` | `Symbol("revoke")` | `Address` (owner) | `Address` (spender) | `()` |
 | `admin_changed` | `Symbol("admin_changed")` | `Address` (old admin) | — | `Address` (new admin) |
 | `admin_proposed` | `Symbol("admin_proposed")` | `Address` (current admin) | — | `Address` (pending admin) |
 | `admin_accepted` | `Symbol("admin_accepted")` | `Address` (new admin) | — | `()` |
+| `admin_proposal_cancelled` | `Symbol("admin_proposal_cancelled")` | `Address` (admin) | — | `()` |
 | `paused` | `Symbol("paused")` | `Address` (admin) | — | `()` |
 | `unpaused` | `Symbol("unpaused")` | `Address` (admin) | — | `()` |
 | `upgraded` | `Symbol("upgraded")` | `Address` (admin) | — | `BytesN<32>` (wasm hash) |
+| `hook_set` | `Symbol("hook_set")` | `Address` (admin) | — | `Option<Address>` (hook; `None` to clear) |
+| `snapshot` | `Symbol("snapshot")` | `Address` (account) | `u32` (ledger) | `i128` (balance) |
 | `permit_signer_set` | `Symbol("permit_signer_set")` | `Address` (owner) | — | `()` |
 | `permit_used` | `Symbol("permit_used")` | `Address` (owner) | `Address` (spender) | `(i128 amount, u32 nonce)` |
 
@@ -97,6 +102,14 @@ changes via `approve`/`revoke` needs no special-casing for signature-granted
 allowances. Watch `permit_signer_set` for unexpected signer rotations — a
 rotation invalidates all outstanding, unsubmitted permits signed with the
 previous key.
+
+`account_frozen` / `account_unfrozen` are the compliance freeze signals — index
+both if you need to know which accounts currently cannot transfer. `hook_set`
+fires from `set_transfer_hook` (data is `None` when the hook is cleared).
+`snapshot` is the governance balance snapshot from `snapshot()` (issue #717);
+topic[2] is the ledger the snapshot is recorded against. `admin_proposal_cancelled`
+fires when the current admin aborts a pending two-step admin transfer via
+`cancel_admin_proposal`.
 
 ### Escrow Contract Events
 
@@ -125,9 +138,17 @@ Events emitted by `contracts/subscription`:
 | Event | Topic[0] | Topic[1] | Topic[2] | Data |
 |-------|----------|----------|----------|------|
 | `initialized` | `Symbol("initialized")` | `Address` (provider) | — | `Address` (token) |
-| `subscribed` | `Symbol("subscribed")` | `Address` (subscriber) | — | `(i128 amount, u32 interval_ledgers)` |
+| `plan_registered` | `Symbol("plan_registered")` | `Symbol` (plan_id) | — | `(i128 amount, u32 interval_ledgers)` |
+| `plan_updated` | `Symbol("plan_updated")` | `Symbol` (plan_id) | — | `bool` (active) |
+| `subscribed` | `Symbol("subscribed")` | `Address` (subscriber) | — | `(Symbol plan_id, i128 amount, u32 interval_ledgers)` |
 | `charged` | `Symbol("charged")` | `Address` (subscriber) | `Address` (provider) | `i128` (amount) |
 | `cancelled` | `Symbol("cancelled")` | `Address` (subscriber) | — | `()` |
+| `trial_completed` | `Symbol("trial_completed")` | `Address` (subscriber) | — | `()` |
+
+`plan_registered` fires from `register_plan`; `plan_updated` from `set_plan_active`.
+`subscribed` data includes `plan_id` so an indexer can join a subscription to its plan
+without a separate lookup. `trial_completed` is emitted from `charge()` when a
+subscriber's trial period ends (no separate `complete_trial` entry point).
 
 ### Wrapped-Token Contract Events
 
@@ -756,6 +777,20 @@ Prometheus datasource and the metrics described in §10. Replace the
 > config so it is recreated on every environment.
 
 ---
+## 11. Example Grafana Dashboard
+
+An importable starter dashboard is checked in at [`examples/grafana/contract-events.json`](../examples/grafana/contract-events.json). It visualizes event volume, event-processing error rate, and errors observed in the last hour, with a contract selector for operators.
+
+The dashboard expects a Prometheus adapter to expose these counters with a `contract` label:
+
+| Metric | Required label | Meaning |
+|---|---|---|
+| `soroban_contract_events_total` | `contract` | Counter of decoded events by contract |
+| `soroban_contract_events_errors_total` | `contract` | Counter of event decoding or processing errors by contract |
+
+To import it, open **Dashboards → Import** in Grafana, upload the JSON file, select the Prometheus data source, and click **Import**. If the adapter uses different metric names, update the panel PromQL expressions after import. The `clamp_min` expression in the error-rate panel avoids division by zero for contracts with no recent events.
+
+This export is an operator starting point rather than a complete alert policy. Pair it with alerts for sustained ingestion errors, missing event traffic, RPC failures, and contract-specific invariants such as the wrapped-token reserve check documented above.
 
 ## 12. Resources
 
@@ -764,3 +799,71 @@ Prometheus datasource and the metrics described in §10. Replace the
 - [Stellar Expert Explorer](https://stellar.expert)
 - [soroban-sdk event docs](https://docs.rs/soroban-sdk/latest/soroban_sdk/struct.Events.html)
 - [XDR types reference](https://developers.stellar.org/docs/learn/fundamentals/transactions/list-of-operations)
+
+
+## 8. Failed-Transaction Alert Rules
+
+The examples below assume an indexer exports monotonically increasing counters named `soroban_transactions_total` and `soroban_transaction_failures_total`, each labeled with `contract_id` and `contract_name`. Adjust the window and thresholds to the normal traffic profile of each deployment; use `for` to avoid paging on a single transient failure.
+
+```yaml
+groups:
+  - name: soroban-transaction-health
+    rules:
+      - alert: SorobanContractFailureRateHigh
+        expr: |
+          (
+            sum by (contract_id, contract_name) (
+              increase(soroban_transaction_failures_total[10m])
+            )
+            /
+            clamp_min(
+              sum by (contract_id, contract_name) (
+                increase(soroban_transactions_total[10m])
+              ), 1
+            )
+          ) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated failed-transaction rate for {{ $labels.contract_name }}"
+          description: "More than 10% of transactions failed for 15 minutes. Check recent deployments, authorization errors, and dependency health."
+
+      - alert: SorobanContractFailureRateCritical
+        expr: |
+          (
+            sum by (contract_id, contract_name) (
+              increase(soroban_transaction_failures_total[5m])
+            )
+            /
+            clamp_min(
+              sum by (contract_id, contract_name) (
+                increase(soroban_transactions_total[5m])
+              ), 1
+            )
+          ) > 0.25
+          and
+          sum by (contract_id, contract_name) (
+            increase(soroban_transactions_total[5m])
+          ) >= 20
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical failed-transaction rate for {{ $labels.contract_name }}"
+          description: "At least 20 transactions were observed and more than 25% failed in each five-minute window. Investigate immediately and consider pausing the affected contract."
+
+      - alert: SorobanContractFailureBurst
+        expr: |
+          sum by (contract_id, contract_name) (
+            increase(soroban_transaction_failures_total[5m])
+          ) >= 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failed-transaction burst for {{ $labels.contract_name }}"
+          description: "At least 10 failed transactions occurred in five minutes. This catches incidents even when total traffic is too low for a percentage threshold."
+```
+
+The 10% warning threshold is intended to identify degradation before it becomes a widespread outage. The 25% critical threshold requires at least 20 attempts so that a low-volume contract does not page on a single failure. The burst rule is complementary: it detects a sustained absolute spike and is useful for contracts with uneven traffic. Route alerts by `contract_id`, include the deployment environment in the metric labels, and link each alert to the relevant runbook and transaction/event dashboard.

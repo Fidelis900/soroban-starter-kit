@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapError {
     NotAuthorized = 1,
     SwapNotFound = 2,
@@ -18,6 +18,11 @@ pub enum SwapError {
     AlreadyInitialized = 9,
     NotInitialized = 10,
     InvalidFee = 11,
+    BasketSwapNotFound = 12,
+    MathOverflow = 13,
+    StorageError = 14,
+    FeeZeroNotAllowed = 12,
+    ExecutionDelayExceeded = 13,
 }
 
 impl_display_error!(
@@ -33,6 +38,22 @@ impl_display_error!(
     AlreadyInitialized => "contract already initialized",
     NotInitialized     => "contract not initialized",
     InvalidFee         => "invalid fee basis points",
+    BasketSwapNotFound => "basket swap not found",
+    MathOverflow       => "arithmetic overflow",
+    StorageError       => "storage error",
+    NotAuthorized          => "not authorized",
+    SwapNotFound           => "swap not found",
+    InvalidState           => "invalid swap state",
+    DeadlineExpired        => "swap deadline has expired",
+    InvalidAmount          => "invalid amount",
+    InvalidDeadline        => "invalid deadline",
+    AlreadyCompleted       => "swap already completed",
+    AlreadyCancelled       => "swap already cancelled",
+    AlreadyInitialized     => "contract already initialized",
+    NotInitialized         => "contract not initialized",
+    InvalidFee             => "invalid fee basis points",
+    FeeZeroNotAllowed      => "fee truncated to zero or below minimum required",
+    ExecutionDelayExceeded => "maximum execution delay exceeded",
 );
 
 #[cfg(test)]

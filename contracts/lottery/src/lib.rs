@@ -157,11 +157,6 @@ mod contract {
 
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             let token_addr: Address = get_required(&env, &Token)?;
-            token::Client::new(&env, &token_addr).transfer(
-                &buyer,
-                &env.current_contract_address(),
-                &ticket_price,
-            );
 
             let mut participants: Vec<Address> = get_required(&env, &Participants)?;
             participants.push_back(&buyer);
@@ -174,6 +169,12 @@ mod contract {
                 &TicketCount(&buyer),
                 LEDGER_LIFETIME_THRESHOLD,
                 LEDGER_BUMP_AMOUNT,
+            );
+
+            token::Client::new(&env, &token_addr).transfer(
+                &buyer,
+                &env.current_contract_address(),
+                &ticket_price,
             );
 
             bump_instance(&env);
@@ -306,6 +307,14 @@ mod contract {
                 pool = remaining;
             }
 
+            // Mark the draw complete before distributing the prize pool. If any transfer fails,
+            // the transaction reverts this state transition together with the failed call.
+            env.storage().instance().set(&State, &LotteryState::Drawn);
+            env.storage().instance().set(&Winners, &winners);
+            #[allow(clippy::unwrap_used)] // winner_count >= 1, validated at initialize
+            let first_winner = winners.get(0).unwrap();
+            env.storage().instance().set(&Winner, &first_winner);
+
             // Distribute the prize pool according to the configured splits.
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
@@ -323,12 +332,6 @@ mod contract {
                 token_client.transfer(&env.current_contract_address(), &winner, &amount);
                 events::winner_drawn(&env, &winner, amount);
             }
-
-            env.storage().instance().set(&State, &LotteryState::Drawn);
-            env.storage().instance().set(&Winners, &winners);
-            #[allow(clippy::unwrap_used)] // winner_count >= 1, validated at initialize
-            let first_winner = winners.get(0).unwrap();
-            env.storage().instance().set(&Winner, &first_winner);
 
             bump_instance(&env);
             Ok(winners)

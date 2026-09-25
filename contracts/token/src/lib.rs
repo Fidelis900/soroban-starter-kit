@@ -448,6 +448,18 @@ mod contract {
             events::unpaused(&env, &admin);
             Ok(())
         }
+
+        /// Return `true` when the contract is paused, `false` otherwise.
+        ///
+        /// This is a read-only query — no admin authentication required.
+        /// Use this instead of probing `pause`/`unpause` from monitoring scripts.
+        #[must_use]
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false)
+        }
     }
 
     /// Account freeze — only compiled when the `freeze` feature is enabled.

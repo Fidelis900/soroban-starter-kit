@@ -11,3 +11,7 @@ AuctionError::InvalidDeadline = 10
 AuctionError::NothingToWithdraw = 11
 AuctionError::ReserveNotMet = 12
 AuctionError::BidAlreadyPlaced = 13
+AuctionError::Overflow = 14
+AuctionError::WrongMode = 15
+AuctionError::AuctionNotStarted = 16
+AuctionError::InvalidNftParams = 17

@@ -53,12 +53,13 @@ WASM_HASH="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 **Important:** Only call this if your contract includes timelock pause functionality (escrow with `pausable` feature).
 
-Propose the upgrade to activate after timelock delay:
+Propose the upgrade to activate after the timelock delay:
+
+> **Important:** The timelock delay is a **fixed contract constant** (`UPGRADE_DELAY_LEDGERS = 17_280`), not a parameter you supply at call time. `propose_upgrade` only accepts the WASM hash; the delay is always 17,280 ledgers (≈ 24 hours at 5 s/ledger: 17,280 × 5 s = 86,400 s) regardless of any shell variable you set locally.
 
 ```bash
 CONTRACT_ID="CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 ADMIN_KEY="admin-key"
-TIMELOCK_DELAY_LEDGERS=300  # ~1.5 hours on mainnet (every 5 seconds)
 
 stellar contract invoke \
   --id $CONTRACT_ID \
@@ -67,12 +68,12 @@ stellar contract invoke \
   -- propose_upgrade --wasm_hash $WASM_HASH
 ```
 
-**Response:** Proposal created. Current ledger: `12345`. Execution available at: `12645`.
+**Response:** Proposal created. Current ledger: `12345`. Execution available at: `29625` (12345 + 17280).
 
 Record the target ledger for step 3.
 
 ```bash
-TARGET_LEDGER=12645
+TARGET_LEDGER=29625  # example: 12345 + 17280
 ```
 
 ## Step 3: Wait for Timelock (Optional Key Rotation)
@@ -88,14 +89,16 @@ stellar keys generate new-admin-key
 # Securely back up the secret key
 ```
 
-2. **Export current admin from contract:**
+2. **Export current admin from contract** (token contract only):
+
+> **Note:** This step applies to the **token** contract, which exposes a single `admin` function. The **escrow** contract uses role-based parties (buyer / seller / arbiter) with no single admin address — skip this step for escrow.
 
 ```bash
 CURRENT_ADMIN=$(stellar contract invoke \
   --id $CONTRACT_ID \
   --network testnet \
   --source $ADMIN_KEY \
-  -- get_admin)
+  -- admin)
 ```
 
 3. **Update admin in new code** (if contract includes admin management):
@@ -146,7 +149,7 @@ stellar contract invoke \
   --id $CONTRACT_ID \
   --network testnet \
   --source $ADMIN_KEY \
-  -- get_version
+  -- version
 
 # Should return new version string
 ```
@@ -170,15 +173,10 @@ If the upgrade fails:
 
 ### 1. Immediate Actions (Before Timelock Expires)
 
-Cancel the proposal (if supported):
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --network testnet \
-  --source $ADMIN_KEY \
-  -- cancel_upgrade  # If this function exists
-```
+> **Note:** There is currently **no `cancel_upgrade` function** in any contract in this repository. Once `propose_upgrade` is called, the pending proposal cannot be retracted — it will simply become executable after 17,280 ledgers. If you proposed an upgrade by mistake:
+> - Do **not** execute it when the timelock expires.
+> - If you need to prevent execution entirely (e.g., the contract should not be upgraded at all), pausing the contract first and then re-deploying a patched version via a second proposal is the safest path.
+> - As a future improvement, a `cancel_upgrade` function could be added to allow the admin to retract a pending proposal before it becomes executable.
 
 ### 2. Restore Previous WASM
 
@@ -203,18 +201,27 @@ stellar contract invoke \
 
 ### 3. Key Rotation for Revoked Keys
 
-If keys were compromised:
+If keys were compromised, use the two-step admin transfer (token contract):
 
 ```bash
-# 1. Rotate to emergency key (pre-positioned)
+# 1. Propose the emergency key as the new admin (from current, still-accessible key)
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --network testnet \
+  --source $ADMIN_KEY \
+  -- propose_admin --new_admin $EMERGENCY_KEY
+
+# 2. Accept from the new emergency key
 stellar contract invoke \
   --id $CONTRACT_ID \
   --network testnet \
   --source $EMERGENCY_KEY \
-  -- rotate_admin --new_admin $EMERGENCY_KEY
+  -- accept_admin
 
-# 2. Disable all other keys in your key management system
+# 3. Disable all other keys in your key management system
 ```
+
+> **Note:** The `rotate_admin` function does not exist. The token contract uses a two-step `propose_admin` / `accept_admin` flow to prevent admin lockout from typo'd addresses. The escrow contract has no single admin to rotate — its roles (buyer / seller / arbiter) are fixed at initialization; key compromise on escrow requires deploying a new contract instance.
 
 ## Testing Upgrades (Local)
 
@@ -249,7 +256,7 @@ stellar contract invoke \
 stellar contract invoke \
   --id $CONTRACT_ID \
   --network local \
-  -- get_version
+  -- version
 ```
 
 ## Safety Checklist

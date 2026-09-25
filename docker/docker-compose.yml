@@ -1,27 +1,4 @@
 services:
-  frontend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      target: frontend
-    ports:
-      - "3000:3000"
-    volumes:
-      - ..:/app
-      - /app/node_modules # keep container node_modules isolated
-      - /app/node_modules          # keep container node_modules isolated
-      - /app/target                # exclude Rust build artifacts
-      - /app/.git                  # exclude git metadata
-    env_file: ../.env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    depends_on:
-      stellar-node:
-        condition: service_healthy
-
   contracts:
     build:
       context: ..

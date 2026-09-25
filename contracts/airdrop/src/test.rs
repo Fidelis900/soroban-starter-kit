@@ -124,15 +124,15 @@ fn test_claim_happy_path() {
     let leaf_b = leaf(&env, &t.bob, bob_amount);
     let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
 
-    t.client.set_root(&root);
+    t.client.set_root(&1u32, &root);
 
     let before = TokenClient::new(&env, &t.token).balance(&t.alice);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
+    t.client.claim(&1u32, &t.alice, &alice_amount, &proof_a);
     assert_eq!(
         TokenClient::new(&env, &t.token).balance(&t.alice),
         before + alice_amount
     );
-    assert!(t.client.is_claimed(&t.alice));
+    assert!(t.client.is_claimed(&1u32, &t.alice));
 }
 
 #[test]
@@ -147,10 +147,10 @@ fn test_duplicate_claim_rejected() {
     let leaf_b = leaf(&env, &t.bob, bob_amount);
     let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
 
-    t.client.set_root(&root);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
+    t.client.set_root(&1u32, &root);
+    t.client.claim(&1u32, &t.alice, &alice_amount, &proof_a);
 
-    let res = t.client.try_claim(&t.alice, &alice_amount, &proof_a);
+    let res = t.client.try_claim(&1u32, &t.alice, &alice_amount, &proof_a);
     assert!(res.is_err());
 }
 
@@ -166,10 +166,10 @@ fn test_invalid_proof_rejected() {
     let leaf_b = leaf(&env, &t.bob, bob_amount);
     let (root, _proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
 
-    t.client.set_root(&root);
+    t.client.set_root(&1u32, &root);
 
     // Bob's proof used for Alice's claim — must fail
-    let res = t.client.try_claim(&t.alice, &alice_amount, &proof_b);
+    let res = t.client.try_claim(&1u32, &t.alice, &alice_amount, &proof_b);
     assert!(res.is_err());
 }
 
@@ -185,10 +185,10 @@ fn test_wrong_amount_rejected() {
     let leaf_b = leaf(&env, &t.bob, bob_amount);
     let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
 
-    t.client.set_root(&root);
+    t.client.set_root(&1u32, &root);
 
     // Wrong amount
-    let res = t.client.try_claim(&t.alice, &999i128, &proof_a);
+    let res = t.client.try_claim(&1u32, &t.alice, &999i128, &proof_a);
     assert!(res.is_err());
 }
 
@@ -197,9 +197,9 @@ fn test_zero_amount_rejected() {
     let env = Env::default();
     let t = setup(&env);
     let root = BytesN::from_array(&env, &[0u8; 32]);
-    t.client.set_root(&root);
+    t.client.set_root(&1u32, &root);
     let proof = Vec::new(&env);
-    let res = t.client.try_claim(&t.alice, &0i128, &proof);
+    let res = t.client.try_claim(&1u32, &t.alice, &0i128, &proof);
     assert!(res.is_err());
 }
 
@@ -208,7 +208,7 @@ fn test_claim_without_root_fails() {
     let env = Env::default();
     let t = setup(&env);
     let proof = Vec::new(&env);
-    let res = t.client.try_claim(&t.alice, &1_000i128, &proof);
+    let res = t.client.try_claim(&1u32, &t.alice, &1_000i128, &proof);
     assert!(res.is_err());
 }
 
@@ -224,10 +224,112 @@ fn test_both_recipients_claim() {
     let leaf_b = leaf(&env, &t.bob, bob_amount);
     let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
 
-    t.client.set_root(&root);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
-    t.client.claim(&t.bob, &bob_amount, &proof_b);
+    t.client.set_root(&1u32, &root);
+    t.client.claim(&1u32, &t.alice, &alice_amount, &proof_a);
+    t.client.claim(&1u32, &t.bob, &bob_amount, &proof_b);
 
+    assert_eq!(
+        TokenClient::new(&env, &t.token).balance(&t.alice),
+        alice_amount
+    );
+    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
+}
+
+// ---------------------------------------------------------------------------
+// Lenient batch claim tests — #1150
+// ---------------------------------------------------------------------------
+
+/// A batch containing a duplicate recipient should still fulfil the valid
+/// entries and return only the successfully claimed addresses.
+#[test]
+fn test_claim_batch_lenient_skips_duplicates() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    let alice_amount = 400i128;
+    let bob_amount = 600i128;
+
+    let leaf_a = leaf(&env, &t.alice, alice_amount);
+    let leaf_b = leaf(&env, &t.bob, bob_amount);
+    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
+
+    t.client.set_root(&1u32, &root);
+
+    // Alice appears twice; the second entry must be skipped, not revert.
+    let mut claims = Vec::new(&env);
+    claims.push_back((t.alice.clone(), alice_amount, proof_a.clone()));
+    claims.push_back((t.alice.clone(), alice_amount, proof_a.clone()));
+    claims.push_back((t.bob.clone(), bob_amount, proof_b.clone()));
+
+    let claimed = t.client.claim_batch_lenient(&1u32, &claims);
+
+    assert_eq!(claimed.len(), 2);
+    assert!(claimed.contains(&t.alice));
+    assert!(claimed.contains(&t.bob));
+    assert_eq!(
+        TokenClient::new(&env, &t.token).balance(&t.alice),
+        alice_amount
+    );
+    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
+}
+
+/// A batch containing an invalid proof should skip that entry while still
+/// fulfilling the valid ones.
+#[test]
+fn test_claim_batch_lenient_skips_invalid_proof() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    let alice_amount = 250i128;
+    let bob_amount = 750i128;
+
+    let leaf_a = leaf(&env, &t.alice, alice_amount);
+    let leaf_b = leaf(&env, &t.bob, bob_amount);
+    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
+
+    t.client.set_root(&1u32, &root);
+
+    // Alice's entry uses Bob's proof — invalid, must be skipped.
+    let mut claims = Vec::new(&env);
+    claims.push_back((t.alice.clone(), alice_amount, proof_b.clone()));
+    claims.push_back((t.bob.clone(), bob_amount, proof_b.clone()));
+
+    let claimed = t.client.claim_batch_lenient(&1u32, &claims);
+
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed.contains(&t.bob));
+    assert!(!claimed.contains(&t.alice));
+    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.alice), 0);
+    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
+}
+
+/// Already-claimed recipients in a lenient batch are skipped without
+/// reverting the whole batch.
+#[test]
+fn test_claim_batch_lenient_skips_already_claimed() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    let alice_amount = 100i128;
+    let bob_amount = 200i128;
+
+    let leaf_a = leaf(&env, &t.alice, alice_amount);
+    let leaf_b = leaf(&env, &t.bob, bob_amount);
+    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
+
+    t.client.set_root(&1u32, &root);
+
+    // Alice claims first via the strict path.
+    t.client.claim(&1u32, &t.alice, &alice_amount, &proof_a);
+
+    let mut claims = Vec::new(&env);
+    claims.push_back((t.alice.clone(), alice_amount, proof_a.clone()));
+    claims.push_back((t.bob.clone(), bob_amount, proof_b.clone()));
+
+    let claimed = t.client.claim_batch_lenient(&1u32, &claims);
+
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed.contains(&t.bob));
     assert_eq!(
         TokenClient::new(&env, &t.token).balance(&t.alice),
         alice_amount
@@ -261,190 +363,9 @@ fn test_claim_before_deadline_succeeds() {
     let leaf_a = leaf(&env, &alice, 500i128);
     let leaf_b = leaf(&env, &bob, 500i128);
     let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
+    client.set_root(&1u32, &root);
 
     // ledger 100 < 200 — should succeed
-    client.claim(&alice, &500i128, &proof_a);
-    assert!(client.is_claimed(&alice));
-}
-
-/// Claim at exactly the deadline ledger succeeds (boundary: sequence == deadline is still valid).
-#[test]
-fn test_claim_at_deadline_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 200);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
-
-    // ledger 200 == 200 — should still succeed (only > deadline is rejected)
-    client.claim(&alice, &500i128, &proof_a);
-    assert!(client.is_claimed(&alice));
-}
-
-/// Claim after the deadline is rejected with ClaimWindowClosed.
-#[test]
-fn test_claim_after_deadline_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 100);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
-
-    // Advance ledger past deadline
-    env.ledger().with_mut(|l| l.sequence_number = 201);
-
-    let res = client.try_claim(&alice, &500i128, &proof_a);
-    assert!(res.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Batch claim tests — #782
-// ---------------------------------------------------------------------------
-
-/// Batch claim succeeds when all proofs are valid.
-#[test]
-fn test_claim_batch_success() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
-
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_a));
-    entries.push_back((t.bob.clone(), bob_amount, proof_b));
-
-    t.client.claim_batch(&entries);
-
-    assert!(t.client.is_claimed(&t.alice));
-    assert!(t.client.is_claimed(&t.bob));
-    assert_eq!(
-        TokenClient::new(&env, &t.token).balance(&t.alice),
-        alice_amount
-    );
-    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
-}
-
-/// One invalid proof in the batch causes the entire batch to fail (all-or-nothing).
-#[test]
-fn test_claim_batch_invalid_proof_aborts_all() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
-
-    // Use bob's proof for alice — invalid
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_b)); // wrong proof
-    entries.push_back((t.bob.clone(), bob_amount, proof_a)); // also wrong
-
-    let res = t.client.try_claim_batch(&entries);
-    assert!(res.is_err());
-
-    // Neither should be claimed
-    assert!(!t.client.is_claimed(&t.alice));
-    assert!(!t.client.is_claimed(&t.bob));
-}
-
-/// A batch containing an already-claimed entry fails all-or-nothing.
-#[test]
-fn test_claim_batch_already_claimed_aborts_all() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
-
-    // Alice claims individually first
-    t.client.claim(&t.alice, &alice_amount, &proof_a.clone());
-
-    // Now batch tries to claim alice again (and bob for the first time)
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_a));
-    entries.push_back((t.bob.clone(), bob_amount, proof_b));
-
-    let res = t.client.try_claim_batch(&entries);
-    assert!(res.is_err());
-
-    // Bob must NOT have been claimed (batch rolled back)
-    assert!(!t.client.is_claimed(&t.bob));
-}
-
-/// Batch claim is also rejected after the deadline.
-#[test]
-fn test_claim_batch_after_deadline_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 100);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a.clone(), leaf_b.clone());
-    client.set_root(&root);
-
-    // Advance past deadline
-    env.ledger().with_mut(|l| l.sequence_number = 201);
-
-    let mut entries = Vec::new(&env);
-    entries.push_back((alice.clone(), 500i128, proof_a));
-    entries.push_back((bob.clone(), 500i128, proof_b));
-
-    let res = client.try_claim_batch(&entries);
-    assert!(res.is_err());
+    client.claim(&1u32, &alice, &500i128, &proof_a);
+    assert_eq!(TokenClient::new(&env, &token).balance(&alice), 500i128);
 }

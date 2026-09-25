@@ -16,9 +16,9 @@ on:
       environment:
         description: 'Target environment'
         required: true
-        default: staging
+        default: testnet
         type: choice
-        options: [staging, production]
+        options: [testnet, mainnet]
       cloud:
         description: 'Cloud provider'
         required: true
@@ -68,7 +68,7 @@ jobs:
 
   # ── Plan (PRs, pushes, and manual plan trigger) ────────────────────────────
   plan:
-    name: Plan (${{ github.event.inputs.environment || 'staging' }})
+    name: Plan (${{ github.event.inputs.environment || 'testnet' }})
     runs-on: ubuntu-latest
     needs: compliance
     if: >
@@ -76,7 +76,7 @@ jobs:
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
     env:
-      ENV: ${{ github.event.inputs.environment || 'staging' }}
+      ENV: ${{ github.event.inputs.environment || 'testnet' }}
       CLOUD: ${{ github.event.inputs.cloud || 'aws' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

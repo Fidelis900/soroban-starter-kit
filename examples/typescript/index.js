@@ -63,20 +63,28 @@ async function main() {
   const admin = Keypair.random();
   const buyer = Keypair.random();
   const seller = Keypair.random();
+  const arbiter = Keypair.random();
 
   console.log('Admin:', admin.publicKey());
   console.log('Buyer:', buyer.publicKey());
   console.log('Seller:', seller.publicKey());
+  console.log('Arbiter:', arbiter.publicKey());
 
   // Fund accounts via friendbot (local node)
-  for (const kp of [admin, buyer, seller]) {
+  for (const kp of [admin, buyer, seller, arbiter]) {
     await fetch(`http://localhost:8000/friendbot?addr=${kp.publicKey()}`);
     console.log(`Funded ${kp.publicKey().slice(0, 8)}...`);
   }
 
   const MINT_AMOUNT = 1_000_000n;
   const ESCROW_AMOUNT = 500_000n;
-  const DEADLINE = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+  // The contract measures deadlines in ledger sequence numbers, not Unix
+  // time. A local standalone network closes a ledger roughly every 5s, so
+  // ~720 ledgers is roughly one hour out.
+  const latestLedger = await server.getLatestLedger();
+  const DEADLINE_LEDGER = latestLedger.sequence + 720;
+  const DISPUTE_TIMEOUT_LEDGERS = 100;
 
   console.log('\n--- Minting tokens to buyer ---');
   await invokeContract(admin, TOKEN_CONTRACT_ID, 'mint', [
@@ -86,12 +94,16 @@ async function main() {
   console.log(`Minted ${MINT_AMOUNT} tokens to buyer`);
 
   console.log('\n--- Creating escrow ---');
-  await invokeContract(buyer, ESCROW_CONTRACT_ID, 'create', [
+  await invokeContract(buyer, ESCROW_CONTRACT_ID, 'initialize', [
+    new Address(admin.publicKey()).toScVal(),
     new Address(buyer.publicKey()).toScVal(),
     new Address(seller.publicKey()).toScVal(),
+    new Address(arbiter.publicKey()).toScVal(),
     new Address(TOKEN_CONTRACT_ID).toScVal(),
     nativeToScVal(ESCROW_AMOUNT, { type: 'i128' }),
-    nativeToScVal(DEADLINE, { type: 'u64' }),
+    nativeToScVal(DEADLINE_LEDGER, { type: 'u32' }),
+    nativeToScVal(DISPUTE_TIMEOUT_LEDGERS, { type: 'u32' }),
+    xdr.ScVal.scvVoid(), // metadata_hash: None
   ]);
   console.log('Escrow created');
 
@@ -100,11 +112,11 @@ async function main() {
   console.log('Escrow funded');
 
   console.log('\n--- Marking delivery ---');
-  await invokeContract(seller, ESCROW_CONTRACT_ID, 'mark_delivery', []);
+  await invokeContract(seller, ESCROW_CONTRACT_ID, 'mark_delivered', []);
   console.log('Delivery marked');
 
-  console.log('\n--- Releasing funds to seller ---');
-  await invokeContract(buyer, ESCROW_CONTRACT_ID, 'release', []);
+  console.log('\n--- Approving delivery (releasing funds to seller) ---');
+  await invokeContract(buyer, ESCROW_CONTRACT_ID, 'approve_delivery', []);
   console.log('Funds released to seller');
 
   console.log('\nFull escrow lifecycle complete.');

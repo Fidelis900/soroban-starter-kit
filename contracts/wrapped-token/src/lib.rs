@@ -175,7 +175,22 @@ mod contract {
                 );
             }
 
-            // Transfer underlying asset from user to contract
+            let total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalWrapped)
+                .unwrap_or(0i128);
+            let new_total = total + amount;
+
+            // Commit local accounting before making external token calls. Soroban rolls back
+            // this transaction if either interaction fails, while this ordering prevents a
+            // re-entrant token implementation from observing stale supply accounting.
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalWrapped, &new_total);
+            bump(&env);
+
+            // Transfer underlying asset from user to contract.
             token::Client::new(&env, &underlying_token).transfer(
                 &user,
                 &env.current_contract_address(),
@@ -185,18 +200,6 @@ mod contract {
             // Mint wrapped tokens to user. `wrapped_token` must be a Stellar Asset Contract
             // (or other token exposing the admin-mint interface) with this contract set as its admin.
             token::StellarAssetClient::new(&env, &wrapped_token).mint(&user, &amount);
-
-            let total: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalWrapped)
-                .unwrap_or(0i128);
-            let new_total = total + amount;
-            env.storage()
-                .instance()
-                .set(&DataKey::TotalWrapped, &new_total);
-
-            bump(&env);
             events::wrapped(&env, &user, amount, new_total);
             Ok(())
         }
@@ -233,27 +236,29 @@ mod contract {
                 .get(&DataKey::UnderlyingToken)
                 .ok_or(WrappedTokenError::NotInitialized)?;
 
-            // Burn wrapped tokens from user
-            token::Client::new(&env, &wrapped_token).burn(&user, &amount);
-
-            // Transfer underlying asset from contract to user
-            token::Client::new(&env, &underlying_token).transfer(
-                &env.current_contract_address(),
-                &user,
-                &amount,
-            );
-
             let total: i128 = env
                 .storage()
                 .instance()
                 .get(&DataKey::TotalWrapped)
                 .unwrap_or(0i128);
             let new_total = total - amount;
+
+            // Commit local accounting before making external token calls. Any failed call
+            // aborts the transaction and rolls back this effect atomically.
             env.storage()
                 .instance()
                 .set(&DataKey::TotalWrapped, &new_total);
-
             bump(&env);
+
+            // Burn wrapped tokens from user.
+            token::Client::new(&env, &wrapped_token).burn(&user, &amount);
+
+            // Transfer underlying asset from contract to user.
+            token::Client::new(&env, &underlying_token).transfer(
+                &env.current_contract_address(),
+                &user,
+                &amount,
+            );
             events::unwrapped(&env, &user, amount, new_total);
             Ok(())
         }
