@@ -1,11 +1,12 @@
 #![no_std]
+#![no_std]
 #![deny(missing_docs)]
 //! Bonding-curve token sale contract template.
 //!
 //! Token price scales deterministically with supply along a bonding curve;
 //! buyers mint tokens by paying the curve price and sellers burn to redeem.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutils"))]
 extern crate std;
 
 use soroban_sdk::{Address, Env, contract, contractimpl, token};
@@ -18,10 +19,11 @@ mod storage;
 mod prop_test;
 
 pub use errors::BondingCurveError;
-pub use storage::{DataKey, PRICE_SCALE};
+pub use storage::{CurveState, DataKey, PRICE_SCALE};
 use storage::{BPS_DENOMINATOR, MAX_FEE_BPS, MIN_CONNECTOR_WEIGHT_BPS};
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance};
+use storage::{BUY_COOLDOWN_LEDGERS, CurveState, MAX_BUYS_PER_LEDGER};
 
 fn bump(env: &Env) {
     extend_ttl_instance(env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
@@ -416,6 +418,10 @@ mod contract {
 impl BondingCurveContract {
     /// Initialize the bonding curve contract.
     ///
+    /// `graduation_supply_cap` — when `Some(cap)`, the curve automatically
+    /// transitions to `Graduated` the first time `supply >= cap` after a buy.
+    /// Pass `None` to disable automatic graduation.
+    ///
     /// # Errors
     /// - [`BondingCurveError::AlreadyInitialized`] if called more than once.
     pub fn initialize(
@@ -427,6 +433,7 @@ impl BondingCurveContract {
         connector_weight_bps: u32,
         fee_bps: u32,
         treasury: Address,
+        graduation_supply_cap: Option<i128>,
     ) -> Result<(), BondingCurveError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(BondingCurveError::AlreadyInitialized);
@@ -436,6 +443,11 @@ impl BondingCurveContract {
         }
         if fee_bps > MAX_FEE_BPS {
             return Err(BondingCurveError::InvalidFee);
+        }
+        if let Some(cap) = graduation_supply_cap {
+            if cap <= 0 {
+                return Err(BondingCurveError::InvalidConfiguration);
+            }
         }
         admin.require_auth();
 
@@ -449,6 +461,10 @@ impl BondingCurveContract {
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::Price, &base_price);
+        env.storage().instance().set(&DataKey::CurveState, &CurveState::Active);
+        if let Some(cap) = graduation_supply_cap {
+            env.storage().instance().set(&DataKey::GraduationSupplyCap, &cap);
+        }
 
         bump(&env);
         events::initialized(&env, &admin, &token);
@@ -478,17 +494,81 @@ impl BondingCurveContract {
 
     /// Buy `amount` tokens by paying from the reserve.
     ///
+    /// # Anti-sandwich protections (#1089)
+    ///
+    /// Two complementary guards prevent atomic same-ledger sandwich attacks:
+    ///
+    /// 1. **Per-ledger rate limit** — a single address may submit at most
+    ///    `MAX_BUYS_PER_LEDGER` buys within the same ledger sequence. An
+    ///    attacker who front-runs a victim in the same ledger hits this cap
+    ///    and cannot also sell in the same ledger.
+    ///
+    /// 2. **Buy cooldown** — at least `BUY_COOLDOWN_LEDGERS` must elapse
+    ///    between successive buys from the same address. This makes multi-block
+    ///    sandwich loops prohibitively slow relative to normal user traffic.
+    ///
+    /// Both guards are enforced *before* any state mutation or token transfer.
+    ///
     /// # Errors
     /// - [`BondingCurveError::NotInitialized`] if the contract has not been initialized.
+    /// - [`BondingCurveError::CurveGraduated`] if the curve has already graduated.
     /// - [`BondingCurveError::InvalidAmount`] if `amount` <= 0.
+    /// - [`BondingCurveError::RateLimitExceeded`] if the caller has already bought
+    ///   `MAX_BUYS_PER_LEDGER` times in this ledger sequence.
+    /// - [`BondingCurveError::CooldownActive`] if fewer than `BUY_COOLDOWN_LEDGERS`
+    ///   have elapsed since the caller's last buy.
+    /// - [`BondingCurveError::InvalidAmount`] if the computed cost exceeds `max_cost`.
     pub fn buy(env: Env, buyer: Address, amount: i128, max_cost: i128) -> Result<(), BondingCurveError> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(BondingCurveError::NotInitialized);
         }
+
+        // Graduation guard: no new minting once graduated.
+        let state: CurveState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurveState)
+            .unwrap_or(CurveState::Active);
+        if state == CurveState::Graduated {
+            return Err(BondingCurveError::CurveGraduated);
+        }
+
         if amount <= 0 {
             return Err(BondingCurveError::InvalidAmount);
         }
         buyer.require_auth();
+
+        let current_ledger = env.ledger().sequence();
+
+        // ── Rate-limit guard ──────────────────────────────────────────────
+        // Check how many buys this address has already made this ledger.
+        let last_ledger_key = DataKey::LastBuyLedger(buyer.clone());
+        let buys_key = DataKey::BuysThisLedger(buyer.clone());
+
+        let last_buy_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&last_ledger_key)
+            .unwrap_or(0);
+
+        let buys_this_ledger: u32 = if last_buy_ledger == current_ledger {
+            env.storage().persistent().get(&buys_key).unwrap_or(0)
+        } else {
+            0 // new ledger — counter resets
+        };
+
+        if buys_this_ledger >= MAX_BUYS_PER_LEDGER {
+            return Err(BondingCurveError::RateLimitExceeded);
+        }
+
+        // ── Cooldown guard ────────────────────────────────────────────────
+        // The very first buy (last_buy_ledger == 0) is always allowed.
+        if last_buy_ledger > 0 {
+            let ledgers_since_last = current_ledger.saturating_sub(last_buy_ledger);
+            if ledgers_since_last < BUY_COOLDOWN_LEDGERS {
+                return Err(BondingCurveError::CooldownActive);
+            }
+        }
 
         let token: Address = env
             .storage()
@@ -532,6 +612,21 @@ impl BondingCurveContract {
         env.storage().instance().set(&DataKey::Supply, &new_supply);
         env.storage().instance().set(&DataKey::Reserve, &new_reserve);
         env.storage().instance().set(&DataKey::Price, &new_price);
+
+        // ── Update rate-limit state ───────────────────────────────────────
+        let new_buys_this_ledger = buys_this_ledger.saturating_add(1);
+        env.storage().persistent().set(&last_ledger_key, &current_ledger);
+        env.storage().persistent().set(&buys_key, &new_buys_this_ledger);
+        env.storage().persistent().extend_ttl(&last_ledger_key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(&buys_key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+
+        // ── Auto-graduation check (#1090) ─────────────────────────────────
+        if let Some(cap) = env.storage().instance().get::<_, i128>(&DataKey::GraduationSupplyCap) {
+            if new_supply >= cap {
+                env.storage().instance().set(&DataKey::CurveState, &CurveState::Graduated);
+                events::graduated(&env, cap, new_reserve);
+            }
+        }
 
         bump(&env);
         events::bought(&env, &buyer, cost, amount, new_price, fee);
@@ -661,6 +756,117 @@ impl BondingCurveContract {
     pub fn get_treasury(env: Env) -> Result<Address, BondingCurveError> {
         env.storage().instance().get(&DataKey::Treasury).ok_or(BondingCurveError::NotInitialized)
     }
+
+    // -----------------------------------------------------------------
+    // Graduation state machine (#1090)
+    // -----------------------------------------------------------------
+
+    /// Return the current lifecycle state of the curve (`Active` or `Graduated`).
+    pub fn get_curve_state(env: Env) -> CurveState {
+        env.storage()
+            .instance()
+            .get(&DataKey::CurveState)
+            .unwrap_or(CurveState::Active)
+    }
+
+    /// Return the graduation supply cap, or `None` if none was configured.
+    pub fn get_graduation_supply_cap(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::GraduationSupplyCap)
+    }
+
+    /// Force graduation (admin only). Useful when the admin wants to graduate
+    /// the curve manually without waiting for the automatic supply-cap trigger.
+    ///
+    /// # Errors
+    /// - [`BondingCurveError::NotInitialized`] if not initialized.
+    /// - [`BondingCurveError::Unauthorized`] if caller is not the admin.
+    /// - [`BondingCurveError::CurveGraduated`] if already graduated.
+    pub fn graduate(env: Env, admin: Address) -> Result<(), BondingCurveError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(BondingCurveError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(BondingCurveError::Unauthorized);
+        }
+        admin.require_auth();
+
+        let state: CurveState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurveState)
+            .unwrap_or(CurveState::Active);
+        if state == CurveState::Graduated {
+            return Err(BondingCurveError::CurveGraduated);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CurveState, &CurveState::Graduated);
+
+        let supply: i128 = env.storage().instance().get(&DataKey::Supply).unwrap_or(0);
+        let reserve: i128 = env.storage().instance().get(&DataKey::Reserve).unwrap_or(0);
+        events::graduated(&env, supply, reserve);
+        bump(&env);
+        Ok(())
+    }
+
+    /// Migrate the curve's reserve and supply accounting to an external AMM pool
+    /// (admin only). Must only be called after graduation.
+    ///
+    /// This entry point transfers the full reserve balance held by the contract
+    /// to `amm_pool` and emits a `migrated_to_amm` event. Zeroing the on-chain
+    /// reserve and supply prevents any further sell redemptions against stale
+    /// state, making it safe for the AMM to take over price discovery.
+    ///
+    /// # Errors
+    /// - [`BondingCurveError::NotInitialized`] if not initialized.
+    /// - [`BondingCurveError::Unauthorized`] if caller is not the admin.
+    /// - [`BondingCurveError::NotGraduated`] if the curve has not graduated yet.
+    pub fn migrate_to_amm(env: Env, admin: Address, amm_pool: Address) -> Result<(), BondingCurveError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(BondingCurveError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(BondingCurveError::Unauthorized);
+        }
+        admin.require_auth();
+
+        let state: CurveState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurveState)
+            .unwrap_or(CurveState::Active);
+        if state != CurveState::Graduated {
+            return Err(BondingCurveError::NotGraduated);
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(BondingCurveError::NotInitialized)?;
+        let reserve: i128 = env.storage().instance().get(&DataKey::Reserve).unwrap_or(0);
+        let supply: i128 = env.storage().instance().get(&DataKey::Supply).unwrap_or(0);
+
+        // Transfer full reserve to the AMM pool and zero out accounting.
+        if reserve > 0 {
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &amm_pool,
+                &reserve,
+            );
+        }
+        env.storage().instance().set(&DataKey::Reserve, &0i128);
+        env.storage().instance().set(&DataKey::Supply, &0i128);
+
+        bump(&env);
+        events::migrated_to_amm(&env, &amm_pool, reserve, supply);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -687,7 +893,7 @@ mod test {
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
 
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin, &None::<i128>);
 
         let initial_price = contract.get_price();
         assert!(initial_price >= 0);
@@ -722,7 +928,7 @@ mod test {
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
 
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin, &None::<i128>);
 
         let initial_reserve = contract.get_reserve();
         assert_eq!(initial_reserve, 0);
@@ -756,7 +962,7 @@ mod test {
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
 
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin, &None::<i128>);
 
         // Try to buy with invalid amount
         let result = contract.try_buy(&buyer, &-100i128, &i128::MAX);
@@ -790,7 +996,7 @@ mod test {
         StellarAssetClient::new(&env, &token).mint(&buyer, &1_000_000i128);
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &100u32, &treasury);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &100u32, &treasury, &None::<i128>);
         contract.buy(&buyer, &100i128, &i128::MAX);
         assert!(soroban_sdk::token::Client::new(&env, &token).balance(&treasury) > 0);
         assert_eq!(contract.get_fee_bps(), 100);
@@ -813,7 +1019,7 @@ mod test {
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
 
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin, &None::<i128>);
 
         // Try to buy with a huge amount that would overflow
         // i128::MAX / PRICE_SCALE is a reasonable upper bound
@@ -838,7 +1044,7 @@ mod test {
         let contract_addr = env.register_contract(None, BondingCurveContract);
         let contract = BondingCurveContractClient::new(&env, &contract_addr);
 
-        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
+        contract.initialize(&admin, &token, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin, &None::<i128>);
 
         // To trigger an overflow in sell_proceeds, we'd need to set up a state where
         // the amount * avg_price calculation overflows. This is harder to construct

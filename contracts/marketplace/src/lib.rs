@@ -731,8 +731,19 @@ mod contract {
 
         /// Propose an escrowed offer below the listing's asking price, in the listing's payment
         /// token. Transfers `amount` from `buyer` into the marketplace contract until the seller
-        /// accepts or the buyer cancels. A later call from the same buyer on the same listing
-        /// replaces the prior offer, refunding it first.
+        /// accepts or the buyer cancels.
+        ///
+        /// If the buyer already has an outstanding offer on this listing, the contract
+        /// computes the **net delta** between the new and prior amounts and executes a
+        /// **single transfer** in the appropriate direction:
+        ///
+        /// - Increasing offer (`amount > prior`): pulls only the difference from the buyer.
+        /// - Decreasing offer (`amount < prior`): refunds only the difference to the buyer.
+        /// - Identical offer (`amount == prior`): no transfer at all.
+        ///
+        /// This eliminates the previous double-transfer pattern (full refund then full pull)
+        /// that could transiently require the buyer to hold the full new amount in their
+        /// wallet even when they were merely adjusting an existing position.
         ///
         /// # Errors
         ///
@@ -765,20 +776,34 @@ mod contract {
             }
 
             let tok = token::Client::new(&env, &listing.payment_token);
+            let offer_key = DataKey::Offer(listing_id, buyer.clone());
 
-            // Replace any prior offer from this buyer, refunding the escrowed amount first.
-            if let Some(prior) = env
+            // Compute the net delta and perform at most one transfer (#1093).
+            // Prior == 0 when no offer exists, so the delta is simply `amount`.
+            let prior: i128 = env
                 .storage()
                 .persistent()
-                .get::<_, i128>(&DataKey::Offer(listing_id, buyer.clone()))
-            {
-                tok.transfer(&env.current_contract_address(), &buyer, &prior);
+                .get(&offer_key)
+                .unwrap_or(0i128);
+
+            #[allow(clippy::arithmetic_side_effects)]
+            match amount.cmp(&prior) {
+                core::cmp::Ordering::Greater => {
+                    // Buyer owes the difference.
+                    let delta = amount - prior;
+                    tok.transfer(&buyer, &env.current_contract_address(), &delta);
+                }
+                core::cmp::Ordering::Less => {
+                    // Buyer is owed a partial refund.
+                    let delta = prior - amount;
+                    tok.transfer(&env.current_contract_address(), &buyer, &delta);
+                }
+                core::cmp::Ordering::Equal => {
+                    // No net movement — nothing to transfer.
+                }
             }
 
-            tok.transfer(&buyer, &env.current_contract_address(), &amount);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Offer(listing_id, buyer.clone()), &amount);
+            env.storage().persistent().set(&offer_key, &amount);
             bump_offer(&env, listing_id, &buyer);
             bump_instance(&env);
 

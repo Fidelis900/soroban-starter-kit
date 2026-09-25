@@ -14,9 +14,20 @@ arbitrary = { version = "1", features = ["derive"] }
 [dependencies.multisig]
 path = ".."
 
+[dependencies.bonding-curve]
+path = "../contracts/bonding-curve"
+features = ["testutils"]
+
 [[bin]]
 name = "multisig_state_machine"
 path = "fuzz_targets/multisig_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bonding_curve_solvency"
+path = "fuzz_targets/bonding_curve_solvency.rs"
 test = false
 doc = false
 bench = false
