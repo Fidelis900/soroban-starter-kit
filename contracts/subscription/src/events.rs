@@ -131,6 +131,36 @@ pub fn cancelled(env: &Env, subscriber: &Address, plan_id: &Symbol) {
     );
 }
 
+/// Emitted when the provider reports metered usage for a subscriber.
+/// Topics: (Symbol, Address) — event name, subscriber
+/// Data: (u64, u64) — units reported, cumulative units since the last charge
+pub fn usage_reported(env: &Env, subscriber: &Address, units: u64, total_units: u64) {
+    env.events().publish(
+        (Symbol::new(env, "usage_reported"), subscriber.clone()),
+        (units, total_units),
+    );
+}
+
+/// Emitted when a subscriber prepays for multiple intervals into escrow.
+/// Topics: (Symbol, Address) — event name, subscriber
+/// Data: (u32, i128) — prepaid intervals, total amount escrowed
+pub fn prepaid(env: &Env, subscriber: &Address, intervals: u32, total: i128) {
+    env.events().publish(
+        (Symbol::new(env, "prepaid"), subscriber.clone()),
+        (intervals, total),
+    );
+}
+
+/// Emitted when unconsumed prepaid funds are refunded to a subscriber on cancellation.
+/// Topics: (Symbol, Address) — event name, subscriber
+/// Data: (u32, i128) — unconsumed intervals, amount refunded
+pub fn prepaid_refunded(env: &Env, subscriber: &Address, intervals: u32, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "prepaid_refunded"), subscriber.clone()),
+        (intervals, amount),
+    );
+}
+
 /// Emitted when a subscriber's trial period is completed.
 /// Topics: (Symbol, Address) — event name, subscriber
 pub fn trial_completed(env: &Env, subscriber: &Address, plan_id: &Symbol) {
