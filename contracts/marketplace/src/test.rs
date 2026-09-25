@@ -924,3 +924,102 @@ fn test_royalty_split_applies_to_collection_offer() {
     assert_eq!(tok(&env, &t.token).balance(&b), 300);
     assert_eq!(tok(&env, &t.token).balance(&t.seller), 1_600);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1093 — make_offer() delta-transfer regression tests
+// ---------------------------------------------------------------------------
+
+/// Increasing an offer should pull only the net difference from the buyer,
+/// not a full refund + full pull (which would require the buyer to temporarily
+/// hold the entire new amount even if they only had the difference available).
+#[test]
+fn make_offer_increase_pulls_delta_only() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    // List NFT at 1 000 so offers can be up to 999.
+    let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+
+    // First offer: 300 → buyer pays 300, marketplace holds 300.
+    t.client.make_offer(&t.buyer, &listing_id, &300i128);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 300);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 300);
+
+    // Increase offer to 700 → only the delta of 400 should be pulled.
+    t.client.make_offer(&t.buyer, &listing_id, &700i128);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 700,
+        "buyer should only have paid the delta (400), not a full re-pull of 700");
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 700,
+        "marketplace should hold the new offer amount");
+    assert_eq!(t.client.get_offer(&listing_id, &t.buyer), Some(700));
+}
+
+/// Decreasing an offer should refund only the delta to the buyer.
+#[test]
+fn make_offer_decrease_refunds_delta_only() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+
+    t.client.make_offer(&t.buyer, &listing_id, &800i128);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 800);
+
+    // Decrease offer to 500 → only 300 refunded.
+    t.client.make_offer(&t.buyer, &listing_id, &500i128);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 500,
+        "buyer should have received the delta refund of 300");
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 500);
+    assert_eq!(t.client.get_offer(&listing_id, &t.buyer), Some(500));
+}
+
+/// Resubmitting the exact same offer amount produces no transfer at all.
+#[test]
+fn make_offer_identical_amount_no_transfer() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+
+    t.client.make_offer(&t.buyer, &listing_id, &400i128);
+    let balance_after_first = tok(&env, &t.token).balance(&t.buyer);
+
+    // Resubmit the same amount.
+    t.client.make_offer(&t.buyer, &listing_id, &400i128);
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.buyer),
+        balance_after_first,
+        "identical offer amount should cause no net token movement"
+    );
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 400);
+}
+
+/// Even when the buyer's wallet only holds exactly the delta, an increasing
+/// offer must succeed — the old double-transfer pattern would have failed here
+/// because it would try to pull the full new amount (700) while only 400 is free.
+#[test]
+fn make_offer_increase_succeeds_with_only_delta_available() {
+    let env = Env::default();
+    let t = setup(&env);
+
+    // Give buyer exactly 700 tokens (just enough for the first 300 offer + delta of 400).
+    let token_client = StellarAssetClient::new(&env, &t.token);
+    // The setup minted 10_000, so drain back to 700.
+    // Easiest: use a fresh buyer minted with exactly 700.
+    let tight_buyer = Address::generate(&env);
+    token_client.mint(&tight_buyer, &700i128);
+
+    let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+
+    // First offer of 300 — costs 300, leaving 400 in wallet.
+    t.client.make_offer(&tight_buyer, &listing_id, &300i128);
+    assert_eq!(tok(&env, &t.token).balance(&tight_buyer), 400);
+
+    // Increase to 700 — needs only delta of 400, which is exactly what remains.
+    // Under the old (buggy) code this would try to pull 700 and fail because the
+    // buyer only holds 400.
+    t.client.make_offer(&tight_buyer, &listing_id, &700i128);
+    assert_eq!(tok(&env, &t.token).balance(&tight_buyer), 0,
+        "tight buyer should have spent their remaining 400 as the delta");
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 700);
+}

@@ -6,3 +6,7 @@ BondingCurveError::InsufficientReserve = 5
 BondingCurveError::Overflow = 6
 BondingCurveError::InvalidFee = 7
 BondingCurveError::InvalidConfiguration = 8
+BondingCurveError::RateLimitExceeded = 9
+BondingCurveError::CooldownActive = 10
+BondingCurveError::CurveGraduated = 11
+BondingCurveError::NotGraduated = 12
