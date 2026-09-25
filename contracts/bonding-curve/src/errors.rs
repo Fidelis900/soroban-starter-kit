@@ -15,6 +15,18 @@ pub enum BondingCurveError {
     Overflow = 6,
     InvalidFee = 7,
     InvalidConfiguration = 8,
+    /// Returned when a buyer attempts more than `MAX_BUYS_PER_LEDGER` purchases
+    /// in the same ledger sequence, preventing atomic same-ledger sandwiching.
+    RateLimitExceeded = 9,
+    /// Returned when a buyer attempts to buy before `BUY_COOLDOWN_LEDGERS` have
+    /// elapsed since their last purchase.
+    CooldownActive = 10,
+    /// Returned when an operation is attempted on a graduated curve that is
+    /// only valid while the curve is still active (e.g. buying / minting).
+    CurveGraduated = 11,
+    /// Returned when `migrate_to_amm` is called but the curve has not yet
+    /// graduated.
+    NotGraduated = 12,
 }
 
 impl_display_error!(
@@ -27,6 +39,10 @@ impl_display_error!(
     Overflow             => "arithmetic overflow",
     InvalidFee           => "invalid fee",
     InvalidConfiguration => "invalid curve configuration",
+    RateLimitExceeded    => "rate limit exceeded: too many buys in this ledger",
+    CooldownActive       => "buy cooldown active: wait before buying again",
+    CurveGraduated       => "curve has graduated: minting is locked",
+    NotGraduated         => "curve has not graduated yet",
 );
 
 #[cfg(test)]
@@ -46,13 +62,25 @@ BondingCurveError::NotInitialized = {}\n\
 BondingCurveError::Unauthorized = {}\n\
 BondingCurveError::InvalidAmount = {}\n\
 BondingCurveError::InsufficientReserve = {}\n\
-BondingCurveError::Overflow = {}\n",
+BondingCurveError::Overflow = {}\n\
+BondingCurveError::InvalidFee = {}\n\
+BondingCurveError::InvalidConfiguration = {}\n\
+BondingCurveError::RateLimitExceeded = {}\n\
+BondingCurveError::CooldownActive = {}\n\
+BondingCurveError::CurveGraduated = {}\n\
+BondingCurveError::NotGraduated = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
             BondingCurveError::NotInitialized as u32,
             BondingCurveError::Unauthorized as u32,
             BondingCurveError::InvalidAmount as u32,
             BondingCurveError::InsufficientReserve as u32,
             BondingCurveError::Overflow as u32,
+            BondingCurveError::InvalidFee as u32,
+            BondingCurveError::InvalidConfiguration as u32,
+            BondingCurveError::RateLimitExceeded as u32,
+            BondingCurveError::CooldownActive as u32,
+            BondingCurveError::CurveGraduated as u32,
+            BondingCurveError::NotGraduated as u32,
         )
     }
 
