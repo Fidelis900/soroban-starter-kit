@@ -1,16 +1,11 @@
-// `#[contracterror]` generates undocumented public associated items.
-#![allow(missing_docs)]
-
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum AirdropError {
-    /// `initialize` called on an already-initialized contract.
     AlreadyInitialized = 1,
-    /// Operation attempted before the contract was initialized.
     NotInitialized = 2,
-    /// Caller is not the admin.
     Unauthorized = 3,
     /// Merkle root has not been set yet.
     RootNotSet = 4,
@@ -76,4 +71,11 @@ AirdropError::ClaimWindowClosed = {}\n",
             include_str!("../snapshots/error_codes.snap")
         );
     }
+    ClaimWindowClosed = 4,
+    ClaimWindowNotClosed = 5,
+    NothingToSweep = 6,
+    InvalidDeadline = 7,
+    InvalidAmount = 8,
+    AlreadyClaimed = 9,
+    InvalidProof = 10,
 }

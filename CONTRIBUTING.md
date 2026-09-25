@@ -44,6 +44,19 @@ commit.
 
 ## CI checks
 
+### cargo-geiger (unsafe-code audit)
+
+The `unsafe-audit` CI job scans every crate in the workspace with `cargo-geiger`. First-party contract code is expected to contain no unsafe blocks; dependency findings are retained in the CI artifact for visibility.
+
+Install and run the same check locally:
+
+```bash
+cargo install cargo-geiger --locked
+cargo geiger --workspace --all-features --output-format GitHubMarkdown
+```
+
+Review the report before introducing unsafe code. If an unsafe dependency is unavoidable, document why it is required and keep the usage isolated and reviewed.
+
 ### cargo-machete (unused dependencies)
 
 The `machete` CI job runs `cargo machete --workspace` to detect unused entries in `Cargo.toml`.
@@ -71,7 +84,7 @@ cargo +nightly udeps --workspace --all-targets
 
 ### cargo-semver-checks (breaking API changes)
 
-The `semver` CI job runs `cargo semver-checks` on every PR to detect breaking public API changes in `soroban-token-template` and `soroban-escrow-template`.
+The `semver-check` CI job runs `cargo semver-checks` on every PR, once per contract crate (matrix build, discovered dynamically the same way the `test` and `datakey-discriminants` jobs are), to detect breaking public API changes across all contracts. Each check diffs against the contract's state on `origin/main`; a contract with no history on `origin/main` yet (e.g. newly added in the same PR) is skipped as a first-time check instead of failing CI setup.
 
 **Semver policy:** This repository follows [Semantic Versioning](https://semver.org/). Any change that removes, renames, or changes the signature of a public contract entry point, error type, or event is a **breaking change** and requires a major version bump. Adding new public items is backwards-compatible and requires only a minor bump. Bug fixes with no API change require a patch bump.
 
@@ -79,8 +92,8 @@ Install locally:
 
 ```bash
 cargo install cargo-semver-checks --locked
-cargo semver-checks -p soroban-token-template
-cargo semver-checks -p soroban-escrow-template
+cargo semver-checks --manifest-path contracts/token/Cargo.toml --baseline-rev origin/main
+# repeat with the path to whichever contract you changed
 ```
 
 ### Cargo.lock sync check
@@ -324,7 +337,7 @@ Property tests live in `prop_test.rs` inside each contract and run as part of th
 ### Benchmarks
 
 ```bash
-cargo bench -p benches
+cargo bench -p contract-benchmarks
 ```
 
 ### Build WASM artifacts

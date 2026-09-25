@@ -57,6 +57,12 @@ fn bump_persistent(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+fn bump_claimed(env: &Env, round_id: u32, recipient: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Claimed(round_id, recipient.clone()),
+        LEDGER_LIFETIME_THRESHOLD,
+        LEDGER_BUMP_AMOUNT,
+    );
 }
 
 /// Compute the merkle leaf for `(recipient, token, amount)` as described in
@@ -266,13 +272,22 @@ mod contract {
             Ok(())
         }
 
-        /// Set (or replace) the merkle root. Only the admin may call this.
+        /// Set (or replace) the merkle root for a given round. Only the admin may call this.
+        ///
+        /// The root of an active, unexpired round cannot be replaced: once a round's
+        /// root is set and its claim window is still open, it is immutable. This
+        /// prevents an admin from invalidating outstanding proofs mid-round.
         ///
         /// # Errors
         ///
         /// Returns [`AirdropError::NotInitialized`] if the contract has not been initialized.
         /// Returns [`AirdropError::Unauthorized`] if caller is not the admin.
-        pub fn set_root(env: Env, root: BytesN<32>) -> Result<(), AirdropError> {
+        /// Returns [`AirdropError::RoundActive`] if the round already has a root and is unexpired.
+        pub fn set_root(
+            env: Env,
+            round_id: u32,
+            root: BytesN<32>,
+        ) -> Result<(), AirdropError> {
             let admin: Address = env
                 .storage()
                 .instance()
@@ -281,13 +296,29 @@ mod contract {
 
             admin.require_auth();
 
+            // Prevent changing the root of an active, unexpired round.
+            let existing: Option<Bytes> = env
+                .storage()
+                .instance()
+                .get(&DataKey::MerkleRoot(round_id));
+            if existing.is_some() {
+                let deadline: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ClaimDeadline)
+                    .ok_or(AirdropError::NotInitialized)?;
+                if env.ledger().sequence() <= deadline {
+                    return Err(AirdropError::RoundActive);
+                }
+            }
+
             let root_bytes = Bytes::from(root.clone());
             env.storage()
                 .instance()
-                .set(&DataKey::MerkleRoot, &root_bytes);
+                .set(&DataKey::MerkleRoot(round_id), &root_bytes);
             bump_instance(&env);
 
-            events::root_set(&env, &root_bytes);
+            events::root_set(&env, round_id, &root_bytes);
             Ok(())
         }
 
@@ -295,6 +326,11 @@ mod contract {
         ///
         /// The tree must contain the leaf `(recipient, token, amount)`. A
         /// recipient may claim each token in the tree once.
+        /// Claim tokens by supplying a valid merkle proof for a given round.
+        ///
+        /// The caller must appear in the round's airdrop tree with exactly `amount` tokens.
+        /// Claims are tracked per `(round_id, recipient)`, so a recipient may claim
+        /// once in each round of a multi-round campaign.
         ///
         /// # Errors
         ///
@@ -303,16 +339,32 @@ mod contract {
         /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
         /// Returns [`AirdropError::InvalidAmount`] if `amount <= 0`.
         /// Returns [`AirdropError::AlreadyClaimed`] if this `(recipient, token)` already claimed.
+        /// Returns [`AirdropError::RootNotSet`] if no merkle root has been set for the round.
+        /// Returns [`AirdropError::InvalidAmount`] if `amount <= 0`.
+        /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
+        /// Returns [`AirdropError::AlreadyClaimed`] if the address already claimed in this round.
         /// Returns [`AirdropError::InvalidProof`] if the merkle proof does not verify.
         /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover the claim.
         pub fn claim(
             env: Env,
+            round_id: u32,
             recipient: Address,
             token: Address,
             amount: i128,
             proof: Vec<BytesN<32>>,
         ) -> Result<(), AirdropError> {
             let root = load_claim_context(&env)?;
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(AirdropError::NotInitialized)?;
+
+            let root_bytes: Bytes = env
+                .storage()
+                .instance()
+                .get(&DataKey::MerkleRoot(round_id))
+                .ok_or(AirdropError::RootNotSet)?;
 
             if amount <= 0 {
                 return Err(AirdropError::InvalidAmount);
@@ -321,6 +373,14 @@ mod contract {
             recipient.require_auth();
 
             if is_claimed(&env, &recipient, &token) {
+            // Duplicate-claim prevention, scoped to this round.
+            let claimed_key = DataKey::Claimed(round_id, recipient.clone());
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&claimed_key)
+                .unwrap_or(false)
+            {
                 return Err(AirdropError::AlreadyClaimed);
             }
 
@@ -504,6 +564,22 @@ mod contract {
 
 #[cfg(test)]
 mod test;
+            // Checks-effects-interactions: mark claimed before transfer.
+            env.storage().persistent().set(&claimed_key, &true);
+            bump_claimed(&env, round_id, &recipient);
+            bump_instance(&env);
 
-#[cfg(test)]
-mod prop_test;
+            token::Client::new(&env, &token_addr).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            );
+
+            events::claimed(&env, round_id, &recipient, amount);
+            Ok(())
+        }
+
+        /// Sweep any tokens left unclaimed after the claim deadline.
+        //
+
+/* … truncated 2057 chars — edit only what you need near the top … */

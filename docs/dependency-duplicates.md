@@ -32,18 +32,18 @@ target). Those are not version conflicts and cannot — and should not — be
 
 ## Real version conflicts
 
-Three crate families are linked at two incompatible major versions. In every
-case **one side is pinned by the `soroban-sdk` subtree**, which is locked to an
-exact version (`soroban-sdk = "=21.7.7"`) for reproducible on-chain builds, and
-the other side is required by a major-incompatible dev/build-time tool. None can
-be unified without an upstream release of `soroban-sdk` (or a major bump of the
-dev tooling), so each is recorded as an intentional, justified skip in
-`deny.toml`.
+Three crate families are linked at multiple incompatible major versions. In
+every case **one side is pinned by the `soroban-sdk` subtree**, which is locked
+to an exact version (`soroban-sdk = "=21.7.7"`) for reproducible on-chain
+builds, and the other side is required by a major-incompatible dev/build-time
+tool. None can be unified without an upstream release of `soroban-sdk` (or a
+major bump of the dev tooling), so each is recorded as an intentional,
+justified skip in `deny.toml`.
 
 | Crate | Versions | Pinned by (cannot move) | Other consumer | Scope |
 |-------|----------|-------------------------|----------------|-------|
 | `darling` (+ `darling_core`, `darling_macro`) | `0.20.11` / `0.23.0` | `soroban-sdk-macros` → `soroban-sdk` (needs 0.20) | `serde_with_macros` (needs 0.23) | build/proc-macro |
-| `getrandom` | `0.2.17` / `0.4.3` | `k256` → `soroban-env-host` → `soroban-sdk` (needs 0.2 via `rand_core 0.6`) | `tempfile` → `proptest` | runtime (host) / dev |
+| `getrandom` | `0.2.17` / `0.3.4` / `0.4.3` | `k256` → `soroban-env-host` → `soroban-sdk` (needs 0.2 via `rand_core 0.6`) | `jobserver 0.1.34` (needs 0.3, build-time) and `tempfile` → `proptest` (needs 0.4, dev-only) | runtime (host) / build / dev |
 | `itertools` | `0.10.5` / `0.11.0` | `soroban-builtin-sdk-macros` → `soroban-env-host` → `soroban-sdk` (needs 0.11) | `criterion` / `criterion-plot` (need 0.10) | build / dev (benches) |
 
 ### Why these cannot be unified
@@ -52,9 +52,14 @@ dev tooling), so each is recorded as an intentional, justified skip in
   (itself a transitive dep of `soroban-sdk`) requires `0.23`. Both live under
   the pinned `soroban-sdk` tree; neither can move independently.
 - **`getrandom`** — the `0.2` line is reached through `soroban-env-host`'s
-  cryptography stack (`k256` → `rand_core 0.6`). The `0.4` line only appears in
-  dev/test builds via `tempfile` (a `proptest` dependency); it never ships in
-  the WASM contract artifact.
+  cryptography stack (`k256` → `rand_core 0.6`). The `0.3` line is pulled in by
+  `jobserver 0.1.34` (a build-time dependency of the `cc` crate used by native
+  build scripts); it never ships in the WASM contract artifact. The `0.4` line
+  only appears in dev/test builds via `tempfile` (a `proptest` dependency); it
+  likewise never ships in the WASM contract artifact. All three are pinned by
+  their respective upstreams and cannot be aligned without a release that
+  moves `jobserver`/`cc` and `tempfile`/`proptest` onto the same `getrandom`
+  major as the SDK's `rand_core 0.6` chain.
 - **`itertools`** — the `0.11` line is required by `soroban-builtin-sdk-macros`
   inside the pinned SDK tree; the `0.10` line comes only from the `criterion`
   benchmark harness (`benches`, dev-only). Bumping `criterion` to a release that

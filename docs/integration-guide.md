@@ -787,15 +787,6 @@ await token.balance({ id: buyerAddress });
 
 ---
 
-## 14. Resources
-
-- [Stellar SDK Docs](https://stellar.github.io/js-stellar-sdk/)
-- [Soroban Documentation](https://soroban.stellar.org/docs)
-- [Stellar Laboratory](https://laboratory.stellar.org/)
-- [Freighter Wallet](https://freighter.app/)
-
----
-
 ## 13. TypeScript SDK Integration Examples
 
 > **SDK Version**: These examples target `@stellar/stellar-sdk` **v13.x** (2026 stable), the current standard for Soroban smart contract integration. Install with:
@@ -1193,3 +1184,12 @@ const AMOUNT = BigInt(100_000_000); // 10 tokens at 7 decimals
   console.log('Full token + escrow workflow completed successfully.');
 })();
 ```
+
+---
+
+## 14. Resources
+
+- [Stellar SDK Docs](https://stellar.github.io/js-stellar-sdk/)
+- [Soroban Documentation](https://soroban.stellar.org/docs)
+- [Stellar Laboratory](https://laboratory.stellar.org/)
+- [Freighter Wallet](https://freighter.app/)

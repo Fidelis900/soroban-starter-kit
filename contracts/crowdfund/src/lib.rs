@@ -161,12 +161,9 @@ mod contract {
             }
 
             let token: Address = get_instance(&env, &DataKey::Token)?;
-            token::Client::new(&env, &token).transfer(
-                &pledger,
-                &env.current_contract_address(),
-                &amount,
-            );
 
+            // Persist local accounting before the external token transfer. A failed transfer
+            // aborts the transaction and rolls this effect back atomically.
             env.storage()
                 .persistent()
                 .set(&DataKey::Pledge(pledger.clone()), &new_pledge);
@@ -181,6 +178,12 @@ mod contract {
             env.storage()
                 .instance()
                 .set(&DataKey::TotalPledged, &new_total);
+
+            token::Client::new(&env, &token).transfer(
+                &pledger,
+                &env.current_contract_address(),
+                &amount,
+            );
 
             bump_instance(&env);
             events::pledged(&env, &pledger, amount, new_total);

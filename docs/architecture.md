@@ -252,14 +252,23 @@ The escrow contract enforces a strict state machine to prevent fund loss or doub
 
 ```
 Created ──fund()──► Funded ──mark_delivered()──► Delivered
-   │                  │                              │
-cancel()        request_refund()             approve_delivery()
-   │            (after deadline)             resolve_dispute()
-   ▼                  │                              │
-Cancelled         Refunded ◄──resolve_dispute()──────┤
-                                                      │
-                                               Completed
+   │                  │  ▲                           │  ▲
+cancel()      raise_dispute()                 raise_dispute()
+   │                  │  │                           │  │
+   ▼                  ▼  │                           ▼  │
+Cancelled          Disputed ────────────────────────────┘
+                       │
+         ┌─────────────┼───────────────────────────┐
+         ▼              ▼                           ▼
+  resolve_dispute   resolve_dispute          claim_dispute_timeout()
+  (release_to_      (release_to_              buyer-only, once
+   seller: true)     seller: false)         DisputeTimeoutLedgers elapse
+         │              │                           │
+         ▼              ▼                           ▼
+    Completed        Refunded ◄─────────────────────┘
 ```
+
+**Additional entry points not shown above** (kept off the diagram to avoid clutter, listed in the transition table below): `approve_delivery()` (`Delivered` → `Completed`), `request_refund()` / `request_partial_refund()` (→ `Refunded`), and `release_milestone()` (`Funded` → `Completed`, milestone-based escrows only).
 
 ### State Definitions
 
@@ -278,14 +287,19 @@ Cancelled         Refunded ◄──resolve_dispute()──────┤
 Every entry point reads the current state first and rejects invalid transitions with `EscrowError::InvalidState`.
 
 **Valid transitions:**
-- `Created` → `Funded` (via `fund()`)
-- `Created` → `Cancelled` (via `cancel()`)
-- `Funded` → `Delivered` (via `mark_delivered()`)
-- `Funded` → `Refunded` (via `request_refund()` after deadline)
-- `Funded` → `Disputed` (via `resolve_dispute()` by arbiter)
-- `Delivered` → `Completed` (via `approve_delivery()`)
-- `Delivered` → `Refunded` (via `request_refund()` after deadline or `resolve_dispute()`)
-- `Disputed` → `Completed` or `Refunded` (via `resolve_dispute()`)
+- `Created` → `Funded` (via `fund()`, buyer)
+- `Created` → `Cancelled` (via `cancel()`, buyer)
+- `Funded` → `Delivered` (via `mark_delivered()`, seller)
+- `Funded` → `Disputed` (via `raise_dispute()`, buyer or seller)
+- `Delivered` → `Disputed` (via `raise_dispute()`, buyer or seller)
+- `Delivered` → `Completed` (via `approve_delivery()`, buyer)
+- `Funded` → `Completed` (via `release_milestone()` once every milestone has been released — milestone-based escrows only; other escrows never take this path)
+- `Funded` → `Refunded` (via `request_refund()` after `deadline_ledger`, buyer; or `request_partial_refund()` at any time while `Funded`, buyer)
+- `Delivered` → `Refunded` (via `request_refund()` after `deadline_ledger`, buyer)
+- `Disputed` → `Completed` (via `resolve_dispute(release_to_seller: true)`, arbiter — internally passes through `Delivered` within the same call)
+- `Disputed` → `Refunded` (via `resolve_dispute(release_to_seller: false)`, arbiter; or `claim_dispute_timeout()` once `DisputeTimeoutLedgers` has elapsed since the dispute was raised, buyer — both internally pass through `Funded` within the same call)
+
+**Not a state transition:** `release_partial(amount)` pays out part of the escrowed amount to the seller while remaining in `Funded` — it decrements the stored `Amount` without changing `State`, distinct from `release_milestone()` above which is specific to milestone-based escrows and does terminate in `Completed`.
 
 ---
 

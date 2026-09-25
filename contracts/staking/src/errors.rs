@@ -1,34 +1,43 @@
 // `#[contracterror]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
+use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StakingError {
-    /// `initialize` was called on an already-initialized contract.
     AlreadyInitialized = 1,
-    /// An operation was attempted before the contract was initialized.
     NotInitialized = 2,
-    /// Caller is not the admin.
     Unauthorized = 3,
-    /// Amount is zero or negative.
     InvalidAmount = 4,
-    /// Staker has no stake to unstake or claim from.
     NoStake = 5,
-    /// Requested unstake amount exceeds the staker's current stake.
     InsufficientStake = 6,
-    /// No rewards are available to claim.
     NoRewards = 7,
-    /// Stake and reward token must be the same to compound.
     CompoundTokenMismatch = 8,
-    /// `withdraw` called before the unbonding period has elapsed.
     UnbondingNotComplete = 9,
-    /// `withdraw` called with no pending unbond request.
     NoUnbondRequest = 10,
-    /// `unstake` called while a pending UnbondRequest already exists for this staker.
     UnbondRequestPending = 11,
+    InvalidTranche = 12,
+    InvalidPenalty = 12,
 }
+
+impl_display_error!(
+    StakingError,
+    AlreadyInitialized     => "already initialized",
+    NotInitialized         => "not initialized",
+    Unauthorized           => "not authorized",
+    InvalidAmount          => "invalid amount",
+    NoStake                => "no stake",
+    InsufficientStake      => "insufficient stake",
+    NoRewards              => "no rewards",
+    CompoundTokenMismatch  => "compound token mismatch",
+    UnbondingNotComplete   => "unbonding not complete",
+    NoUnbondRequest        => "no unbond request",
+    UnbondRequestPending   => "unbond request pending",
+    InvalidTranche         => "invalid unbond tranche",
+    InvalidPenalty         => "invalid penalty",
+);
 
 #[cfg(test)]
 mod tests {
@@ -52,7 +61,9 @@ StakingError::NoRewards = {}\n\
 StakingError::CompoundTokenMismatch = {}\n\
 StakingError::UnbondingNotComplete = {}\n\
 StakingError::NoUnbondRequest = {}\n\
-StakingError::UnbondRequestPending = {}\n",
+StakingError::UnbondRequestPending = {}\n\
+StakingError::InvalidTranche = {}\n",
+StakingError::InvalidPenalty = {}\n",
             StakingError::AlreadyInitialized as u32,
             StakingError::NotInitialized as u32,
             StakingError::Unauthorized as u32,
@@ -64,6 +75,8 @@ StakingError::UnbondRequestPending = {}\n",
             StakingError::UnbondingNotComplete as u32,
             StakingError::NoUnbondRequest as u32,
             StakingError::UnbondRequestPending as u32,
+            StakingError::InvalidTranche as u32,
+            StakingError::InvalidPenalty as u32,
         )
     }
 

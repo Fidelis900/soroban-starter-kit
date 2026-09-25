@@ -1,5 +1,11 @@
 # Mutation testing: token and escrow critical paths only.
 # Packages are selected via CLI: -p soroban-token-template -p soroban-escrow-template
+#
+# Tracked as #972: this scope only measures whether token/escrow's unit tests
+# actually catch bugs, not whether they exist. staking, vesting, escrow's
+# dispute.rs, marketplace, and auction are the priority additions — each has
+# had a real fund-movement bug ship past a passing unit-test suite. See
+# docs/testing-strategy.md#gaps.
 
 examine_globs = [
     "contracts/token/src/**/*.rs",

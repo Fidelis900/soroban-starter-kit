@@ -35,6 +35,10 @@ pub fn rewards_added(env: &Env, admin: &Address, amount: i128, new_total: i128) 
     );
 }
 
+/// Emitted when a staker auto-compounds claimed rewards back into their stake.
+///
+/// `reward` is the amount of rewards restaked; `new_stake` is the staker's
+/// resulting stake balance after compounding.
 pub fn compounded(env: &Env, staker: &Address, reward: i128, new_stake: i128) {
     env.events().publish(
         (Symbol::new(env, "compounded"), staker.clone()),

@@ -8,7 +8,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN cargo install --locked stellar-cli --features opt
 
 WORKDIR /contracts
-COPY soroban-starter-kit/ .
+# Build context is the repository root (see docker/docker-compose.yml's
+# `context: ..`), so paths here are relative to the repo root, not a nested
+# `soroban-starter-kit/` folder. Every directory below is a workspace member
+# declared in the root Cargo.toml, so all of them must be present for cargo
+# to resolve the workspace even though only contracts/ is actually compiled.
+COPY Cargo.toml Cargo.lock ./
+COPY contracts/ ./contracts/
+COPY benches/ ./benches/
+COPY tests/ ./tests/
+COPY fuzz/ ./fuzz/
 
 RUN for dir in contracts/*/; do \
       [ -f "$dir/Cargo.toml" ] && stellar contract build --manifest-path "$dir/Cargo.toml"; \

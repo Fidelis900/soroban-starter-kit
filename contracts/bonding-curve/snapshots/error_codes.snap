@@ -4,3 +4,5 @@ BondingCurveError::Unauthorized = 3
 BondingCurveError::InvalidAmount = 4
 BondingCurveError::InsufficientReserve = 5
 BondingCurveError::Overflow = 6
+BondingCurveError::InvalidFee = 7
+BondingCurveError::InvalidConfiguration = 8

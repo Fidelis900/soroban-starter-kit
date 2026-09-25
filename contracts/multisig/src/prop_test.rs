@@ -48,13 +48,13 @@ proptest! {
 
         let new_signer = Address::generate(&env);
         let duplicate_approvals = vec![&env, alice.clone(), alice.clone()];
-        let result = client.try_add_signer(&duplicate_approvals, &new_signer, &2);
+        let result = client.try_add_signer(&duplicate_approvals, &new_signer, &1, &2);
 
         prop_assert!(result.is_err());
         prop_assert!(!client.is_signer(&new_signer));
 
         let valid_approvals = vec![&env, alice, bob];
-        let result = client.try_add_signer(&valid_approvals, &new_signer, &2);
+        let result = client.try_add_signer(&valid_approvals, &new_signer, &1, &2);
         prop_assert!(result.is_ok());
         prop_assert!(client.is_signer(&new_signer));
     }

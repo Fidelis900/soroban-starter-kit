@@ -15,7 +15,7 @@ This document catalogues, per contract, who is trusted, what each trusted role c
 
 | Role | Can do | Cannot do | Compromise blast radius |
 |------|--------|-----------|--------------------------|
-| Seller | `start`, `cancel` (only before any bid) | Cancel after a bid lands, alter bids | Low — cannot touch bidder funds; at most disrupts their own auction pre-bid |
+| Seller | `start`, `cancel` (before any bid, or within the cancellation grace window by paying `cancellation_fee` to the top bidder) | Cancel after the grace window once a bid lands, alter bids, collect a cancelled auction's bid | Low — cannot touch bidder funds; a grace-window cancel refunds the top bid in full plus compensation |
 | Bidder | `bid`, `withdraw` (own outbid funds) | Withdraw another bidder's funds | Limited to that bidder's own pending/escrowed bid amount |
 | Anyone | `end()` (permissionless settlement) | — | None — settlement logic is fixed regardless of caller |
 
@@ -44,7 +44,7 @@ This document catalogues, per contract, who is trusted, what each trusted role c
 
 | Role | Can do | Cannot do | Compromise blast radius |
 |------|--------|-----------|--------------------------|
-| Admin | `initialize`, `cancel_proposal` (any proposal, any time) | Vote on others' behalf, force a proposal to pass | Governance availability: attacker can veto any proposal indefinitely. The DAO holds no treasury funds itself, so this is a censorship/liveness risk, not a direct fund-theft risk |
+| Admin | `initialize`, `cancel_proposal` (only while the proposal is `Active`, i.e. within its voting window) | Vote on others' behalf, force a proposal to pass; cancel or reverse an already-`Executed` or already-`Cancelled` proposal | Governance availability: attacker can veto any proposal that is still being voted on, but cannot retroactively cancel or reverse a proposal that has already executed. This bounds the blast radius to the active voting window — a censorship/liveness risk, not a direct fund-theft risk |
 | Proposer/Voter | `create_proposal`, `vote` (weight = live token balance) | Vote more than once per proposal | Vote-weight manipulation is possible via flash-loan-style balance changes (see [Known Issues](known-issues.md#dao)), not role-key compromise |
 
 ## Escrow

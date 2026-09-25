@@ -233,3 +233,161 @@ For detailed per-contract breakdown, see the individual contract documentation i
 ---
 
 For the front-running risk assessment, see [front-running-risk-assessment.md](front-running-risk-assessment.md).
+
+## Newer Contract Security Considerations
+
+The following sections cover the newer contracts in the template. The role boundaries and compromise outcomes are summarized in the [Threat Model](threat-model.md); deployment teams should review both documents before funding or configuring an instance.
+
+### Airdrop
+
+**Trust assumptions.** The administrator is trusted to publish the intended Merkle root and to protect the root-management key. Recipients are trusted only to submit proofs for their own allocations.
+
+**Known limitations.** Replacing the root can change every unclaimed allocation, and a recipient cannot recover a claim made against an earlier root. Merkle proofs establish inclusion, not the correctness of the allocation file supplied by the administrator.
+
+**Safe deployment.** Verify the root and allocation manifest independently, announce root changes, fund the contract only after verification, and monitor `root_set` and `claimed` events. See [Threat Model — Airdrop](threat-model.md#airdrop).
+
+### Auction
+
+**Trust assumptions.** The seller controls the lot and auction parameters; bidders trust the contract to escrow and return bid funds according to its state machine. Settlement is permissionless.
+
+**Known limitations.** The seller can cancel only before a bid, and anti-sniping deadline extensions affect the expected close time. The contract does not independently attest to the quality or authenticity of the lot.
+
+**Safe deployment.** Confirm seller and asset metadata off-chain, set a realistic reserve and deadline, and monitor bids, deadline extensions, withdrawals, and terminal events. See [Threat Model — Auction](threat-model.md#auction).
+
+### Ballot
+
+**Trust assumptions.** The administrator is trusted to register the intended voters and to call tally at an appropriate time. Voters are trusted to protect their own signing keys.
+
+**Known limitations.** Registration is permissioned, so a compromised administrator can add sybil voters or force a tally. The contract records votes but does not establish that the proposal itself was communicated honestly off-chain.
+
+**Safe deployment.** Audit the voter registry before opening voting, publish the choice set and voting window, and treat admin-key compromise as a governance incident. See [Threat Model — Ballot](threat-model.md#ballot).
+
+### Bonding Curve
+
+**Trust assumptions.** Traders trust the configured token and curve parameters; after initialization, the contract has no standing administrator withdrawal path.
+
+**Known limitations.** Price impact, slippage, reserve depth, and integer rounding are inherent to the curve. A direct token or reserve transfer can create accounting conditions that are not equivalent to a trade.
+
+**Safe deployment.** Validate token identity and curve parameters before initialization, require caller-supplied cost/proceeds bounds, and monitor reserve and buy/sell events. See [Threat Model — Bonding Curve](threat-model.md#bonding-curve).
+
+### Crowdfund
+
+**Trust assumptions.** The creator is trusted to deliver the campaign and controls the deadline-extension and successful-claim paths. Pledgers trust the contract to isolate each pledge.
+
+**Known limitations.** Once the goal is met, `claim` transfers the pool to the creator; the contract cannot enforce off-chain promises. A creator key compromise can redirect the raised funds after the success condition.
+
+**Safe deployment.** Verify the creator and campaign metadata, publish the goal and deadline, monitor deadline extensions and goal progress, and keep a recovery process for creator-key compromise. See [Threat Model — Crowdfund](threat-model.md#crowdfund).
+
+### DAO
+
+**Trust assumptions.** The administrator controls proposal cancellation, while voting power is derived from the configured token balance. Participants trust the token and proposal semantics.
+
+**Known limitations.** Live-balance voting can be sensitive to temporary balance changes, and admin cancellation is a governance censorship vector. The contract does not itself execute treasury calls.
+
+**Safe deployment.** Use a governed admin, document quorum and proposal rules, snapshot or otherwise account for balance-manipulation risk in the surrounding process, and monitor creation, voting, cancellation, and execution events. See [Threat Model — DAO](threat-model.md#dao).
+
+### Lottery
+
+**Trust assumptions.** Participants trust the administrator to commit a fair secret and reveal it, and trust the configured token and ticket price. The contract’s commit-reveal mechanism is not an external randomness beacon.
+
+**Known limitations.** An administrator can grind candidate secrets before committing and may withhold a reveal, leaving the refund path as the availability fallback. Winner selection is therefore not trustless.
+
+**Safe deployment.** Use an operationally independent reveal process, publish the commit before ticket sales, define a reveal deadline and refund procedure, and monitor `committed`, `winner_drawn`, and `refund_claimed`. See [Threat Model — Lottery](threat-model.md#lottery).
+
+### Marketplace
+
+**Trust assumptions.** Sellers control their listings and buyers control their purchase decisions; the administrator is trusted only for initialization of payment and royalty configuration.
+
+**Known limitations.** The contract does not verify off-chain ownership, authenticity, or delivery of listed assets. Offer-related event paths may be unavailable until the implementation supports them fully.
+
+**Safe deployment.** Validate asset identifiers and royalty settings before initialization, use exact-price and expiry checks in clients, and monitor listing, sale, cancellation, sweep, and offer events. See [Threat Model — Marketplace](threat-model.md#marketplace).
+
+### NFT
+
+**Trust assumptions.** The administrator is trusted to mint the intended collection and supply, while owners and approved spenders are trusted only for their authorized tokens.
+
+**Known limitations.** Admin minting can dilute or counterfeit the collection up to the configured cap; metadata and provenance are external to the contract. There is no assumption that an on-chain token implies legal ownership of an off-chain work.
+
+**Safe deployment.** Set and verify the maximum supply before minting, protect the admin key, publish immutable metadata references where possible, and monitor mint, transfer, burn, and approval events. See [Threat Model — NFT](threat-model.md#nft).
+
+### Oracle
+
+**Trust assumptions.** Consumers trust the administrator or configured publishers to report accurate prices and trust the staleness parameters to bound data age.
+
+**Known limitations.** A single-source update can be manipulated until replaced or rejected as stale; a publisher quorum reduces but does not eliminate collusion and data-quality risk. The oracle cannot validate a downstream consumer’s use of a price.
+
+**Safe deployment.** Configure independent publishers where supported, enforce freshness and deviation checks in consumers, protect publisher-management authority, and alert on updates, stale data, and publisher-set changes. See [Threat Model — Oracle](threat-model.md#oracle).
+
+### Subscription
+
+**Trust assumptions.** The provider is trusted to charge only for the agreed service, while the subscriber is trusted to grant an appropriate token allowance. The token contract and allowance semantics are critical dependencies.
+
+**Known limitations.** An elapsed interval permits a provider charge up to the remaining allowance; cancellation may not reverse a charge that has already become due. The contract cannot enforce service quality.
+
+**Safe deployment.** Use least-privilege allowances, display interval and maximum exposure clearly, monitor charge failures and cancellations, and revoke allowances when service ends. See [Threat Model — Subscription](threat-model.md#subscription).
+
+### Swap
+
+**Trust assumptions.** Parties trust the configured token contracts and each other to provide the assets described by the proposal; the contract enforces atomic acceptance and timeout cancellation.
+
+**Known limitations.** Token behavior and asset value are external dependencies. Party A’s deposit is locked until acceptance or timeout, and a party can become unavailable without violating the contract.
+
+**Safe deployment.** Verify both token addresses and amounts before signing, communicate the deadline to both parties, and monitor proposals, acceptances, and timeout cancellations. See [Threat Model — Swap](threat-model.md#swap).
+
+### Timelock
+
+**Trust assumptions.** The administrator is trusted to initialize the intended beneficiary, asset, amount, and release ledger. Anyone may trigger release once the time condition is met.
+
+**Known limitations.** Before release, the administrator can cancel and reclaim the full locked amount. The contract does not guarantee the beneficiary’s off-chain identity or prevent an administrator key compromise.
+
+**Safe deployment.** Verify the beneficiary and release ledger from an independent source, treat initialization as irreversible policy, monitor cancellation and release events, and use a hardened or multisig admin. See [Threat Model — Timelock](threat-model.md#timelock).
+
+### Wrapped Token
+
+**Trust assumptions.** Users trust the external underlying token and its mint/burn authority, which must be correctly restricted to the wrapper. The wrapper administrator is trusted during initialization.
+
+**Known limitations.** The wrapper cannot repair a malicious or non-standard underlying token. Direct transfers can make reserves exceed tracked wrapped supply, while a reserve shortfall is a critical solvency signal.
+
+**Safe deployment.** Verify the underlying token and authority configuration before initialization, enforce the reserve invariant described above, monitor `wrapped`/`unwrapped` events, and pause wrapping on any shortfall. See [Threat Model — Wrapped Token](threat-model.md#wrapped-token).
+
+The [Threat Model](threat-model.md) provides the corresponding role-by-role compromise analysis for every section above.
+## Checks-Effects-Interactions Audit
+
+As part of issue #873, every state-changing entry point in the 20 workspace contracts was reviewed. The audit treated token transfers, token mint/burn calls, and arbitrary contract invocations as interactions; authorization, validation, and storage updates were reviewed as checks and effects. Soroban transactions are atomic, so moving local effects before an interaction does not persist a partial update when the interaction fails.
+
+| Contract | State-changing entry points reviewed | Interaction-before-effect finding | Resolution |
+|---|---:|---|---|
+| airdrop | 4 | None | No change required |
+| auction | 8 | None | No change required |
+| ballot | 5 | None | No change required |
+| bonding-curve | 5 | None | No change required |
+| crowdfund | 6 | `pledge` updated pledge totals after funding transfer | Fixed: pledge accounting now precedes the transfer |
+| dao | 6 | None | No change required |
+| escrow | 18 | None | Existing lifecycle ordering retained |
+| lottery | 7 | `buy_ticket` and `draw` interacted before recording local results | Fixed: ticket/draw state now precedes token transfers |
+| marketplace | 10 | None | Existing `buy` ordering retained |
+| multisig | 10 | None | No change required |
+| nft | 6 | None | No change required |
+| oracle | 4 | None | No change required |
+| staking | 8 | None | No change required |
+| subscription | 6 | None | No change required |
+| swap | 4 | None | No change required |
+| timelock | 5 | None | No change required |
+| token | 15 | No contract-to-contract state interaction requiring a reorder | No change required |
+| vesting | 4 | `initialize` funded the contract before recording the schedule | Fixed: schedule state now precedes the funding transfer |
+| wrapped-token | 4 | `wrap`/`unwrap` updated supply after token interactions | Fixed: supply accounting now precedes transfer/mint/burn calls |
+
+The audit covers the full workspace, including view methods separately from state-changing methods. Remaining external calls are either read-only queries, calls whose local effect already precedes the interaction, or contract-internal event publication after the state transition. No follow-up vulnerability issue was required for the reviewed code.
+
+The practical rule for future contributions is: **validate first, write the contract's local state second, interact with another contract third, and emit the success event last**. If a later interaction fails, Soroban reverts the transaction, preserving the invariant that local accounting and token balances move together.
+
+## Static Unsafe-Code Analysis
+
+CI now includes a `cargo-geiger` job that scans the entire workspace and flags unsafe usage for review in first-party crates. Run the same check locally with:
+
+```bash
+cargo install cargo-geiger --locked
+cargo geiger --workspace --all-features
+```
+
+Unsafe code in transitive dependencies is reported for visibility but is not treated as a contract source finding; the CI gate is scoped to the workspace's own crates.

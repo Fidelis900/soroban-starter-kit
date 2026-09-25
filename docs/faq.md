@@ -90,15 +90,19 @@ cd contracts/escrow && stellar contract deploy --network testnet
 
 ### How do I enable feature flags for a contract?
 
-Feature flags are configured in each contract's `Cargo.toml`. For example, the token contract has optional features:
+Feature flags are configured in each contract's `Cargo.toml`. For the token contract, `pausable`, `upgradeable`, `capped-supply`, `freeze`, and `transfer-hook` are all **enabled by default** — a plain build already includes them:
 
 ```bash
-# Build with a specific feature
-cargo build -p token --features fee-token
-
-# Build with multiple features
-cargo build -p token --features fee-token,cap-supply
+cargo build -p token
 ```
+
+To build with only a subset, opt out of the defaults explicitly:
+
+```bash
+cargo build -p token --no-default-features --features pausable,capped-supply
+```
+
+See [Deployment Guide, "Cargo Feature Defaults"](deployment-guide.md#18-cargo-feature-defaults) — `scripts/deploy.sh` and `scripts/deploy-all.sh` run a bare `stellar contract build` with no `--features` flag, so a standard deploy ships with every default feature turned on.
 
 ### What feature flags are available?
 
@@ -113,9 +117,10 @@ Each contract's source code and `Cargo.toml` defines available features. Integra
 ### How do I customize the token contract?
 
 1. **Change name/symbol**: Edit `initialize()` call with desired values
-2. **Set supply cap**: Enable and use the `cap-supply` feature in `Cargo.toml`
-3. **Add fee logic**: Enable and configure the `fee-token` feature
-4. **Mint/burn controls**: The contract is admin-controlled; only the admin can mint or burn
+2. **Set supply cap**: The `capped-supply` feature is on by default; pass a `max_supply` to `initialize()` to enforce it
+3. **Mint/burn controls**: The contract is admin-controlled; only the admin can mint or burn
+
+There is no fee-on-transfer feature in this contract — the token has no fee logic today. If you need one, implement it yourself (e.g. via the `transfer-hook` feature's `on_transfer` callback).
 
 See [Token Features](adr/0007-token-interface-compliance.md) for compliance details.
 
@@ -129,9 +134,10 @@ const call = new ContractInvoke({
   method: 'initialize',
   args: [
     new Address(admin),
-    new U32(18),           // decimals
-    nativeToScVal('MyToken', 'string'),
-    nativeToScVal('MTK', 'string'),
+    nativeToScVal('MyToken', 'string'),  // name
+    nativeToScVal('MTK', 'string'),      // symbol
+    new U32(18),                         // decimals
+    nativeToScVal(null, 'void'),         // max_supply: None (or an i128 to cap supply)
   ],
 });
 ```
@@ -168,18 +174,19 @@ Contracts on Testnet consume fees from the account that deployed them. Top up yo
 
 ### How do I extend contract storage TTL?
 
-Call the TTL bump function (varies by contract):
+TTL extension varies by contract:
 
-```rust
-// For token contract
-token::Client::new(&env, &token_contract_id).bump();
-```
+- **Token contract**: there is no standalone `bump()` entry point. Every state-mutating call (`mint`, `transfer`, `approve`, etc.) automatically extends the relevant instance/persistent TTL internally via `extend_ttl_instance`/`extend_ttl_persistent`. To keep a token contract alive, periodically invoke any such state-mutating function — a read-only call like `balance_of` does not extend TTL.
+- **Escrow contract**: exposes a public, permissionless `bump()` you can call directly:
+  ```rust
+  escrow::Client::new(&env, &escrow_contract_id).bump();
+  ```
 
 All contracts define `LEDGER_LIFETIME_THRESHOLD` and `LEDGER_BUMP_AMOUNT` constants for TTL strategy.
 
 ### Why does my contract state expire?
 
-Soroban requires periodic TTL (time-to-live) extension. If no one calls a state-mutating function for ~7 days, the contract's persistent storage expires. Call a bump function to extend it.
+Soroban requires periodic TTL (time-to-live) extension. If no one calls a state-mutating function for ~7 days, the contract's persistent storage expires. For contracts without a standalone bump entry point (like `token`), invoke any state-mutating function to refresh the TTL; for contracts that expose one (like `escrow`), call its `bump()`.
 
 ## Errors
 

@@ -1,31 +1,44 @@
 // `#[contracterror]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
+use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BallotError {
-    /// `initialize` was called on an already-initialized contract.
     AlreadyInitialized = 1,
-    /// An operation was attempted before the contract was initialized.
     NotInitialized = 2,
-    /// Caller is not the admin.
     Unauthorized = 3,
-    /// Voter is not registered.
     NotRegistered = 4,
-    /// Voter has already voted.
     AlreadyVoted = 5,
-    /// Invalid vote choice index (out of range).
     InvalidChoice = 6,
-    /// Voting has not started, is closed, or has not reached its start ledger yet.
     VotingClosed = 7,
-    /// `deregister_voter` was called after at least one vote has been cast.
     VotingAlreadyStarted = 8,
-    /// Voting window is invalid: start_ledger >= end_ledger or window is in the past.
     InvalidWindow = 9,
-    /// Current ledger is before voting_start.
     VotingNotStarted = 10,
-    /// `initialize` was called with an empty choices list.
     NoChoices = 11,
+    InvalidRanking = 12,
+    DuplicateRanking = 13,
+    VotingNotClosed = 12,
+    TallyNotAvailable = 13,
 }
+
+impl_display_error!(
+    BallotError,
+    AlreadyInitialized   => "already initialized",
+    NotInitialized       => "not initialized",
+    Unauthorized         => "not authorized",
+    NotRegistered        => "voter not registered",
+    AlreadyVoted         => "voter has already voted",
+    InvalidChoice        => "invalid vote choice",
+    VotingClosed         => "voting is closed",
+    VotingAlreadyStarted => "voting already started",
+    InvalidWindow        => "invalid voting window",
+    VotingNotStarted     => "voting not started",
+    NoChoices            => "no choices provided",
+    InvalidRanking       => "invalid preference ranking",
+    DuplicateRanking     => "duplicate choice in ranking",
+    VotingNotClosed      => "voting window has not closed",
+    TallyNotAvailable    => "tally not available",
+);

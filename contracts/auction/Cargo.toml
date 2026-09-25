@@ -3,7 +3,7 @@ name = "soroban-auction-template"
 version = "0.1.0"
 edition = "2024"
 authors.workspace = true
-description = "A production-ready Soroban English auction contract template"
+description = "A production-ready Soroban English and Dutch auction contract template"
 license.workspace = true
 
 [lib]
@@ -15,6 +15,8 @@ soroban-common = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = { workspace = true }
+soroban-nft-template = { path = "../nft" }
 
 [lints]
 workspace = true

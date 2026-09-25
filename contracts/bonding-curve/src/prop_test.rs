@@ -9,7 +9,7 @@
 
 use proptest::prelude::*;
 use soroban_sdk::{
-    Address, Env, String,
+    Address, Env,
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
 };
@@ -25,7 +25,7 @@ fn setup_bonding_curve<'a>(env: &'a Env) -> (BondingCurveContractClient<'a>, Add
 
     let contract_addr = env.register_contract(None, BondingCurveContract);
     let client = BondingCurveContractClient::new(env, &contract_addr);
-    client.initialize(&admin, &token_addr);
+    client.initialize(&admin, &token_addr, &1_000_000i128, &1i128, &10_000u32, &0u32, &admin);
 
     (client, token_addr, contract_addr)
 }
@@ -50,7 +50,7 @@ proptest! {
             l.sequence_number = 100;
         });
 
-        let (client, token_addr, contract_addr) = setup_bonding_curve(&env);
+        let (client, token_addr, _contract_addr) = setup_bonding_curve(&env);
         let trader = Address::generate(&env);
 
         // Mint initial balance to trader
@@ -138,5 +138,39 @@ proptest! {
         prop_assert!(reserve_after_sell >= 0, "Reserve went negative");
         prop_assert_eq!(supply_after_sell, supply_after_buy - actual_sell, "Supply mismatch after sell");
         prop_assert!(supply_after_sell >= 0, "Supply went negative");
+    }
+}
+
+#[cfg(test)]
+mod issue_1085_1086_tests {
+    use super::*;
+
+    #[test]
+    fn buy_mints_curve_balance_to_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token, _) = setup_bonding_curve(&env);
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &1_000_000);
+
+        client.buy(&buyer, &100, &i128::MAX);
+
+        assert_eq!(client.balance(&buyer), 100);
+    }
+
+    #[test]
+    fn sell_rejects_amount_not_owned_by_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token, _) = setup_bonding_curve(&env);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&owner, &1_000_000);
+        client.buy(&owner, &100, &i128::MAX);
+
+        let result = client.try_sell(&attacker, &100, &0);
+
+        assert!(result.is_err());
+        assert_eq!(client.balance(&attacker), 0);
     }
 }

@@ -15,6 +15,7 @@ soroban-common = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = { workspace = true }
 # `total_supply` (needed for the quorum_bps checks) isn't part of the SEP-41
 # `TokenInterface`, so the governance token in these tests must be a contract
 # that implements it, like `soroban-token-template`, rather than a bare
