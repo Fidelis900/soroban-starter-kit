@@ -31,6 +31,10 @@ pub enum DataKey {
     /// Persistent storage – next expected nonce for an owner's signature-based
     /// permits (`u32`).
     PermitNonce(Address),
+    /// Persistent storage – nonces explicitly cancelled by an owner so that a
+    /// previously signed permit can no longer be applied (`bool` per
+    /// `(Address, u32)`).
+    CancelledPermitNonce(Address, u32),
 }
 
 #[contracttype]
@@ -83,6 +87,7 @@ mod discriminant_tests {
             DataKey::Snapshot(_, _) => 12,
             DataKey::PermitSigner(_) => 13,
             DataKey::PermitNonce(_) => 14,
+            DataKey::CancelledPermitNonce(_, _) => 15,
         }
     }
 
@@ -126,7 +131,11 @@ mod discriminant_tests {
             token_data_key_index(&DataKey::PermitSigner(addr.clone())),
             13
         );
-        assert_eq!(token_data_key_index(&DataKey::PermitNonce(addr)), 14);
+        assert_eq!(token_data_key_index(&DataKey::PermitNonce(addr.clone())), 14);
+        assert_eq!(
+            token_data_key_index(&DataKey::CancelledPermitNonce(addr, 0u32)),
+            15
+        );
     }
 
     #[test]

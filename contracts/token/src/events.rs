@@ -150,3 +150,13 @@ pub fn permit_used(env: &Env, owner: &Address, spender: &Address, amount: i128, 
         (amount, nonce),
     );
 }
+
+/// Emitted when an owner cancels a permit nonce, invalidating any signature
+/// that was signed for it.
+/// Topics: (Symbol, Address) — event name, owner
+pub fn permit_nonce_cancelled(env: &Env, owner: &Address, nonce: u32) {
+    env.events().publish(
+        (Symbol::new(env, "permit_nonce_cancelled"), owner.clone()),
+        nonce,
+    );
+}

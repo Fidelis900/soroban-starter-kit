@@ -1460,4 +1460,87 @@ mod permit_tests {
         client.approve_with_signature(&owner, &spender, &100i128, &0u32, &expiry, &new_signature);
         assert_eq!(client.allowance(&owner, &spender), 100i128);
     }
+
+    #[test]
+    fn test_cancel_permit_nonce_marks_nonce_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+        client.cancel_permit_nonce(&owner, &0u32);
+        assert!(client.is_permit_nonce_cancelled(&owner, &0u32));
+        // Other nonces are unaffected.
+        assert!(!client.is_permit_nonce_cancelled(&owner, &1u32));
+    }
+
+    #[test]
+    fn test_cancelled_nonce_rejects_matching_permit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            500i128,
+            0u32,
+            expiry,
+        );
+
+        // Owner cancels the nonce before the relayer submits the permit.
+        client.cancel_permit_nonce(&owner, &0u32);
+
+        let result = client
+            .try_approve_with_signature(&owner, &spender, &500i128, &0u32, &expiry, &signature);
+        assert!(result.is_err());
+        // No allowance was granted.
+        assert_eq!(client.allowance(&owner, &spender), 0i128);
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        // Stop mocking auths: the owner's authorization is now required.
+        env.set_auths(&[]);
+        let result = client.try_cancel_permit_nonce(&owner, &0u32);
+        assert!(result.is_err());
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_does_not_advance_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        client.cancel_permit_nonce(&owner, &0u32);
+        // Cancelling does not consume the nonce counter.
+        assert_eq!(client.permit_nonce(&owner), 0u32);
+
+        // A permit signed for a different, uncancelled nonce still works.
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            250i128,
+            1u32,
+            expiry,
+        );
+        client.approve_with_signature(&owner, &spender, &250i128, &1u32, &expiry, &signature);
+        assert_eq!(client.allowance(&owner, &spender), 250i128);
+        assert_eq!(client.permit_nonce(&owner), 2u32);
+    }
 }
