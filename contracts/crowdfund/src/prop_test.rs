@@ -32,7 +32,7 @@ proptest! {
         let client = CrowdfundContractClient::new(&env, &crowdfund_addr);
 
         let deadline = env.ledger().sequence() + 1000;
-        client.initialize(&creator, &token_addr, &goal, &deadline);
+        client.initialize(&creator, &token_addr, &goal, &deadline, &soroban_sdk::Vec::new(&env), &None, &None);
 
         let mut total_pledged = 0i128;
         let mut backers = vec![];
@@ -87,11 +87,52 @@ proptest! {
         let client = CrowdfundContractClient::new(&env, &crowdfund_addr);
 
         let deadline = env.ledger().sequence() + 1000;
-        client.initialize(&creator, &token_addr, &100_000i128, &deadline);
+        client.initialize(&creator, &token_addr, &100_000i128, &deadline, &soroban_sdk::Vec::new(&env), &None, &None);
 
         let _ = client.try_pledge(&backer, &pledge_amount);
 
         let pledge = client.get_pledge(backer);
         prop_assert!(pledge >= 0, "Pledge amount went negative: {}", pledge);
+    }
+
+    /// Property: Checked arithmetic prevents overflow near i128::MAX
+    /// Closes #1167
+    #[test]
+    fn prop_pledge_overflow_rejected(
+        amount1 in (i128::MAX - 10_000)..=i128::MAX,
+        amount2 in 1i128..=10_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let creator = Address::generate(&env);
+        let backer1 = Address::generate(&env);
+        let backer2 = Address::generate(&env);
+        let sac_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+
+        StellarAssetClient::new(&env, &token_addr).mint(&backer1, &i128::MAX);
+        StellarAssetClient::new(&env, &token_addr).mint(&backer2, &amount2);
+
+        let crowdfund_addr = env.register_contract(None, CrowdfundContract);
+        let client = CrowdfundContractClient::new(&env, &crowdfund_addr);
+
+        let deadline = env.ledger().sequence() + 1000;
+        client.initialize(&creator, &token_addr, &i128::MAX, &deadline, &soroban_sdk::Vec::new(&env), &None, &None);
+
+        // First large pledge
+        let result1 = client.try_pledge(&backer1, &amount1);
+
+        if result1.is_ok() {
+            // Second pledge that would overflow
+            let result2 = client.try_pledge(&backer2, &amount2);
+
+            // Should either succeed (if no overflow) or fail with Overflow error
+            if amount1.checked_add(amount2).is_none() {
+                prop_assert!(result2.is_err(), "Overflow should be rejected");
+            }
+        }
     }
 }
