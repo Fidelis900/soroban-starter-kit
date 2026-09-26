@@ -23,6 +23,9 @@ pub enum CrowdfundError {
     InvalidTier = 14,
     PledgeCapExceeded = 15,
     DeadlineAlreadyExtended = 16,
+    CampaignCancelled = 17,
+    TierCapacityExceeded = 18,
+    InvalidTierId = 19,
 }
 
 impl_display_error!(
@@ -43,6 +46,9 @@ impl_display_error!(
     InvalidTier             => "invalid funding tier",
     PledgeCapExceeded       => "pledge would exceed the per-address cap",
     DeadlineAlreadyExtended => "deadline has already been extended once",
+    CampaignCancelled       => "campaign has been cancelled",
+    TierCapacityExceeded    => "tier has reached maximum capacity",
+    InvalidTierId           => "invalid tier id",
 );
 
 #[cfg(test)]
@@ -72,7 +78,10 @@ CrowdfundError::InvalidGoal = {}\n\
 CrowdfundError::NotAuthorized = {}\n\
 CrowdfundError::InvalidTier = {}\n\
 CrowdfundError::PledgeCapExceeded = {}\n\
-CrowdfundError::DeadlineAlreadyExtended = {}\n",
+CrowdfundError::DeadlineAlreadyExtended = {}\n\
+CrowdfundError::CampaignCancelled = {}\n\
+CrowdfundError::TierCapacityExceeded = {}\n\
+CrowdfundError::InvalidTierId = {}\n",
             CrowdfundError::AlreadyInitialized as u32,
             CrowdfundError::NotInitialized as u32,
             CrowdfundError::DeadlinePassed as u32,
@@ -89,6 +98,9 @@ CrowdfundError::DeadlineAlreadyExtended = {}\n",
             CrowdfundError::InvalidTier as u32,
             CrowdfundError::PledgeCapExceeded as u32,
             CrowdfundError::DeadlineAlreadyExtended as u32,
+            CrowdfundError::CampaignCancelled as u32,
+            CrowdfundError::TierCapacityExceeded as u32,
+            CrowdfundError::InvalidTierId as u32,
         )
     }
 

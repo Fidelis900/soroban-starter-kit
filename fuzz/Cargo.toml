@@ -10,12 +10,17 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [dependencies.multisig]
 path = ".."
 
 [dependencies.bonding-curve]
 path = "../contracts/bonding-curve"
+features = ["testutils"]
+
+[dependencies.crowdfund]
+path = "../contracts/crowdfund"
 features = ["testutils"]
 
 [[bin]]
@@ -28,6 +33,13 @@ bench = false
 [[bin]]
 name = "bonding_curve_solvency"
 path = "fuzz_targets/bonding_curve_solvency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crowdfund_state_machine"
+path = "fuzz_targets/crowdfund_state_machine.rs"
 test = false
 doc = false
 bench = false
