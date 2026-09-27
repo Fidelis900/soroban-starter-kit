@@ -84,7 +84,6 @@ mod storage;
 
 pub use errors::AuctionError;
 pub use events::AuctionCancelledWithCompensation;
-pub use storage::{AuctionInfo, DataKey};
 pub use storage::{AuctionInfo, DataKey, DutchConfig};
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
@@ -831,11 +830,26 @@ mod contract {
 
             // Payment and NFT delivery happen in the same invocation, so either both
             // succeed or the whole settlement reverts.
-            token::Client::new(&env, &token).transfer(
-                &env.current_contract_address(),
-                &seller,
-                &highest_bid,
-            );
+            // Pull-over-push fallback (issue #1067): if the seller cannot receive
+            // (frozen, blacklisted, failing receiver), credit their proceeds so
+            // settlement never blocks and funds are never trapped.
+            let paid = token::Client::new(&env, &token)
+                .try_transfer(&env.current_contract_address(), &seller, &highest_bid)
+                .is_ok_and(|r| r.is_ok());
+            if !paid {
+                let key = DataKey::SellerPending(seller.clone());
+                let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+                let new_total = current
+                    .checked_add(highest_bid)
+                    .ok_or(AuctionError::Overflow)?;
+                env.storage().persistent().set(&key, &new_total);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
+                events::seller_proceeds_queued(&env, &seller, highest_bid);
+            }
             release_nft(&env, &winner);
 
             events::ended(&env, &winner, highest_bid);
@@ -868,6 +882,43 @@ mod contract {
 
             events::withdrawn(&env, &bidder, pending);
             Ok(())
+        }
+
+        /// Withdraw sale proceeds credited to `seller` when the direct payout in
+        /// `end()` failed (issue #1067).
+        ///
+        /// # Errors
+        ///
+        /// - [`AuctionError::NothingToWithdraw`] if the seller has no pending proceeds.
+        pub fn withdraw_seller_proceeds(env: Env, seller: Address) -> Result<(), AuctionError> {
+            seller.require_auth();
+
+            let key = DataKey::SellerPending(seller.clone());
+            let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if pending <= 0 {
+                return Err(AuctionError::NothingToWithdraw);
+            }
+
+            env.storage().persistent().remove(&key);
+
+            let token: Address = get_instance(&env, &DataKey::Token)?;
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &seller,
+                &pending,
+            );
+
+            events::seller_proceeds_withdrawn(&env, &seller, pending);
+            Ok(())
+        }
+
+        /// Return the sale proceeds pending withdrawal for `seller`.
+        #[must_use]
+        pub fn get_seller_pending(env: Env, seller: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&DataKey::SellerPending(seller))
+                .unwrap_or(0)
         }
 
         /// Return a bidder's pending refund amount.
