@@ -19,7 +19,7 @@ pub enum DataKey {
     PendingUpgrade,
     /// Instance storage – contract version number (`u32`).
     Version,
-    /// Instance storage – frozen accounts set (`bool` per address).
+    /// Persistent storage – frozen accounts set (`bool` per address).
     Frozen(Address),
     /// Instance storage – optional transfer hook contract address (`Address`).
     TransferHook,
