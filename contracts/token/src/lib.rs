@@ -392,6 +392,23 @@ mod contract {
             permit::permit_nonce(env, owner)
         }
 
+        /// Cancel `nonce` for `owner`, permanently invalidating any permit
+        /// signature signed for it. Owner-authenticated.
+        ///
+        /// Use this to revoke an unused off-chain permit (for example one given
+        /// to an untrusted relayer) without executing a dummy permit. Any
+        /// subsequent [`Self::approve_with_signature`] call using a cancelled
+        /// nonce fails with [`TokenError::InvalidNonce`].
+        pub fn cancel_permit_nonce(env: Env, owner: Address, nonce: u32) {
+            permit::cancel_permit_nonce(env, owner, nonce)
+        }
+
+        /// Return `true` if `owner` has cancelled `nonce`.
+        #[must_use]
+        pub fn is_permit_nonce_cancelled(env: Env, owner: Address, nonce: u32) -> bool {
+            permit::is_permit_nonce_cancelled(env, owner, nonce)
+        }
+
         /// Grant `spender` an allowance over `owner`'s tokens using a pre-signed,
         /// owner-authorized message instead of the owner submitting the transaction
         /// themselves. Analogous to ERC-2612 `permit`.
