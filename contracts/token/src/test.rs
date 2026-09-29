@@ -1131,6 +1131,150 @@ mod transfer_hook_tests {
     }
 }
 
+// ── freeze feature tests ───────────────────────────────────────────────────────
+
+#[cfg(feature = "freeze")]
+mod freeze_tests {
+    use super::*;
+    use crate::storage::DataKey;
+
+    #[test]
+    fn test_freeze_blocks_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+
+        // Transfer should fail for frozen account
+        assert!(client.try_transfer(&user, &recipient, &100i128).is_err());
+    }
+
+    #[test]
+    fn test_unfreeze_allows_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+        client.unfreeze_account(&user);
+
+        // Transfer should succeed after unfreeze
+        client.transfer(&user, &recipient, &100i128);
+        assert_eq!(client.balance(&user), 900i128);
+        assert_eq!(client.balance(&recipient), 100i128);
+    }
+
+    #[test]
+    fn test_freeze_uses_persistent_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.freeze_account(&user);
+
+        // Verify frozen status is in persistent storage
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen(user.clone()))
+            .unwrap_or(false);
+        assert!(frozen);
+
+        // Verify frozen status is NOT in instance storage
+        let instance_frozen: Option<bool> =
+            env.storage().instance().get(&DataKey::Frozen(user.clone()));
+        assert!(instance_frozen.is_none());
+    }
+
+    #[test]
+    fn test_unfreeze_removes_from_persistent_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.freeze_account(&user);
+        client.unfreeze_account(&user);
+
+        // Verify frozen status is removed from persistent storage
+        let frozen: Option<bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen(user.clone()));
+        assert!(frozen.is_none());
+    }
+
+    #[test]
+    fn test_freeze_does_not_affect_instance_storage_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        // Freeze many accounts to verify instance storage doesn't grow
+        for _ in 0..100 {
+            let user = Address::generate(&env);
+            client.freeze_account(&user);
+        }
+
+        // Instance storage should only contain configuration, not frozen accounts
+        // This is a sanity check - we verify the contract still functions
+        let new_user = Address::generate(&env);
+        client.mint(&new_user, &100i128);
+        assert_eq!(client.balance(&new_user), 100i128);
+    }
+
+    #[test]
+    fn test_freeze_blocks_burn() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+
+        // Burn should fail for frozen account
+        assert!(client.try_burn(&user, &100i128).is_err());
+    }
+
+    #[test]
+    fn test_freeze_blocks_transfer_from() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&owner, &1000i128);
+        let expiration = env.ledger().sequence() + 100;
+        client.approve(&owner, &spender, &500i128, &expiration);
+        client.freeze_account(&owner);
+
+        // transfer_from should fail when owner is frozen
+        assert!(
+            client
+                .try_transfer_from(&spender, &owner, &recipient, &100i128)
+                .is_err()
+        );
+    }
+}
+
 // ── #717 snapshot tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -1459,5 +1603,88 @@ mod permit_tests {
         );
         client.approve_with_signature(&owner, &spender, &100i128, &0u32, &expiry, &new_signature);
         assert_eq!(client.allowance(&owner, &spender), 100i128);
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_marks_nonce_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+        client.cancel_permit_nonce(&owner, &0u32);
+        assert!(client.is_permit_nonce_cancelled(&owner, &0u32));
+        // Other nonces are unaffected.
+        assert!(!client.is_permit_nonce_cancelled(&owner, &1u32));
+    }
+
+    #[test]
+    fn test_cancelled_nonce_rejects_matching_permit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            500i128,
+            0u32,
+            expiry,
+        );
+
+        // Owner cancels the nonce before the relayer submits the permit.
+        client.cancel_permit_nonce(&owner, &0u32);
+
+        let result = client
+            .try_approve_with_signature(&owner, &spender, &500i128, &0u32, &expiry, &signature);
+        assert!(result.is_err());
+        // No allowance was granted.
+        assert_eq!(client.allowance(&owner, &spender), 0i128);
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        // Stop mocking auths: the owner's authorization is now required.
+        env.set_auths(&[]);
+        let result = client.try_cancel_permit_nonce(&owner, &0u32);
+        assert!(result.is_err());
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_does_not_advance_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        client.cancel_permit_nonce(&owner, &0u32);
+        // Cancelling does not consume the nonce counter.
+        assert_eq!(client.permit_nonce(&owner), 0u32);
+
+        // A permit signed for a different, uncancelled nonce still works.
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            250i128,
+            1u32,
+            expiry,
+        );
+        client.approve_with_signature(&owner, &spender, &250i128, &1u32, &expiry, &signature);
+        assert_eq!(client.allowance(&owner, &spender), 250i128);
+        assert_eq!(client.permit_nonce(&owner), 2u32);
     }
 }

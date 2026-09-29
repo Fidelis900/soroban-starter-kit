@@ -19,6 +19,14 @@ pub enum DataKey {
     Cancelled,
     PledgeTier(Address),
     TierBackerCount(u32),
+    ClaimWindow,
+    Milestones,
+    MilestoneVotes(u32, Address),
+    MilestoneReleased(u32),
+    WhitelistedTokens,
+    TokenPledge(Address, Address), // (pledger, token)
+    TokenTotalPledged(Address),
+    OracleAddress,
 }
 
 #[contracttype]
@@ -55,4 +63,23 @@ pub struct TierStatus {
     pub met: bool,
     pub max_backers: Option<u32>,
     pub current_backers: u32,
+}
+
+/// Milestone for tranche-based fund release
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Milestone {
+    pub milestone_id: u32,
+    pub amount: i128,
+    pub description: String,
+    pub votes_required: u32,
+}
+
+/// Token contribution with price conversion
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TokenContribution {
+    pub token: Address,
+    pub amount: i128,
+    pub value_in_common_unit: i128,
 }

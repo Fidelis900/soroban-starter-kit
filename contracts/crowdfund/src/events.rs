@@ -40,5 +40,23 @@ pub fn campaign_cancelled(env: &Env, creator: &Address) {
     env.events().publish(
         (Symbol::new(env, "campaign_cancelled"), creator.clone()),
         (),
+pub fn creator_claim_expired(env: &Env, claim_deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "creator_claim_expired"),),
+        claim_deadline,
+    );
+}
+
+pub fn milestone_released(env: &Env, milestone_id: u32, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "milestone_released"), milestone_id),
+        amount,
+    );
+}
+
+pub fn milestone_voted(env: &Env, milestone_id: u32, voter: &Address, approve: bool) {
+    env.events().publish(
+        (Symbol::new(env, "milestone_voted"), milestone_id, voter.clone()),
+        approve,
     );
 }
