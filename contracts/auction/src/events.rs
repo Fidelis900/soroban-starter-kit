@@ -145,3 +145,17 @@ pub fn nft_released(env: &Env, to: &Address, token_id: u32) {
     env.events()
         .publish((Symbol::new(env, "nft_released"), to.clone()), token_id);
 }
+
+pub fn seller_proceeds_queued(env: &Env, seller: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "seller_proceeds_queued"), seller.clone()),
+        amount,
+    );
+}
+
+pub fn seller_proceeds_withdrawn(env: &Env, seller: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "seller_proceeds_withdrawn"), seller.clone()),
+        amount,
+    );
+}

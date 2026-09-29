@@ -42,6 +42,9 @@ pub enum DataKey {
     /// Dutch (descending price) schedule (issue #1071). Present only when the
     /// auction was started with `start_dutch`.
     DutchConfig,
+    /// Seller proceeds awaiting withdrawal after a failed direct payout in
+    /// `end()` (issue #1067).
+    SellerPending(Address),
 }
 
 /// Linear price-decay schedule for a Dutch auction (issue #1071).

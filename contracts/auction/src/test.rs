@@ -1650,3 +1650,79 @@ fn test_dutch_invalid_schedule_rejected() {
         Err(Ok(AuctionError::Overflow))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pull-over-push seller settlement (issue #1067)
+// ---------------------------------------------------------------------------
+
+fn setup_frozen_seller(env: &Env) -> (AuctionContractClient, Address, Address, Address) {
+    let admin = Address::generate(env);
+    let seller = Address::generate(env);
+    let bidder = Address::generate(env);
+
+    let sac = env.register_stellar_asset_contract_v2(admin);
+    let token = sac.address();
+    StellarAssetClient::new(env, &token).mint(&bidder, &100_000);
+
+    let addr = env.register_contract(None, AuctionContract);
+    let client = AuctionContractClient::new(env, &addr);
+    let deadline = env.ledger().sequence() + 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0, &None, &None);
+    client.bid(&bidder, &1_500);
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    (client, seller, bidder, token)
+}
+
+#[test]
+fn test_end_credits_seller_when_transfer_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, _, token) = setup_frozen_seller(&env);
+
+    StellarAssetClient::new(&env, &token).set_authorized(&seller, &false);
+    client.end();
+
+    assert!(client.get_info().settled);
+    assert_eq!(client.get_seller_pending(&seller), 1_500);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&seller), 0);
+}
+
+#[test]
+fn test_seller_withdraws_proceeds_after_unfreeze() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, _, token) = setup_frozen_seller(&env);
+
+    StellarAssetClient::new(&env, &token).set_authorized(&seller, &false);
+    client.end();
+    StellarAssetClient::new(&env, &token).set_authorized(&seller, &true);
+
+    client.withdraw_seller_proceeds(&seller);
+    assert_eq!(client.get_seller_pending(&seller), 0);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&seller), 1_500);
+}
+
+#[test]
+fn test_end_pays_seller_directly_when_transfer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, _, token) = setup_frozen_seller(&env);
+
+    client.end();
+    assert_eq!(client.get_seller_pending(&seller), 0);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&seller), 1_500);
+}
+
+#[test]
+fn test_withdraw_seller_proceeds_nothing_pending_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, _, _) = setup_frozen_seller(&env);
+
+    client.end();
+    assert_eq!(
+        client.try_withdraw_seller_proceeds(&seller),
+        Err(Ok(AuctionError::NothingToWithdraw))
+    );
+}
