@@ -23,6 +23,9 @@ pub enum CrowdfundError {
     InvalidTier = 14,
     PledgeCapExceeded = 15,
     DeadlineAlreadyExtended = 16,
+    CampaignCancelled = 17,
+    TierCapacityExceeded = 18,
+    InvalidTierId = 19,
     ClaimDeadlineExpired = 17,
     Overflow = 18,
     MilestoneNotFound = 19,
@@ -50,6 +53,9 @@ impl_display_error!(
     InvalidTier             => "invalid funding tier",
     PledgeCapExceeded       => "pledge would exceed the per-address cap",
     DeadlineAlreadyExtended => "deadline has already been extended once",
+    CampaignCancelled       => "campaign has been cancelled",
+    TierCapacityExceeded    => "tier has reached maximum capacity",
+    InvalidTierId           => "invalid tier id",
     ClaimDeadlineExpired    => "creator claim window has expired",
     Overflow                => "arithmetic overflow",
     MilestoneNotFound       => "milestone not found",
@@ -87,6 +93,9 @@ CrowdfundError::NotAuthorized = {}\n\
 CrowdfundError::InvalidTier = {}\n\
 CrowdfundError::PledgeCapExceeded = {}\n\
 CrowdfundError::DeadlineAlreadyExtended = {}\n\
+CrowdfundError::CampaignCancelled = {}\n\
+CrowdfundError::TierCapacityExceeded = {}\n\
+CrowdfundError::InvalidTierId = {}\n",
 CrowdfundError::ClaimDeadlineExpired = {}\n\
 CrowdfundError::Overflow = {}\n\
 CrowdfundError::MilestoneNotFound = {}\n\
@@ -110,6 +119,9 @@ CrowdfundError::TokenNotWhitelisted = {}\n",
             CrowdfundError::InvalidTier as u32,
             CrowdfundError::PledgeCapExceeded as u32,
             CrowdfundError::DeadlineAlreadyExtended as u32,
+            CrowdfundError::CampaignCancelled as u32,
+            CrowdfundError::TierCapacityExceeded as u32,
+            CrowdfundError::InvalidTierId as u32,
             CrowdfundError::ClaimDeadlineExpired as u32,
             CrowdfundError::Overflow as u32,
             CrowdfundError::MilestoneNotFound as u32,

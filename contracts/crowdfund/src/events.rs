@@ -36,6 +36,10 @@ pub fn deadline_extended(env: &Env, creator: &Address, new_deadline: u32) {
     );
 }
 
+pub fn campaign_cancelled(env: &Env, creator: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "campaign_cancelled"), creator.clone()),
+        (),
 pub fn creator_claim_expired(env: &Env, claim_deadline: u32) {
     env.events().publish(
         (Symbol::new(env, "creator_claim_expired"),),

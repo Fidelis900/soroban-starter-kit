@@ -112,6 +112,7 @@ mod contract {
                 .instance()
                 .set(&DataKey::TotalPledged, &0_i128);
             env.storage().instance().set(&DataKey::Claimed, &false);
+            env.storage().instance().set(&DataKey::Cancelled, &false);
             env.storage().instance().set(&DataKey::Tiers, &tiers);
             env.storage()
                 .instance()
@@ -132,6 +133,7 @@ mod contract {
         }
 
         /// Pledge `amount` tokens to the campaign. Must be called before the deadline.
+        /// Optionally specify a reward tier to claim by providing `tier_id` (0-based index).
         ///
         /// # Errors
         ///
@@ -140,7 +142,15 @@ mod contract {
         /// - [`CrowdfundError::InvalidAmount`] if `amount` <= 0.
         /// - [`CrowdfundError::PledgeCapExceeded`] if this pledge would push the
         ///   pledger's cumulative total above `max_pledge_per_address`.
-        pub fn pledge(env: Env, pledger: Address, amount: i128) -> Result<(), CrowdfundError> {
+        /// - [`CrowdfundError::CampaignCancelled`] if the campaign was cancelled.
+        /// - [`CrowdfundError::InvalidTierId`] if `tier_id` is out of bounds.
+        /// - [`CrowdfundError::TierCapacityExceeded`] if the tier has reached max capacity.
+        pub fn pledge(
+            env: Env,
+            pledger: Address,
+            amount: i128,
+            tier_id: Option<u32>,
+        ) -> Result<(), CrowdfundError> {
             if amount <= 0 {
                 return Err(CrowdfundError::InvalidAmount);
             }
@@ -148,6 +158,11 @@ mod contract {
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
             if env.ledger().sequence() > deadline {
                 return Err(CrowdfundError::DeadlinePassed);
+            }
+
+            let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;
+            if cancelled {
+                return Err(CrowdfundError::CampaignCancelled);
             }
 
             pledger.require_auth();
@@ -167,6 +182,54 @@ mod contract {
                 if new_pledge > cap {
                     return Err(CrowdfundError::PledgeCapExceeded);
                 }
+            }
+
+            // Handle tier selection
+            if let Some(tid) = tier_id {
+                let tiers: Vec<FundingTier> = get_instance(&env, &DataKey::Tiers)?;
+                if tid >= tiers.len() {
+                    return Err(CrowdfundError::InvalidTierId);
+                }
+
+                let tier = tiers.get(tid).unwrap();
+                if let Some(max_backers) = tier.max_backers {
+                    let current_count = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::TierBackerCount(tid))
+                        .unwrap_or(0u32);
+
+                    // Check if already claimed this tier
+                    let already_claimed = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::PledgeTier(pledger.clone()))
+                        .unwrap_or(None::<u32>);
+
+                    if already_claimed != Some(tid) && current_count >= max_backers {
+                        return Err(CrowdfundError::TierCapacityExceeded);
+                    }
+
+                    // Update backer count if new to this tier
+                    if already_claimed != Some(tid) {
+                        env.storage().persistent().set(
+                            &DataKey::TierBackerCount(tid),
+                            &(current_count + 1),
+                        );
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&DataKey::TierBackerCount(tid), LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+                    }
+                }
+
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PledgeTier(pledger.clone()), &Some(tid));
+                env.storage().persistent().extend_ttl(
+                    &DataKey::PledgeTier(pledger.clone()),
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
             }
 
             let token: Address = get_instance(&env, &DataKey::Token)?;
@@ -336,24 +399,32 @@ mod contract {
         }
 
         /// Contributor reclaims their pledge after the deadline when the goal was not met,
+        /// or immediately if the campaign was cancelled.
         /// OR after the claim window expires if the creator failed to claim.
         ///
         /// # Errors
         ///
         /// - [`CrowdfundError::NotInitialized`] if not set up.
+        /// - [`CrowdfundError::DeadlineNotReached`] if the deadline has not passed and campaign not cancelled.
+        /// - [`CrowdfundError::GoalAlreadyMet`] if the goal was met (creator should claim instead).
         /// - [`CrowdfundError::DeadlineNotReached`] if the deadline has not passed.
         /// - [`CrowdfundError::GoalAlreadyMet`] if the goal was met AND the claim window hasn't expired AND funds were claimed.
         /// - [`CrowdfundError::NothingToWithdraw`] if the caller has no pledge to refund.
         pub fn refund(env: Env, pledger: Address) -> Result<(), CrowdfundError> {
             get_instance::<Address>(&env, &DataKey::Creator)?; // ensure initialized
 
+            let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
-            if env.ledger().sequence() <= deadline {
+
+            // Allow refund if cancelled OR if deadline passed and goal not met
+            if !cancelled && env.ledger().sequence() <= deadline {
                 return Err(CrowdfundError::DeadlineNotReached);
             }
 
             let goal: i128 = get_instance(&env, &DataKey::Goal)?;
             let total: i128 = get_instance(&env, &DataKey::TotalPledged)?;
+            if !cancelled && total >= goal {
+                return Err(CrowdfundError::GoalAlreadyMet);
             let claimed: bool = get_instance(&env, &DataKey::Claimed)?;
             
             // Allow refund if:
@@ -409,6 +480,15 @@ mod contract {
             Ok(())
         }
 
+        /// Creator cancels the campaign before the deadline, immediately enabling refunds.
+        ///
+        /// # Errors
+        ///
+        /// - [`CrowdfundError::NotInitialized`] if not set up.
+        /// - [`CrowdfundError::NotAuthorized`] if caller is not the creator.
+        /// - [`CrowdfundError::DeadlinePassed`] if the deadline has already passed.
+        /// - [`CrowdfundError::CampaignCancelled`] if already cancelled.
+        pub fn cancel_campaign(env: Env) -> Result<(), CrowdfundError> {
         /// Set milestones for tranche-based fund release (creator only, before campaign starts).
         /// Closes #1168
         ///
@@ -426,6 +506,63 @@ mod contract {
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
             if env.ledger().sequence() > deadline {
                 return Err(CrowdfundError::DeadlinePassed);
+            }
+
+            let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;
+            if cancelled {
+                return Err(CrowdfundError::CampaignCancelled);
+            }
+
+            env.storage().instance().set(&DataKey::Cancelled, &true);
+
+            bump_instance(&env);
+            events::campaign_cancelled(&env, &creator);
+            Ok(())
+        }
+
+        /// Batch refund pledges to multiple contributors. Callable by anyone after the
+        /// deadline if the goal was not met, or immediately if the campaign was cancelled.
+        ///
+        /// # Errors
+        ///
+        /// - [`CrowdfundError::NotInitialized`] if not set up.
+        /// - [`CrowdfundError::DeadlineNotReached`] if the deadline has not passed and campaign not cancelled.
+        /// - [`CrowdfundError::GoalAlreadyMet`] if the goal was met.
+        pub fn refund_batch(env: Env, pledgers: Vec<Address>) -> Result<(), CrowdfundError> {
+            get_instance::<Address>(&env, &DataKey::Creator)?; // ensure initialized
+
+            let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;
+            let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
+
+            if !cancelled && env.ledger().sequence() <= deadline {
+                return Err(CrowdfundError::DeadlineNotReached);
+            }
+
+            let goal: i128 = get_instance(&env, &DataKey::Goal)?;
+            let total: i128 = get_instance(&env, &DataKey::TotalPledged)?;
+            if !cancelled && total >= goal {
+                return Err(CrowdfundError::GoalAlreadyMet);
+            }
+
+            let token: Address = get_instance(&env, &DataKey::Token)?;
+            let token_client = token::Client::new(&env, &token);
+
+            for pledger in pledgers.iter() {
+                let pledge: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Pledge(pledger.clone()))
+                    .unwrap_or(0);
+
+                if pledge > 0 {
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::Pledge(pledger.clone()));
+
+                    token_client.transfer(&env.current_contract_address(), &pledger, &pledge);
+
+                    events::refunded(&env, &pledger, pledge);
+                }
             }
 
             env.storage().instance().set(&DataKey::Milestones, &milestones);
@@ -596,6 +733,17 @@ mod contract {
             Ok(())
         }
 
+        /// Query reward perk eligibility for a pledger.
+        ///
+        /// # Returns
+        ///
+        /// The tier_id the pledger has claimed, or None if no tier was selected.
+        #[must_use]
+        pub fn claim_reward_perk(env: Env, pledger: Address) -> Option<u32> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::PledgeTier(pledger))
+                .unwrap_or(None)
         /// Pledge with alternative token (multi-token support).
         /// Closes #1169
         ///
@@ -694,11 +842,19 @@ mod contract {
             let total_pledged: i128 = get_instance(&env, &DataKey::TotalPledged)?;
             let tiers: Vec<FundingTier> = get_instance(&env, &DataKey::Tiers)?;
             let mut tier_status = Vec::new(&env);
-            for tier in tiers.iter() {
+            for (idx, tier) in tiers.iter().enumerate() {
+                let current_backers = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TierBackerCount(idx as u32))
+                    .unwrap_or(0u32);
+
                 tier_status.push_back(TierStatus {
                     threshold: tier.threshold,
                     description: tier.description.clone(),
                     met: total_pledged >= tier.threshold,
+                    max_backers: tier.max_backers,
+                    current_backers,
                 });
             }
 
@@ -709,6 +865,7 @@ mod contract {
                 deadline: get_instance(&env, &DataKey::Deadline)?,
                 total_pledged,
                 claimed: get_instance(&env, &DataKey::Claimed)?,
+                cancelled: get_instance(&env, &DataKey::Cancelled)?,
                 tiers: tier_status,
                 max_pledge_per_address: env.storage().instance().get(&DataKey::MaxPledgePerAddress),
             })
