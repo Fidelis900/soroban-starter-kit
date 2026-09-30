@@ -1687,4 +1687,142 @@ mod permit_tests {
         assert_eq!(client.allowance(&owner, &spender), 250i128);
         assert_eq!(client.permit_nonce(&owner), 2u32);
     }
+
+    #[test]
+    fn test_transfer_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 200i128),
+            (user3.clone(), 300i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+
+        assert_eq!(client.balance(&user1), 500i128);
+        assert_eq!(client.balance(&user2), 200i128);
+        assert_eq!(client.balance(&user3), 300i128);
+        assert_eq!(client.total_supply(), 1000i128);
+    }
+
+    #[test]
+    fn test_transfer_batch_self_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user1.clone(), 200i128),
+            (user2.clone(), 300i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+
+        assert_eq!(client.balance(&user1), 700i128);
+        assert_eq!(client.balance(&user2), 300i128);
+        assert_eq!(client.total_supply(), 1000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1)")]
+    fn test_transfer_batch_insufficient_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &100i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 200i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 0i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_negative_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), -1i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![&env];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    fn test_transfer_batch_multiple_recipients() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&sender, &10000i128);
+
+        let mut recipients = soroban_sdk::Vec::new(&env);
+        for i in 0..10 {
+            let recipient = Address::generate(&env);
+            recipients.push_back((recipient, 100i128));
+        }
+        client.transfer_batch(&sender, &recipients);
+
+        assert_eq!(client.balance(&sender), 9000i128);
+        assert_eq!(client.total_supply(), 10000i128);
+        for i in 0..10 {
+            let recipient = recipients.get(i).unwrap().0;
+            assert_eq!(client.balance(&recipient), 100i128);
+        }
+    }
 }

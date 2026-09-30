@@ -9,7 +9,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    Address, BytesN, Env, String, contract, contractimpl, token, token::TokenInterface,
+    Address, BytesN, Env, MuxedAddress, String, contract, contractimpl, token, token::TokenInterface,
 };
 
 mod admin;
@@ -228,6 +228,16 @@ mod contract {
             extend_ttl_instance(&env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
 
             Ok(())
+        }
+
+        /// Batch transfer: execute multiple transfers atomically with a single
+        /// sender balance deduction. More gas-efficient than repeated `transfer`.
+        pub fn transfer_batch(
+            env: Env,
+            from: Address,
+            transfers: soroban_sdk::Vec<(Address, i128)>,
+        ) -> Result<(), TokenError> {
+            Self::transfer_batch_impl(&env, from, transfers)
         }
 
         /// Burn `amount` tokens from `from`. Admin only.
@@ -679,6 +689,123 @@ mod contract {
 
             Ok(())
         }
+
+        /// Batch transfer: execute multiple transfers atomically with a single
+        /// sender balance deduction. More gas-efficient than repeated `transfer`.
+        pub(crate) fn transfer_batch_impl(
+            env: &Env,
+            from: Address,
+            transfers: soroban_sdk::Vec<(Address, i128)>,
+        ) -> Result<(), TokenError> {
+            from.require_auth();
+            #[cfg(feature = "pausable")]
+            if let Err(e) = require_not_paused(env) {
+                return Err(e);
+            }
+            #[cfg(feature = "freeze")]
+            if let Err(e) = require_not_frozen(env, &from) {
+                return Err(e);
+            }
+
+            if transfers.is_empty() {
+                return Err(TokenError::InvalidAmount);
+            }
+
+            // Calculate total amount and validate all amounts are positive
+            let mut total_amount: i128 = 0;
+            for (_, amount) in transfers.iter() {
+                if amount <= 0 {
+                    return Err(TokenError::InvalidAmount);
+                }
+                total_amount = total_amount
+                    .checked_add(amount)
+                    .ok_or(TokenError::Overflow)?;
+            }
+
+            // Verify sender has sufficient balance
+            let sender_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Balance(from.clone()))
+                .unwrap_or(0);
+            if sender_balance < total_amount {
+                return Err(TokenError::InsufficientBalance);
+            }
+
+            // Deduct total amount from sender once
+            let new_sender_balance = sender_balance
+                .checked_sub(total_amount)
+                .ok_or(TokenError::Overflow)?;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(from.clone()), &new_sender_balance);
+            extend_ttl_persistent(
+                &env,
+                &DataKey::Balance(from.clone()),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+
+            // Credit each recipient individually
+            for (to, amount) in transfers.iter() {
+                if from == to {
+                    continue; // Self-transfer is a no-op for that recipient
+                }
+                let balance: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Balance(to.clone()))
+                    .unwrap_or(0);
+                let new_balance = balance.checked_add(amount).ok_or(TokenError::Overflow)?;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Balance(to.clone()), &new_balance);
+                extend_ttl_persistent(
+                    &env,
+                    &DataKey::Balance(to.clone()),
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
+            }
+
+            // Emit batch transfer event
+            events::transferred_batch(&env, &from, &transfers);
+
+            // Transfer hook: fire-and-forget for each transfer
+            #[cfg(feature = "transfer-hook")]
+            {
+                if let Some(hook_addr) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Address>(&DataKey::TransferHook)
+                {
+                    for (to, amount) in transfers.iter() {
+                        if from == to {
+                            continue;
+                        }
+                        let args = soroban_sdk::vec![
+                            env,
+                            soroban_sdk::IntoVal::<soroban_sdk::Env, soroban_sdk::Val>::into_val(
+                                &from, env
+                            ),
+                            soroban_sdk::IntoVal::<soroban_sdk::Env, soroban_sdk::Val>::into_val(
+                                &to, env
+                            ),
+                            soroban_sdk::IntoVal::<soroban_sdk::Env, soroban_sdk::Val>::into_val(
+                                &amount, env
+                            ),
+                        ];
+                        let _ = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+                            &hook_addr,
+                            &soroban_sdk::Symbol::new(env, "on_transfer"),
+                            args,
+                        );
+                    }
+                }
+            }
+
+            Ok(())
+        }
     }
 
     #[contractimpl]
@@ -698,7 +825,7 @@ mod contract {
         fn balance(env: Env, id: Address) -> i128 {
             token_interface::balance(env, id)
         }
-        fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
             token_interface::transfer(env, from, to, amount)
         }
         fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
