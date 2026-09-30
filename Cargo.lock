@@ -211,7 +211,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "ballot"
 version = "0.1.0"
 dependencies = [
- "soroban-common",
+ "proptest",
+ "proptest-state-machine",
  "soroban-sdk",
 ]
 
@@ -915,6 +916,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "bonding-curve",
+ "libfuzzer-sys",
+ "soroban-crowdfund-template",
+ "soroban-multisig-template",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1448,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest-state-machine"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b52a714915de2d16a5289616d2265a934780f50a9dd30359322b687403fa2ac2"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,6 +1878,7 @@ dependencies = [
 name = "soroban-dao-template"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "soroban-common",
  "soroban-sdk",
  "soroban-token-template",
@@ -2127,21 +2150,6 @@ version = "0.1.0"
 dependencies = [
  "soroban-common",
  "soroban-sdk",
-]
-
-[[package]]
-name = "soroban-token-fuzz"
-version = "0.1.0"
-dependencies = [
- "libfuzzer-sys",
- "soroban-airdrop-template",
- "soroban-escrow-template",
- "soroban-lottery-template",
- "soroban-marketplace-template",
- "soroban-oracle-template",
- "soroban-sdk",
- "soroban-swap-template",
- "soroban-token-template",
 ]
 
 [[package]]

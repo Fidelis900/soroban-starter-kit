@@ -78,6 +78,16 @@ pub fn transferred(env: &Env, from: &Address, to: &Address, amount: i128) {
     );
 }
 
+/// Emitted when tokens are batch transferred.
+/// Topics: (Symbol, Address) — event name, from
+/// Data: Vec<(Address, i128)> — recipients and amounts
+pub fn transferred_batch(env: &Env, from: &Address, transfers: &soroban_sdk::Vec<(Address, i128)>) {
+    env.events().publish(
+        (Symbol::new(env, "transfer_batch"), from.clone()),
+        transfers.clone(),
+    );
+}
+
 /// Emitted when an account is frozen.
 /// Topics: (Symbol, Address) — event name, account
 pub fn account_frozen(env: &Env, account: &Address) {
