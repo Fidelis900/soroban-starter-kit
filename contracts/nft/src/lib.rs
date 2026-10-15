@@ -102,6 +102,7 @@ mod contract {
                     .instance()
                     .set(&DataKey::RoyaltyRecipient, recipient);
             }
+            env.storage().instance().set(&DataKey::NextTokenId, &1u32);
             env.storage().instance().set(&DataKey::Initialized, &true);
 
             bump_instance(&env);
@@ -196,11 +197,148 @@ mod contract {
                 bump_token(&env, &TokenKey::TokenRoyaltyRecipient(token_id));
             }
 
+            // Keep sequential allocator ahead of explicitly chosen ids.
+            let next: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextTokenId)
+                .unwrap_or(1);
+            if token_id >= next {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::NextTokenId, &(token_id + 1));
+            }
+
             bump_instance(&env);
             bump_token(&env, &TokenKey::Owner(token_id));
             bump_token(&env, &TokenKey::Uri(token_id));
             events::minted(&env, &to, token_id);
 
+            Ok(())
+        }
+
+        /// Mint multiple NFTs to `to` with sequential id allocation.
+        ///
+        /// Returns the list of newly minted token ids in order.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NftError::NotInitialized`] if the contract has not been set up.
+        /// Returns [`NftError::NotAuthorized`] if the caller is not the admin.
+        /// Returns [`NftError::SupplyCapReached`] if minting would exceed the max supply.
+        pub fn mint_batch(
+            env: Env,
+            to: Address,
+            token_uris: Vec<String>,
+        ) -> Result<Vec<u32>, NftError> {
+            Self::require_initialized(&env)?;
+
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(NftError::NotInitialized)?;
+            admin.require_auth();
+
+            let count = token_uris.len();
+            if count == 0 {
+                return Ok(Vec::new(&env));
+            }
+
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalSupply)
+                .unwrap_or(0);
+            if let Some(max) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MaxSupply)
+            {
+                if total.saturating_add(count) > max {
+                    return Err(NftError::SupplyCapReached);
+                }
+            }
+
+            let mut next: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextTokenId)
+                .unwrap_or(1);
+            let mut minted = Vec::new(&env);
+            let mut new_total = total;
+
+            for uri in token_uris.iter() {
+                // Skip any ids already taken by explicit mint.
+                while env.storage().persistent().has(&TokenKey::Owner(next)) {
+                    next = next.checked_add(1).ok_or(NftError::SupplyCapReached)?;
+                }
+
+                let token_id = next;
+                next = next.checked_add(1).ok_or(NftError::SupplyCapReached)?;
+                new_total = new_total.checked_add(1).ok_or(NftError::SupplyCapReached)?;
+
+                env.storage()
+                    .persistent()
+                    .set(&TokenKey::Owner(token_id), &to);
+                env.storage()
+                    .persistent()
+                    .set(&TokenKey::Uri(token_id), &uri);
+                bump_token(&env, &TokenKey::Owner(token_id));
+                bump_token(&env, &TokenKey::Uri(token_id));
+                events::minted(&env, &to, token_id);
+                minted.push_back(token_id);
+            }
+
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalSupply, &new_total);
+            env.storage()
+                .instance()
+                .set(&DataKey::NextTokenId, &next);
+            bump_instance(&env);
+            Ok(minted)
+        }
+
+        /// Transfer multiple tokens from `from` to `to` in one call.
+        ///
+        /// Validates that `from` owns every token before applying any transfer.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NftError::TokenNotFound`] if any token does not exist.
+        /// Returns [`NftError::NotOwner`] if `from` does not own every token.
+        pub fn transfer_batch(
+            env: Env,
+            from: Address,
+            to: Address,
+            token_ids: Vec<u32>,
+        ) -> Result<(), NftError> {
+            Self::require_initialized(&env)?;
+            from.require_auth();
+
+            // Validate ownership for all tokens first (all-or-nothing).
+            for token_id in token_ids.iter() {
+                let owner: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&TokenKey::Owner(token_id))
+                    .ok_or(NftError::TokenNotFound)?;
+                if owner != from {
+                    return Err(NftError::NotOwner);
+                }
+            }
+
+            for token_id in token_ids.iter() {
+                env.storage()
+                    .persistent()
+                    .set(&TokenKey::Owner(token_id), &to);
+                env.storage()
+                    .persistent()
+                    .remove(&TokenKey::Approval(token_id));
+                bump_token(&env, &TokenKey::Owner(token_id));
+                events::transferred(&env, &from, &to, token_id);
+            }
             Ok(())
         }
 

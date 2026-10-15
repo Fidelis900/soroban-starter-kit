@@ -17,6 +17,8 @@ pub enum DataKey {
     RoyaltyBps,
     /// Collection-level default royalty recipient.
     RoyaltyRecipient,
+    /// Next token id for sequential batch minting.
+    NextTokenId,
 }
 
 /// Persistent-storage keys (per-key TTL for per-token data).

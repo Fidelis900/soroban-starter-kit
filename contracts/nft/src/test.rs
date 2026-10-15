@@ -577,3 +577,87 @@ fn test_per_token_data_uses_persistent_storage() {
     });
     assert_eq!(client.total_supply(), 20);
 }
+
+
+// ---------------------------------------------------------------------------
+// Batch mint / transfer (#1186)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mint_batch_sequential_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let mut uris = soroban_sdk::Vec::new(&env);
+    uris.push_back(String::from_str(&env, "ipfs://a"));
+    uris.push_back(String::from_str(&env, "ipfs://b"));
+    uris.push_back(String::from_str(&env, "ipfs://c"));
+
+    let ids = client.mint_batch(&owner, &uris);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0).unwrap(), 1);
+    assert_eq!(ids.get(1).unwrap(), 2);
+    assert_eq!(ids.get(2).unwrap(), 3);
+    assert_eq!(client.total_supply(), 3);
+    assert_eq!(client.owner_of(&2), owner);
+    assert_eq!(client.token_uri(&3), String::from_str(&env, "ipfs://c"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_mint_batch_respects_supply_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_with_cap(&env, 2);
+    let owner = Address::generate(&env);
+
+    let mut uris = soroban_sdk::Vec::new(&env);
+    uris.push_back(String::from_str(&env, "ipfs://a"));
+    uris.push_back(String::from_str(&env, "ipfs://b"));
+    uris.push_back(String::from_str(&env, "ipfs://c"));
+    client.mint_batch(&owner, &uris);
+}
+
+#[test]
+fn test_transfer_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    let mut uris = soroban_sdk::Vec::new(&env);
+    uris.push_back(String::from_str(&env, "ipfs://a"));
+    uris.push_back(String::from_str(&env, "ipfs://b"));
+    let ids = client.mint_batch(&alice, &uris);
+
+    let mut token_ids = soroban_sdk::Vec::new(&env);
+    token_ids.push_back(ids.get(0).unwrap());
+    token_ids.push_back(ids.get(1).unwrap());
+    client.transfer_batch(&alice, &bob, &token_ids);
+
+    assert_eq!(client.owner_of(&1), bob);
+    assert_eq!(client.owner_of(&2), bob);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_transfer_batch_not_owner_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+
+    client.mint(&alice, &1, &String::from_str(&env, "ipfs://1"), &None, &None);
+    client.mint(&bob, &2, &String::from_str(&env, "ipfs://2"), &None, &None);
+
+    let mut token_ids = soroban_sdk::Vec::new(&env);
+    token_ids.push_back(1u32);
+    token_ids.push_back(2u32);
+    // alice does not own token 2
+    client.transfer_batch(&alice, &carol, &token_ids);
+}
