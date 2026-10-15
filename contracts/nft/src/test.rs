@@ -541,3 +541,39 @@ fn test_mint_invalid_token_royalty_bps_fails() {
         &Some(recipient),
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Persistent storage (#1185)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_per_token_data_uses_persistent_storage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+    let contract_id = client.address.clone();
+
+    for id in 1u32..=20 {
+        client.mint(
+            &owner,
+            &id,
+            &String::from_str(&env, "ipfs://QmVeryLongHashThatWouldBloatInstanceStorageIfStoredThere"),
+            &None,
+            &None,
+        );
+    }
+
+    env.as_contract(&contract_id, || {
+        for id in 1u32..=20 {
+            assert!(env.storage().persistent().has(&TokenKey::Owner(id)));
+            assert!(env.storage().persistent().has(&TokenKey::Uri(id)));
+            assert!(!env.storage().instance().has(&TokenKey::Owner(id)));
+            assert!(!env.storage().instance().has(&TokenKey::Uri(id)));
+        }
+        assert!(env.storage().instance().has(&DataKey::TotalSupply));
+        assert!(env.storage().instance().has(&DataKey::Name));
+    });
+    assert_eq!(client.total_supply(), 20);
+}

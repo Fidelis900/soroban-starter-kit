@@ -22,5 +22,21 @@ name = "deploy"
 path = "src/bin/deploy.rs"
 doc = false
 
-[lints]
-workspace = true
+# soroban-sdk 28 #[contractimpl] requires unsafe; override workspace forbid.
+[lints.rust]
+unsafe_code = "allow"
+unused_imports = "warn"
+unused_variables = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+integer_division = "warn"
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+std_instead_of_core = "warn"
