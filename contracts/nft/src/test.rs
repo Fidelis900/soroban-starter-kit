@@ -731,3 +731,44 @@ fn test_soulbound_transfer_from_fails() {
     client.approve(&1, &bob);
     client.transfer_from(&bob, &alice, &carol, &1);
 }
+
+
+// ---------------------------------------------------------------------------
+// Enumerable (#1187)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_enumerable_index_integrity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    client.mint(&alice, &10, &String::from_str(&env, "ipfs://10"), &None, &None);
+    client.mint(&alice, &20, &String::from_str(&env, "ipfs://20"), &None, &None);
+    client.mint(&alice, &30, &String::from_str(&env, "ipfs://30"), &None, &None);
+
+    assert_eq!(client.balance_of(&alice), 3);
+    assert_eq!(client.token_of_owner_by_index(&alice, &0), 10);
+    assert_eq!(client.token_of_owner_by_index(&alice, &1), 20);
+    assert_eq!(client.token_of_owner_by_index(&alice, &2), 30);
+
+    // Transfer middle token → swap-and-pop keeps index integrity.
+    client.transfer(&alice, &bob, &20);
+    assert_eq!(client.balance_of(&alice), 2);
+    assert_eq!(client.balance_of(&bob), 1);
+    assert_eq!(client.token_of_owner_by_index(&bob, &0), 20);
+
+    let alice0 = client.token_of_owner_by_index(&alice, &0);
+    let alice1 = client.token_of_owner_by_index(&alice, &1);
+    let mut alice_ids = [alice0, alice1];
+    alice_ids.sort();
+    assert_eq!(alice_ids, [10, 30]);
+
+    // Transfer remaining to bob
+    client.transfer(&alice, &bob, &10);
+    client.transfer(&alice, &bob, &30);
+    assert_eq!(client.balance_of(&alice), 0);
+    assert_eq!(client.balance_of(&bob), 3);
+}

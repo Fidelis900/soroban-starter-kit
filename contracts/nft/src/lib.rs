@@ -28,6 +28,61 @@ fn bump_token(env: &Env, key: &TokenKey) {
         .extend_ttl(key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
 }
 
+fn bump_data(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+}
+
+fn owner_balance(env: &Env, owner: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Balance(owner.clone()))
+        .unwrap_or(0)
+}
+
+fn enumerable_add(env: &Env, owner: &Address, token_id: u32) {
+    let balance = owner_balance(env, owner);
+    let tokens_key = DataKey::OwnerTokens(owner.clone(), balance);
+    let index_key = DataKey::OwnedIndex(token_id);
+    env.storage().persistent().set(&tokens_key, &token_id);
+    env.storage().persistent().set(&index_key, &balance);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Balance(owner.clone()), &(balance.saturating_add(1)));
+    bump_data(env, &tokens_key);
+    bump_data(env, &index_key);
+    bump_data(env, &DataKey::Balance(owner.clone()));
+}
+
+fn enumerable_remove(env: &Env, owner: &Address, token_id: u32) {
+    let balance = owner_balance(env, owner);
+    if balance == 0 {
+        return;
+    }
+    let index_key = DataKey::OwnedIndex(token_id);
+    let index: u32 = env.storage().persistent().get(&index_key).unwrap_or(0);
+    let last_index = balance.saturating_sub(1);
+    let last_key = DataKey::OwnerTokens(owner.clone(), last_index);
+    if index != last_index {
+        let last_token: u32 = env.storage().persistent().get(&last_key).unwrap_or(0);
+        let swap_key = DataKey::OwnerTokens(owner.clone(), index);
+        env.storage().persistent().set(&swap_key, &last_token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnedIndex(last_token), &index);
+        bump_data(env, &swap_key);
+        bump_data(env, &DataKey::OwnedIndex(last_token));
+    }
+    env.storage().persistent().remove(&last_key);
+    env.storage().persistent().remove(&index_key);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Balance(owner.clone()), &last_index);
+    bump_data(env, &DataKey::Balance(owner.clone()));
+}
+
+
 /// Non-fungible token (NFT) contract with admin-controlled minting and optional supply cap.
 ///
 /// Each token has a unique `token_id` (`u32`), an owner, an optional approved spender,
@@ -184,6 +239,7 @@ mod contract {
             env.storage()
                 .instance()
                 .set(&DataKey::TotalSupply, &(total + 1));
+            enumerable_add(&env, &to, token_id);
 
             // Store per-token royalty overrides if provided.
             if let Some(bps) = token_royalty_bps {
@@ -286,6 +342,7 @@ mod contract {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Uri(token_id), &uri);
+                enumerable_add(&env, &to, token_id);
                 bump_token(&env, &TokenKey::Owner(token_id));
                 bump_token(&env, &TokenKey::Uri(token_id));
                 events::minted(&env, &to, token_id);
@@ -333,9 +390,11 @@ mod contract {
             }
 
             for token_id in token_ids.iter() {
+                enumerable_remove(&env, &from, token_id);
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Owner(token_id), &to);
+                enumerable_add(&env, &to, token_id);
                 env.storage()
                     .persistent()
                     .remove(&TokenKey::Approval(token_id));
@@ -446,9 +505,11 @@ mod contract {
                 return Err(NftError::NotOwner);
             }
 
+            enumerable_remove(&env, &from, token_id);
             env.storage()
                 .persistent()
                 .set(&TokenKey::Owner(token_id), &to);
+            enumerable_add(&env, &to, token_id);
             // Clear any existing approval on transfer.
             env.storage()
                 .persistent()
@@ -460,52 +521,6 @@ mod contract {
             Ok(())
         }
 
-        /// Transfer multiple tokens from `from` to `to` in a single call. Requires a single
-        /// auth from `from` (the owner) covering the whole batch.
-        ///
-        /// Ownership of every token in `token_ids` is validated before any transfer is applied,
-        /// so the batch is atomic: either all tokens move or none do.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`NftError::TokenNotFound`] if any token in `token_ids` does not exist.
-        /// Returns [`NftError::NotOwner`] if `from` does not own any token in `token_ids`.
-        pub fn batch_transfer(
-            env: Env,
-            from: Address,
-            to: Address,
-            token_ids: Vec<u32>,
-        ) -> Result<(), NftError> {
-            Self::require_initialized(&env)?;
-            from.require_auth();
-
-            for token_id in token_ids.iter() {
-                let owner: Address = env
-                    .storage()
-                    .persistent()
-                    .get(&TokenKey::Owner(token_id))
-                    .ok_or(NftError::TokenNotFound)?;
-
-                if owner != from {
-                    return Err(NftError::NotOwner);
-                }
-            }
-
-            for token_id in token_ids.iter() {
-                env.storage()
-                    .persistent()
-                    .set(&TokenKey::Owner(token_id), &to);
-                // Clear any existing approval on transfer.
-                env.storage()
-                    .persistent()
-                    .remove(&TokenKey::Approval(token_id));
-
-                bump_token(&env, &TokenKey::Owner(token_id));
-                events::transferred(&env, &from, &to, token_id);
-            }
-
-            Ok(())
-        }
 
         /// Burn (destroy) token `token_id`. Requires auth from the current owner.
         ///
@@ -527,6 +542,7 @@ mod contract {
                 return Err(NftError::NotOwner);
             }
 
+            enumerable_remove(&env, &from, token_id);
             env.storage()
                 .persistent()
                 .remove(&TokenKey::Owner(token_id));
@@ -614,9 +630,11 @@ mod contract {
                 _ => return Err(NftError::NotApproved),
             }
 
+            enumerable_remove(&env, &from, token_id);
             env.storage()
                 .persistent()
                 .set(&TokenKey::Owner(token_id), &to);
+            enumerable_add(&env, &to, token_id);
             env.storage()
                 .persistent()
                 .remove(&TokenKey::Approval(token_id));
@@ -688,6 +706,33 @@ mod contract {
                 .instance()
                 .get(&DataKey::Symbol)
                 .ok_or(NftError::NotInitialized)
+        }
+
+
+        /// Return how many tokens `owner` currently holds.
+        #[must_use]
+        pub fn balance_of(env: Env, owner: Address) -> u32 {
+            owner_balance(&env, &owner)
+        }
+
+        /// Return the token id at `index` in `owner`'s enumerable list.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NftError::InvalidTokenId`] if `index` is out of range.
+        pub fn token_of_owner_by_index(
+            env: Env,
+            owner: Address,
+            index: u32,
+        ) -> Result<u32, NftError> {
+            let balance = owner_balance(&env, &owner);
+            if index >= balance {
+                return Err(NftError::InvalidTokenId);
+            }
+            env.storage()
+                .persistent()
+                .get(&DataKey::OwnerTokens(owner, index))
+                .ok_or(NftError::InvalidTokenId)
         }
 
         /// Return whether this collection is soulbound (non-transferable).
