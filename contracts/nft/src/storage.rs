@@ -19,6 +19,8 @@ pub enum DataKey {
     RoyaltyRecipient,
     /// Next token id for sequential batch minting.
     NextTokenId,
+    /// Collection-level soulbound (non-transferable) flag.
+    Soulbound,
 }
 
 /// Persistent-storage keys (per-key TTL for per-token data).

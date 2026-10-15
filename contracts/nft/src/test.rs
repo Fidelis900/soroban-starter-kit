@@ -25,6 +25,7 @@ fn setup(env: &Env) -> (NftContractClient, Address) {
         &0,
         &None,
         &None,
+    &false,
     );
     (client, admin)
 }
@@ -40,6 +41,7 @@ fn setup_with_cap(env: &Env, max_supply: u32) -> (NftContractClient, Address) {
         &max_supply,
         &None,
         &None,
+    &false,
     );
     (client, admin)
 }
@@ -74,6 +76,7 @@ fn test_initialize_twice_fails() {
         &0,
         &None,
         &None,
+    &false,
     );
     client.initialize(
         &admin,
@@ -82,6 +85,7 @@ fn test_initialize_twice_fails() {
         &0,
         &None,
         &None,
+    &false,
     );
 }
 
@@ -366,6 +370,7 @@ fn test_royalty_info_collection_level() {
         &0,
         &Some(500u32),
         &Some(royalty_recipient.clone()),
+    &false,
     );
 
     let owner = Address::generate(&env);
@@ -402,6 +407,7 @@ fn test_royalty_info_per_token_override() {
         &0,
         &Some(1_000u32),
         &Some(collection_recipient.clone()),
+    &false,
     );
 
     let owner = Address::generate(&env);
@@ -452,6 +458,7 @@ fn test_royalty_info_per_token_zero_bps_returns_none() {
         &0,
         &Some(500u32),
         &Some(collection_recipient.clone()),
+    &false,
     );
 
     let owner = Address::generate(&env);
@@ -499,6 +506,7 @@ fn test_initialize_invalid_royalty_bps_fails() {
         &0,
         &Some(10_001u32),
         &Some(recipient),
+    &false,
     );
 }
 
@@ -519,7 +527,8 @@ fn test_initialize_royalty_missing_recipient_fails() {
         &String::from_str(&env, "BAD"),
         &0,
         &Some(500u32),
-        &None, // missing recipient
+        &None, // missing recipient,
+    &false,
     );
 }
 
@@ -660,4 +669,65 @@ fn test_transfer_batch_not_owner_fails() {
     token_ids.push_back(2u32);
     // alice does not own token 2
     client.transfer_batch(&alice, &carol, &token_ids);
+}
+
+
+// ---------------------------------------------------------------------------
+// Soulbound (#1188)
+// ---------------------------------------------------------------------------
+
+fn setup_soulbound(env: &Env) -> (NftContractClient<'_>, Address) {
+    let admin = Address::generate(env);
+    let addr = env.register_contract(None, NftContract);
+    let client = NftContractClient::new(env, &addr);
+    client.initialize(
+        &admin,
+        &String::from_str(env, "Soul"),
+        &String::from_str(env, "SBT"),
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+    (client, admin)
+}
+
+#[test]
+fn test_soulbound_mint_and_burn_ok() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_soulbound(&env);
+    let owner = Address::generate(&env);
+
+    assert!(client.is_soulbound());
+    client.mint(&owner, &1, &String::from_str(&env, "ipfs://badge"), &None, &None);
+    assert_eq!(client.owner_of(&1), owner);
+    client.burn(&owner, &1);
+    assert_eq!(client.total_supply(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_soulbound_transfer_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_soulbound(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.mint(&alice, &1, &String::from_str(&env, "ipfs://1"), &None, &None);
+    client.transfer(&alice, &bob, &1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_soulbound_transfer_from_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup_soulbound(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+    client.mint(&alice, &1, &String::from_str(&env, "ipfs://1"), &None, &None);
+    client.approve(&1, &bob);
+    client.transfer_from(&bob, &alice, &carol, &1);
 }

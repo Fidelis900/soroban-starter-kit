@@ -9,3 +9,4 @@ NftError::SupplyCapReached = 8
 NftError::InvalidTokenId = 9
 NftError::InvalidRoyalty = 10
 NftError::RoyaltyRecipientMissing = 11
+NftError::NonTransferable = 12

@@ -68,6 +68,7 @@ mod contract {
             max_supply: u32,
             royalty_bps: Option<u32>,
             royalty_recipient: Option<Address>,
+            soulbound: bool,
         ) -> Result<(), NftError> {
             if env.storage().instance().has(&DataKey::Initialized) {
                 return Err(NftError::AlreadyInitialized);
@@ -103,6 +104,7 @@ mod contract {
                     .set(&DataKey::RoyaltyRecipient, recipient);
             }
             env.storage().instance().set(&DataKey::NextTokenId, &1u32);
+            env.storage().instance().set(&DataKey::Soulbound, &soulbound);
             env.storage().instance().set(&DataKey::Initialized, &true);
 
             bump_instance(&env);
@@ -315,6 +317,7 @@ mod contract {
             token_ids: Vec<u32>,
         ) -> Result<(), NftError> {
             Self::require_initialized(&env)?;
+            Self::require_transferable(&env)?;
             from.require_auth();
 
             // Validate ownership for all tokens first (all-or-nothing).
@@ -430,6 +433,7 @@ mod contract {
             token_id: u32,
         ) -> Result<(), NftError> {
             Self::require_initialized(&env)?;
+            Self::require_transferable(&env)?;
             from.require_auth();
 
             let owner: Address = env
@@ -587,6 +591,7 @@ mod contract {
             token_id: u32,
         ) -> Result<(), NftError> {
             Self::require_initialized(&env)?;
+            Self::require_transferable(&env)?;
             spender.require_auth();
 
             let owner: Address = env
@@ -685,6 +690,15 @@ mod contract {
                 .ok_or(NftError::NotInitialized)
         }
 
+        /// Return whether this collection is soulbound (non-transferable).
+        #[must_use]
+        pub fn is_soulbound(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::Soulbound)
+                .unwrap_or(false)
+        }
+
         /// Return the total number of minted (non-burned) tokens.
         #[must_use]
         pub fn total_supply(env: Env) -> u32 {
@@ -692,6 +706,19 @@ mod contract {
                 .instance()
                 .get(&DataKey::TotalSupply)
                 .unwrap_or(0)
+        }
+
+
+        fn require_transferable(env: &Env) -> Result<(), NftError> {
+            let soulbound: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::Soulbound)
+                .unwrap_or(false);
+            if soulbound {
+                return Err(NftError::NonTransferable);
+            }
+            Ok(())
         }
 
         fn require_initialized(env: &Env) -> Result<(), NftError> {

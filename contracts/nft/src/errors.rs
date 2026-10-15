@@ -20,6 +20,8 @@ pub enum NftError {
     InvalidRoyalty = 10,
     /// A royalty BPS was provided without a recipient (or vice-versa).
     RoyaltyRecipientMissing = 11,
+    /// Token or collection is soulbound and cannot be transferred.
+    NonTransferable = 12,
 }
 
 impl_display_error!(
@@ -35,6 +37,7 @@ impl_display_error!(
     InvalidTokenId          => "invalid token id",
     InvalidRoyalty          => "royalty bps exceeds 10 000",
     RoyaltyRecipientMissing => "royalty recipient must be set when royalty bps > 0",
+    NonTransferable         => "token is soulbound and non-transferable",
 );
 
 #[cfg(test)]
@@ -59,7 +62,8 @@ NftError::NotApproved = {}\n\
 NftError::SupplyCapReached = {}\n\
 NftError::InvalidTokenId = {}\n\
 NftError::InvalidRoyalty = {}\n\
-NftError::RoyaltyRecipientMissing = {}\n",
+NftError::RoyaltyRecipientMissing = {}\n\
+NftError::NonTransferable = {}\n",
             NftError::NotAuthorized as u32,
             NftError::AlreadyInitialized as u32,
             NftError::NotInitialized as u32,
@@ -71,6 +75,7 @@ NftError::RoyaltyRecipientMissing = {}\n",
             NftError::InvalidTokenId as u32,
             NftError::InvalidRoyalty as u32,
             NftError::RoyaltyRecipientMissing as u32,
+            NftError::NonTransferable as u32,
         )
     }
 
