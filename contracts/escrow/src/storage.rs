@@ -56,6 +56,16 @@ pub enum DataKey {
     FeeBps,
     /// Treasury [`Address`] that receives the deducted fee on each release.
     Treasury,
+    /// Reentrancy guard flag (`bool`). Set to `true` while a token transfer is
+    /// in progress; any reentrant call that hits [`require_not_locked`] will
+    /// immediately return [`EscrowError::NotAuthorized`].
+    Locked,
+    /// Ordered list of token contract [`Address`]es for a multi-token escrow.
+    /// Only present when the escrow was initialized with
+    /// [`EscrowContract::initialize_with_tokens`].
+    TokenContracts,
+    /// Parallel list of amounts for each entry in [`DataKey::TokenContracts`].
+    TokenAmounts,
 }
 
 /// Lifecycle states of an escrow.
@@ -101,6 +111,37 @@ impl core::fmt::Display for EscrowState {
         })
     }
 }
+
+// ─── Reentrancy guard (#1190) ─────────────────────────────────────────────────
+
+/// Acquire the reentrancy lock.
+///
+/// Sets [`DataKey::Locked`] to `true` in instance storage.  Must be paired
+/// with a call to [`release_lock`] once the protected section (token transfer)
+/// is complete.
+///
+/// # Errors
+/// Returns [`EscrowError::NotAuthorized`] if the lock is already held,
+/// i.e., a reentrant call is detected.
+pub fn acquire_lock(env: &Env) -> Result<(), crate::errors::EscrowError> {
+    if env
+        .storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::Locked)
+        .unwrap_or(false)
+    {
+        return Err(crate::errors::EscrowError::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::Locked, &true);
+    Ok(())
+}
+
+/// Release the reentrancy lock acquired by [`acquire_lock`].
+pub fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::Locked, &false);
+}
+
+// ─── State guard ──────────────────────────────────────────────────────────────
 
 /// Reads the current [`EscrowState`] from instance storage and returns
 /// `Err(EscrowError::InvalidState)` when it does not match `expected`.
@@ -258,6 +299,9 @@ mod discriminant_tests {
             DataKey::Milestones => 19,
             DataKey::FeeBps => 20,
             DataKey::Treasury => 21,
+            DataKey::Locked => 22,
+            DataKey::TokenContracts => 23,
+            DataKey::TokenAmounts => 24,
         }
     }
 
@@ -285,6 +329,9 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::Milestones), 19);
         assert_eq!(escrow_data_key_index(&DataKey::FeeBps), 20);
         assert_eq!(escrow_data_key_index(&DataKey::Treasury), 21);
+        assert_eq!(escrow_data_key_index(&DataKey::Locked), 22);
+        assert_eq!(escrow_data_key_index(&DataKey::TokenContracts), 23);
+        assert_eq!(escrow_data_key_index(&DataKey::TokenAmounts), 24);
     }
 }
 

@@ -95,12 +95,38 @@ fn in_warning_window(remaining: u32, heartbeat: u32) -> bool {
 
 /// Append a new price observation to the ring buffer, dropping the oldest
 /// entry once [`MAX_HISTORY`] is exceeded.
-fn push_history(env: &Env, price: i128, timestamp: u64) {
+///
+/// **Duplicate-timestamp handling (#1194):** when the incoming `timestamp`
+/// matches the most-recent entry's timestamp (i.e., multiple publishers
+/// submitted prices in the same block), the two prices are averaged and the
+/// existing entry is *updated in place* rather than pushing a new one. This
+/// prevents zero-duration windows in [`twap`] and ensures the weight for
+/// that slot reflects a single canonical price for the ledger.
+pub(crate) fn push_history(env: &Env, price: i128, timestamp: u64) {
     let mut history: Vec<PriceObservation> = env
         .storage()
         .instance()
         .get(&DataKey::History)
         .unwrap_or(Vec::new(env));
+
+    // Merge same-timestamp observations instead of appending a zero-duration
+    // duplicate.  A simple average is used so that all same-block prices
+    // contribute equally to the canonical price for that ledger.
+    let len = history.len();
+    if len > 0 {
+        let last = history.get_unchecked(len - 1);
+        if last.timestamp == timestamp {
+            // avg = (last.price + price) / 2  (integer; rounds toward zero)
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::integer_division
+            )]
+            let merged_price = (last.price.saturating_add(price)) / 2;
+            history.set(len - 1, PriceObservation { price: merged_price, timestamp });
+            env.storage().instance().set(&DataKey::History, &history);
+            return;
+        }
+    }
 
     history.push_back(PriceObservation { price, timestamp });
     while history.len() > MAX_HISTORY {
@@ -113,8 +139,14 @@ fn push_history(env: &Env, price: i128, timestamp: u64) {
 /// Compute the time-weighted average price over `observations`, which must be
 /// non-empty and sorted oldest-first. Each observation's price is weighted by
 /// how long it held (until the next observation, or `now` for the last one).
+///
+/// Zero-duration segments (identical adjacent timestamps after #1194
+/// deduplication, or if `now` equals the last timestamp) are skipped rather
+/// than contributing a zero-weight bucket that would silently distort the
+/// result. If all weights collapse to zero (e.g., a single-observation window
+/// where `now` == `timestamp`), the last price is returned unchanged.
 #[allow(clippy::arithmetic_side_effects, clippy::integer_division)]
-fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
+pub(crate) fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
     let len = observations.len();
     if len == 1 {
         return observations.get_unchecked(0).price;
@@ -129,12 +161,19 @@ fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
         } else {
             now
         };
+        // Skip zero-duration windows — they carry no time information and
+        // would pad total_weight with 0 while contributing nothing useful.
+        if next_timestamp == obs.timestamp {
+            continue;
+        }
         let weight = i128::from(next_timestamp.saturating_sub(obs.timestamp));
         weighted_sum = weighted_sum.saturating_add(obs.price.saturating_mul(weight));
         total_weight = total_weight.saturating_add(weight);
     }
 
     if total_weight == 0 {
+        // All observations share the same timestamp (degenerate window).
+        // Return the last recorded price as the best available estimate.
         return observations.get_unchecked(len - 1).price;
     }
     weighted_sum / total_weight
@@ -621,6 +660,17 @@ mod contract {
                 decimals,
                 updated_at,
             })
+        }
+
+        /// Return the raw price-observation ring buffer, oldest-first.
+        ///
+        /// Primarily intended for testing the duplicate-timestamp deduplication
+        /// introduced in #1194 and for off-chain monitoring tooling.
+        pub fn get_history(env: Env) -> Vec<PriceObservation> {
+            env.storage()
+                .instance()
+                .get(&History)
+                .unwrap_or(Vec::new(&env))
         }
     }
 }

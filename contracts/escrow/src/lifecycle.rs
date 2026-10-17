@@ -3,7 +3,7 @@ use soroban_sdk::{Address, Env, Vec, token};
 use crate::admin;
 use crate::errors::EscrowError;
 use crate::events;
-use crate::storage::{DataKey, EscrowState, Milestone, require_state};
+use crate::storage::{DataKey, EscrowState, Milestone, acquire_lock, release_lock, require_state};
 use soroban_common::{
     LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance, validate_deadline,
 };
@@ -228,10 +228,16 @@ pub fn fund(env: Env) -> Result<(), EscrowError> {
     if token_client.balance(&buyer) < amount {
         return Err(EscrowError::InsufficientFunds);
     }
-    token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
+    // Checks–Effects–Interactions + reentrancy guard (#1190):
+    // state is set to Funded BEFORE the external token transfer so any
+    // reentrant call into fund() will see InvalidState and abort.
     env.storage().instance().set(&State, &EscrowState::Funded);
     extend_ttl(&env);
+
+    acquire_lock(&env)?;
+    token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+    release_lock(&env);
 
     events::escrow_funded(&env, &buyer, amount);
 
@@ -303,8 +309,10 @@ pub fn release_partial(env: Env, amount: i128) -> Result<(), EscrowError> {
     extend_ttl(&env);
 
     let (net, fee) = apply_fee(&env, amount);
+    acquire_lock(&env)?;
     admin::transfer_token(&env, &env.current_contract_address(), &seller, net);
     maybe_pay_fee(&env, fee);
+    release_lock(&env);
     events::partial_release(&env, &seller, net, fee);
 
     Ok(())
@@ -490,6 +498,8 @@ pub fn release_to_seller(env: Env) -> Result<(), EscrowError> {
     // Only redistribute unreleased remainder (issue #1189).
     let amount: i128 = sync_disputable_amount(&env)?;
 
+    // Checks–Effects–Interactions (#1190): finalise state and zero out amount
+    // BEFORE any external token transfer.
     env.storage()
         .instance()
         .set(&State, &EscrowState::Completed);
@@ -499,8 +509,10 @@ pub fn release_to_seller(env: Env) -> Result<(), EscrowError> {
 
     if amount > 0 {
         let (net, fee) = apply_fee(&env, amount);
+        acquire_lock(&env)?;
         admin::transfer_token(&env, &env.current_contract_address(), &seller, net);
         maybe_pay_fee(&env, fee);
+        release_lock(&env);
         events::funds_released(&env, &seller, net, fee);
     } else {
         events::funds_released(&env, &seller, 0, 0);
@@ -516,13 +528,17 @@ pub fn refund_to_buyer(env: Env) -> Result<(), EscrowError> {
     // Only redistribute unreleased remainder (issue #1189).
     let amount: i128 = sync_disputable_amount(&env)?;
 
+    // Checks–Effects–Interactions (#1190): finalise state and zero out amount
+    // BEFORE any external token transfer.
     env.storage().instance().set(&State, &EscrowState::Refunded);
     env.storage().instance().set(&Amount, &0i128);
     mark_all_milestones_released(&env);
     extend_ttl(&env);
 
     if amount > 0 {
+        acquire_lock(&env)?;
         admin::transfer_token(&env, &env.current_contract_address(), &buyer, amount);
+        release_lock(&env);
     }
 
     events::funds_refunded(&env, &buyer, amount);
@@ -731,8 +747,11 @@ pub fn release_milestone(
 
     let seller: Address = get_required(&env, &Seller)?;
     let (net, fee) = apply_fee(&env, gross);
+    // Reentrancy guard around external token transfer (#1190)
+    acquire_lock(&env)?;
     admin::transfer_token(&env, &env.current_contract_address(), &seller, net);
     maybe_pay_fee(&env, fee);
+    release_lock(&env);
 
     events::milestone_released(&env, &seller, milestone_index, net, fee);
 
@@ -754,4 +773,256 @@ pub fn get_milestones(env: Env) -> Vec<Milestone> {
         .instance()
         .get(&DataKey::Milestones)
         .unwrap_or_else(|| Vec::new(&env))
+}
+
+// ─── Multi-token support (#1192) ──────────────────────────────────────────────
+
+/// Initialize an escrow that accepts a basket of tokens instead of a single
+/// payment token.
+///
+/// * `token_contracts` – ordered list of SEP-41 token addresses.
+/// * `token_amounts`   – parallel list of amounts for each token.
+///
+/// Both lists must be non-empty and have the same length.  The primary
+/// [`DataKey::TokenContract`] and [`DataKey::Amount`] are set to the first
+/// entry so that the rest of the lifecycle (dispute resolution, fee
+/// collection) works unchanged for the lead token.  The full basket is stored
+/// in [`DataKey::TokenContracts`] / [`DataKey::TokenAmounts`] for the
+/// multi-token fund / release paths.
+#[allow(clippy::too_many_arguments)]
+pub fn initialize_with_tokens(
+    env: Env,
+    admin: Address,
+    buyer: Address,
+    seller: Address,
+    arbiter: Address,
+    token_contracts: Vec<Address>,
+    token_amounts: Vec<i128>,
+    deadline_ledger: u32,
+    dispute_timeout_ledgers: u32,
+    metadata_hash: Option<soroban_sdk::BytesN<32>>,
+) -> Result<(), EscrowError> {
+    if env.storage().instance().has(&DataKey::State) {
+        return Err(EscrowError::AlreadyInitialized);
+    }
+    if token_contracts.is_empty() {
+        return Err(EscrowError::EmptyTokenList);
+    }
+    if token_contracts.len() != token_amounts.len() {
+        return Err(EscrowError::TokenListMismatch);
+    }
+    // Validate every amount and verify each token contract responds.
+    for (idx, amt) in token_amounts.iter().enumerate() {
+        if amt <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        token::Client::new(&env, &token_contracts.get(idx as u32).unwrap()).decimals();
+    }
+    validate_parties(&buyer, &seller, &arbiter)?;
+    validate_deadline::<EscrowError>(&env, deadline_ledger)?;
+
+    // Lead token drives the primary amount slot.
+    let lead_token = token_contracts.get(0).unwrap();
+    let lead_amount = token_amounts.get(0).unwrap();
+
+    env.storage()
+        .instance()
+        .set(&soroban_common::AdminKey::Admin, &admin);
+    store_escrow_data(
+        &env,
+        &buyer,
+        &seller,
+        &arbiter,
+        &lead_token,
+        lead_amount,
+        deadline_ledger,
+        1u32,
+        dispute_timeout_ledgers,
+    );
+    // Store full basket.
+    env.storage()
+        .instance()
+        .set(&DataKey::TokenContracts, &token_contracts);
+    env.storage()
+        .instance()
+        .set(&DataKey::TokenAmounts, &token_amounts);
+
+    if let Some(hash) = metadata_hash {
+        env.storage().instance().set(&DataKey::MetadataHash, &hash);
+    }
+    extend_ttl(&env);
+    emit_init_events(&env, &buyer, &seller, &arbiter, lead_amount);
+    Ok(())
+}
+
+/// Fund a multi-token escrow by transferring every token in the basket from
+/// the buyer to the contract.
+///
+/// Falls back to the standard single-token [`fund`] path when no basket is
+/// stored (i.e., escrow was initialized with [`initialize`] or
+/// [`initialize_with_milestones`]).
+pub fn fund_multi_token(env: Env) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    // If no basket was stored, delegate to the standard single-token path.
+    let token_contracts: Option<Vec<Address>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenContracts);
+    let token_amounts: Option<Vec<i128>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenAmounts);
+
+    match (token_contracts, token_amounts) {
+        (Some(contracts), Some(amounts)) => {
+            require_state(&env, EscrowState::Created)?;
+            let buyer: Address = get_required(&env, &DataKey::Buyer)?;
+            buyer.require_auth();
+
+            // Verify the buyer holds sufficient balance for every token.
+            for (idx, contract) in contracts.iter().enumerate() {
+                let amt = amounts.get(idx as u32).unwrap();
+                let client = token::Client::new(&env, &contract);
+                if client.balance(&buyer) < amt {
+                    return Err(EscrowError::InsufficientFunds);
+                }
+            }
+
+            // CEI: update state before any external transfer.
+            env.storage()
+                .instance()
+                .set(&DataKey::State, &EscrowState::Funded);
+            extend_ttl(&env);
+
+            // Transfer every token under the reentrancy guard.
+            acquire_lock(&env)?;
+            for (idx, contract) in contracts.iter().enumerate() {
+                let amt = amounts.get(idx as u32).unwrap();
+                let client = token::Client::new(&env, &contract);
+                client.transfer(&buyer, &env.current_contract_address(), &amt);
+            }
+            release_lock(&env);
+
+            let lead_amount = amounts.get(0).unwrap();
+            events::escrow_funded(&env, &buyer, lead_amount);
+            Ok(())
+        }
+        _ => {
+            // No basket — fall back to standard single-token fund.
+            fund(env)
+        }
+    }
+}
+
+/// Release every token in the basket to the seller.
+///
+/// Only valid when the escrow was initialized with [`initialize_with_tokens`]
+/// and is in `Delivered` state.  Falls back to [`release_to_seller`] for
+/// single-token escrows.
+pub fn release_multi_token(env: Env) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let token_contracts: Option<Vec<Address>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenContracts);
+    let token_amounts: Option<Vec<i128>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenAmounts);
+
+    match (token_contracts, token_amounts) {
+        (Some(contracts), Some(amounts)) => {
+            require_state(&env, EscrowState::Delivered)?;
+            let seller: Address = get_required(&env, &DataKey::Seller)?;
+
+            // CEI: finalise state before transfers.
+            env.storage()
+                .instance()
+                .set(&DataKey::State, &EscrowState::Completed);
+            env.storage().instance().set(&DataKey::Amount, &0i128);
+            extend_ttl(&env);
+
+            acquire_lock(&env)?;
+            for (idx, contract) in contracts.iter().enumerate() {
+                let amt = amounts.get(idx as u32).unwrap();
+                if amt > 0 {
+                    let (net, fee) = apply_fee(&env, amt);
+                    let client = token::Client::new(&env, &contract);
+                    client.transfer(&env.current_contract_address(), &seller, &net);
+                    if fee > 0 {
+                        if let Some(treasury) = env
+                            .storage()
+                            .instance()
+                            .get::<DataKey, Address>(&DataKey::Treasury)
+                        {
+                            client.transfer(
+                                &env.current_contract_address(),
+                                &treasury,
+                                &fee,
+                            );
+                        }
+                    }
+                }
+            }
+            release_lock(&env);
+
+            let lead_amount = amounts.get(0).unwrap();
+            let (net, fee) = apply_fee(&env, lead_amount);
+            events::funds_released(&env, &seller, net, fee);
+            Ok(())
+        }
+        _ => release_to_seller(env),
+    }
+}
+
+/// Refund all basket tokens to the buyer.
+///
+/// Only valid when the escrow was initialized with [`initialize_with_tokens`]
+/// and is in `Funded` state.  Falls back to [`refund_to_buyer`] for
+/// single-token escrows.
+pub fn refund_multi_token(env: Env) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let token_contracts: Option<Vec<Address>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenContracts);
+    let token_amounts: Option<Vec<i128>> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenAmounts);
+
+    match (token_contracts, token_amounts) {
+        (Some(contracts), Some(amounts)) => {
+            require_state(&env, EscrowState::Funded)?;
+            let buyer: Address = get_required(&env, &DataKey::Buyer)?;
+
+            // CEI: finalise state before transfers.
+            env.storage()
+                .instance()
+                .set(&DataKey::State, &EscrowState::Refunded);
+            env.storage().instance().set(&DataKey::Amount, &0i128);
+            extend_ttl(&env);
+
+            acquire_lock(&env)?;
+            for (idx, contract) in contracts.iter().enumerate() {
+                let amt = amounts.get(idx as u32).unwrap();
+                if amt > 0 {
+                    let client = token::Client::new(&env, &contract);
+                    client.transfer(&env.current_contract_address(), &buyer, &amt);
+                }
+            }
+            release_lock(&env);
+
+            let lead_amount = amounts.get(0).unwrap();
+            events::funds_refunded(&env, &buyer, lead_amount);
+            Ok(())
+        }
+        _ => refund_to_buyer(env),
+    }
 }

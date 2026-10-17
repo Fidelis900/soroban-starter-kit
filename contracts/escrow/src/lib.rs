@@ -226,6 +226,61 @@ mod contract {
             lifecycle::get_milestones(env)
         }
 
+        // ── Multi-token entry points (#1192) ──────────────────────────────
+
+        /// Initialize a multi-token escrow holding a basket of SEP-41 tokens.
+        ///
+        /// * `token_contracts` – ordered list of token contract addresses.
+        /// * `token_amounts`   – parallel list of amounts for each token.
+        ///
+        /// Both slices must be non-empty and of equal length.  The first entry
+        /// acts as the "lead" token for fee accounting and event emission.
+        #[allow(clippy::too_many_arguments)]
+        pub fn initialize_with_tokens(
+            env: Env,
+            admin: Address,
+            buyer: Address,
+            seller: Address,
+            arbiter: Address,
+            token_contracts: soroban_sdk::Vec<Address>,
+            token_amounts: soroban_sdk::Vec<i128>,
+            deadline_ledger: u32,
+            dispute_timeout_ledgers: u32,
+            metadata_hash: Option<soroban_sdk::BytesN<32>>,
+        ) -> Result<(), EscrowError> {
+            lifecycle::initialize_with_tokens(
+                env,
+                admin,
+                buyer,
+                seller,
+                arbiter,
+                token_contracts,
+                token_amounts,
+                deadline_ledger,
+                dispute_timeout_ledgers,
+                metadata_hash,
+            )
+        }
+
+        /// Fund a multi-token escrow by transferring all basket tokens from
+        /// the buyer to the contract.  Falls back to `fund` for single-token
+        /// escrows.
+        pub fn fund_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::fund_multi_token(env)
+        }
+
+        /// Release all basket tokens to the seller.
+        /// Falls back to `release_to_seller` for single-token escrows.
+        pub fn release_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::release_multi_token(env)
+        }
+
+        /// Refund all basket tokens to the buyer.
+        /// Falls back to `refund_to_buyer` for single-token escrows.
+        pub fn refund_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::refund_multi_token(env)
+        }
+
         #[must_use]
         pub fn get_escrow_info(env: Env) -> Result<EscrowInfo, EscrowError> {
             queries::get_escrow_info(env)

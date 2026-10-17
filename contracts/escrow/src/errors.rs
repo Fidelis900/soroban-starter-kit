@@ -46,6 +46,12 @@ pub enum EscrowError {
     MilestoneNotFound = 12,
     /// The requested fee in basis points exceeds the maximum allowed (10 000).
     FeeTooHigh = 13,
+    /// A reentrant call was detected while a token transfer was in progress.
+    Reentrancy = 14,
+    /// At least one token/amount pair is required for a multi-token escrow.
+    EmptyTokenList = 15,
+    /// Token lists and amount lists must have the same length.
+    TokenListMismatch = 16,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -75,6 +81,9 @@ impl_display_error!(
     NoDisputeTimeout          => "no dispute timeout configured",
     MilestoneNotFound         => "milestone not found",
     FeeTooHigh                => "fee exceeds maximum (10 000 bps)",
+    Reentrancy                => "reentrant call detected",
+    EmptyTokenList            => "token list must not be empty",
+    TokenListMismatch         => "token and amount lists must have the same length",
 );
 
 #[cfg(test)]
@@ -101,7 +110,10 @@ EscrowError::InvalidParties = {}\n\
 EscrowError::DisputeTimeoutNotReached = {}\n\
 EscrowError::NoDisputeTimeout = {}\n\
 EscrowError::MilestoneNotFound = {}\n\
-EscrowError::FeeTooHigh = {}\n",
+EscrowError::FeeTooHigh = {}\n\
+EscrowError::Reentrancy = {}\n\
+EscrowError::EmptyTokenList = {}\n\
+EscrowError::TokenListMismatch = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -115,6 +127,9 @@ EscrowError::FeeTooHigh = {}\n",
             EscrowError::NoDisputeTimeout as u32,
             EscrowError::MilestoneNotFound as u32,
             EscrowError::FeeTooHigh as u32,
+            EscrowError::Reentrancy as u32,
+            EscrowError::EmptyTokenList as u32,
+            EscrowError::TokenListMismatch as u32,
         )
     }
 

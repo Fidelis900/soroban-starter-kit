@@ -92,3 +92,84 @@ proptest! {
         prop_assert_eq!(price_from_get, price);
     }
 }
+
+// ─── #1194 – TWAP duplicate-timestamp regression tests ───────────────────────
+
+#[cfg(test)]
+mod twap_dedup_tests {
+    use soroban_sdk::{Env, Vec as SdkVec};
+    use crate::{PriceObservation, twap};
+
+    /// When all observations share the same timestamp the TWAP must equal
+    /// the last recorded price (not panic or silently return 0).
+    #[test]
+    fn twap_all_same_timestamp_returns_last_price() {
+        let env = Env::default();
+        let mut obs: SdkVec<PriceObservation> = SdkVec::new(&env);
+        obs.push_back(PriceObservation { price: 100, timestamp: 42 });
+        obs.push_back(PriceObservation { price: 200, timestamp: 42 });
+        obs.push_back(PriceObservation { price: 300, timestamp: 42 });
+
+        // `now` is also the same timestamp — total_weight collapses to 0.
+        let result = twap(&obs, 42);
+        assert_eq!(result, 300, "must fall back to last price when all timestamps equal");
+    }
+
+    /// When `now` equals the last observation's timestamp the trailing
+    /// zero-duration window is skipped and the TWAP is computed from the
+    /// valid prefix only.
+    #[test]
+    fn twap_now_equals_last_timestamp_skips_trailing_zero() {
+        let env = Env::default();
+        let mut obs: SdkVec<PriceObservation> = SdkVec::new(&env);
+        // Observation at t=10 (price=100) held for 10 ledgers.
+        obs.push_back(PriceObservation { price: 100, timestamp: 10 });
+        // Observation at t=20 (price=200) — `now` is also 20, trailing window = 0.
+        obs.push_back(PriceObservation { price: 200, timestamp: 20 });
+
+        // Only the first window (t=10..20, weight=10) contributes.
+        let result = twap(&obs, 20);
+        assert_eq!(result, 100, "trailing zero-duration window must be skipped");
+    }
+
+    /// Normal observations with distinct timestamps produce a correct TWAP.
+    #[test]
+    fn twap_distinct_timestamps_correct() {
+        let env = Env::default();
+        let mut obs: SdkVec<PriceObservation> = SdkVec::new(&env);
+        // price=100 held for 10 ledgers (t=0..10)
+        obs.push_back(PriceObservation { price: 100, timestamp: 0 });
+        // price=200 held for 10 ledgers (t=10..20)
+        obs.push_back(PriceObservation { price: 200, timestamp: 10 });
+        // `now` = 20 → total window = 20, weighted_sum = 100*10 + 200*10 = 3000
+        let result = twap(&obs, 20);
+        assert_eq!(result, 150);
+    }
+
+    /// Push-history deduplication: two submissions at the same timestamp
+    /// must NOT create two entries — only one averaged entry must exist.
+    #[test]
+    fn push_history_deduplicates_same_timestamp() {
+        use crate::{OracleContract, OracleContractClient};
+        use soroban_sdk::Address;
+        use soroban_sdk::testutils::Address as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let oracle_addr = env.register(OracleContract, ());
+        let client = OracleContractClient::new(&env, &oracle_addr);
+        client.initialize(&admin, &500u32);
+
+        // Two update_price calls in the same ledger share the same timestamp.
+        client.update_price(&100i128);
+        client.update_price(&200i128);
+
+        // There should be exactly one history entry (the merged one).
+        let history = client.get_history();
+        assert_eq!(history.len(), 1, "duplicate-timestamp entries must be merged");
+        // Merged price = (100 + 200) / 2 = 150.
+        assert_eq!(history.get_unchecked(0).price, 150);
+    }
+}

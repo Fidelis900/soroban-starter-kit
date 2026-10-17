@@ -11,3 +11,6 @@ EscrowError::DisputeTimeoutNotReached = 10
 EscrowError::NoDisputeTimeout = 11
 EscrowError::MilestoneNotFound = 12
 EscrowError::FeeTooHigh = 13
+EscrowError::Reentrancy = 14
+EscrowError::EmptyTokenList = 15
+EscrowError::TokenListMismatch = 16
