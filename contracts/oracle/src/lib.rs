@@ -362,6 +362,34 @@ mod contract {
             Ok(())
         }
 
+        /// Configure the minimum number of fresh publisher submissions required
+        /// for `get_median_price` to return a result (issue #1195).
+        ///
+        /// Defaults to `1` when never set, preserving the original behaviour.
+        ///
+        /// # Errors
+        /// - [`OracleError::NotInitialized`] if not yet set up.
+        /// - [`OracleError::Unauthorized`] if `admin` is not the configured admin.
+        /// - [`OracleError::InvalidStalenessThreshold`] if `min_quorum` is zero.
+        pub fn set_min_quorum(
+            env: Env,
+            admin: Address,
+            min_quorum: u32,
+        ) -> Result<(), OracleError> {
+            let stored_admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+            if admin != stored_admin {
+                return Err(OracleError::Unauthorized);
+            }
+            if min_quorum == 0 {
+                return Err(OracleError::InvalidStalenessThreshold);
+            }
+
+            env.storage().instance().set(&MinQuorum, &min_quorum);
+            bump_instance(&env);
+            Ok(())
+        }
+
         /// Submit a price as an authorized publisher.
         ///
         /// # Errors
@@ -418,12 +446,25 @@ mod contract {
         /// Submissions older than `max_staleness_seconds` are excluded from the median
         /// to prevent stale data from offline publishers from skewing the result.
         ///
+        /// A minimum publisher quorum can be configured via [`Self::set_min_quorum`].
+        /// When set, at least that many fresh submissions must be present, otherwise
+        /// [`OracleError::InsufficientQuorum`] is returned (issue #1195). This
+        /// prevents a single publisher from unilaterally setting the median when
+        /// the oracle is configured for multi-publisher aggregation.
+        ///
         /// # Errors
         /// - [`OracleError::NotInitialized`] if `set_publishers` has never been called.
         /// - [`OracleError::NoPublisherData`] if no publisher has submitted a fresh price
         ///   (all submissions are older than `max_staleness_seconds` or no submissions exist).
+        /// - [`OracleError::InsufficientQuorum`] if fewer than the configured minimum
+        ///   number of fresh publishers submitted prices.
         pub fn get_median_price(env: Env, max_staleness_seconds: u64) -> Result<i128, OracleError> {
             let publishers: Vec<Address> = get_required(&env, &Publishers)?;
+            let min_quorum: u32 = env
+                .storage()
+                .instance()
+                .get(&MinQuorum)
+                .unwrap_or(1);
             let now = env.ledger().timestamp();
 
             let mut prices: Vec<i128> = Vec::new(&env);
@@ -442,6 +483,10 @@ mod contract {
 
             if prices.is_empty() {
                 return Err(OracleError::NoPublisherData);
+            }
+
+            if (prices.len() as u32) < min_quorum {
+                return Err(OracleError::InsufficientQuorum);
             }
 
             Ok(median(&mut prices))

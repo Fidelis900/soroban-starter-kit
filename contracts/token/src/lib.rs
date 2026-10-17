@@ -31,7 +31,7 @@ use errors::TokenError;
 use soroban_common::{
     LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance, extend_ttl_persistent,
 };
-use storage::{AllowanceDataKey, AllowanceValue, DataKey, MetadataKey};
+use storage::{AllowanceDataKey, AllowanceValue, DataKey, MetadataKey, SnapshotEntry};
 
 #[cfg(feature = "pausable")]
 pub(crate) fn require_not_paused(env: &Env) -> Result<(), TokenError> {
@@ -387,7 +387,9 @@ mod contract {
 
         /// Record the caller's current balance at `ledger` sequence number.
         ///
-        /// Stores `(caller, ledger) → balance` in persistent storage with TTL.
+        /// Stores `(caller, ledger) → balance` in persistent storage with TTL,
+        /// and appends to a per-account sorted history vector for O(log N)
+        /// binary-search lookups (issue #1175).
         /// Useful for governance voting-power snapshots (issue #717).
         pub fn snapshot(env: Env, caller: Address, ledger: u32) -> Result<(), TokenError> {
             caller.require_auth();
@@ -399,13 +401,63 @@ mod contract {
             let key = DataKey::Snapshot(caller.clone(), ledger);
             env.storage().persistent().set(&key, &balance);
             extend_ttl_persistent(&env, &key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+
+            // Append to per-account history vector for binary-search lookups.
+            // Ledgers are monotonically increasing across calls, so the vector
+            // stays sorted — no need to sort or deduplicate (issue #1175).
+            let history_key = DataKey::SnapshotHistory(caller.clone());
+            let mut history: soroban_sdk::Vec<SnapshotEntry> = env
+                .storage()
+                .persistent()
+                .get(&history_key)
+                .unwrap_or(soroban_sdk::Vec::new(&env));
+            history.push_back(SnapshotEntry { ledger, balance });
+            env.storage().persistent().set(&history_key, &history);
+            extend_ttl_persistent(&env, &history_key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+
             events::snapshot_taken(&env, &caller, ledger, balance);
             Ok(())
         }
 
-        /// Return the balance recorded for `account` at `ledger`, or `None` if no snapshot exists.
+        /// Return the balance recorded for `account` at `ledger`, or `None` if
+        /// no snapshot exists.
+        ///
+        /// Uses binary search over the per-account sorted snapshot history vector
+        /// to achieve O(log N) lookup efficiency, keeping gas costs low even for
+        /// high-activity accounts with many snapshots (issue #1175). Falls back
+        /// to a direct key lookup for legacy data that predates the history vector.
         #[must_use]
         pub fn balance_at(env: Env, account: Address, ledger: u32) -> Option<i128> {
+            // Fast path: binary search over the sorted history vector.
+            let history_key = DataKey::SnapshotHistory(account.clone());
+            if let Some(history) =
+                env.storage().persistent().get::<_, soroban_sdk::Vec<SnapshotEntry>>(&history_key)
+            {
+                let len = history.len();
+                if len == 0 {
+                    return None;
+                }
+                // Binary search for `ledger` in the sorted vector.
+                let mut lo: u32 = 0;
+                let mut hi: u32 = len;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let entry = history.get(mid).unwrap();
+                    if entry.ledger < ledger {
+                        lo = mid + 1;
+                    } else if entry.ledger > ledger {
+                        hi = mid;
+                    } else {
+                        // Exact match found.
+                        return Some(entry.balance);
+                    }
+                }
+                // No exact match — `ledger` not in the history.
+                return None;
+            }
+
+            // Fallback: legacy per-ledger key lookup for data predating the
+            // history vector (issue #1175 backward compatibility).
             env.storage()
                 .persistent()
                 .get(&DataKey::Snapshot(account, ledger))

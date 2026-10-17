@@ -325,7 +325,15 @@ mod contract {
 
             admin.require_auth();
 
-            // Validate tranches and calculate total amount
+            // Validate tranches and calculate total amount.
+            //
+            // Each tranche must have a positive amount and a release ledger
+            // strictly greater than the previous one (monotonically increasing).
+            // The first tranche must also be in the future relative to the
+            // current ledger; because the sequence is monotonic, this
+            // guarantees every subsequent tranche is also in the future
+            // (issue #1200 — previously only the *last* tranche was checked,
+            // allowing earlier tranches with already-past release ledgers).
             let mut total_amount: i128 = 0;
             let mut prev_ledger: u32 = 0;
             for tranche in tranches.iter() {
@@ -340,7 +348,8 @@ mod contract {
                 prev_ledger = tranche.release_ledger;
             }
 
-            if prev_ledger <= env.ledger().sequence() {
+            let first_release_ledger = tranches.get(0).unwrap().release_ledger;
+            if first_release_ledger <= env.ledger().sequence() {
                 return Err(TimelockError::InvalidReleaseLedger);
             }
 
@@ -787,6 +796,11 @@ mod contract {
 
         /// Cancel the timelock and return tokens to admin. Admin only; works while in `Active` state.
         ///
+        /// For multi-tranche timelocks, only the unreleased balance is returned:
+        /// tranches already released to the beneficiary via `release()` are
+        /// subtracted from the total locked amount so the contract never
+        /// attempts to transfer more than it holds (issue #1199).
+        ///
         /// # Errors
         ///
         /// Returns [`TimelockError::NotInitialized`] if not yet set up.
@@ -807,6 +821,38 @@ mod contract {
             let token: Address = get_required(&env, &Token)?;
             let amount: i128 = get_required(&env, &Amount)?;
 
+            // For multi-tranche timelocks, subtract the amounts already released
+            // to the beneficiary so we only return what the contract still holds
+            // (issue #1199 — insolvency bug).
+            let tranche_count: Option<u32> = env.storage().instance().get(&TRANCHE_COUNT);
+            let refund_amount = if let Some(count) = tranche_count {
+                let mut already_released: i128 = 0;
+                for i in 0..count {
+                    let released_key = DataKey::TrancheReleased(i);
+                    let is_released: bool = env
+                        .storage()
+                        .persistent()
+                        .get(&released_key)
+                        .unwrap_or(false);
+                    if is_released {
+                        let tranche_key = DataKey::Tranche(i);
+                        let tranche: ReleaseTranche = env
+                            .storage()
+                            .persistent()
+                            .get(&tranche_key)
+                            .ok_or(TimelockError::NotInitialized)?;
+                        already_released = already_released
+                            .checked_add(tranche.amount)
+                            .ok_or(TimelockError::InvalidAmount)?;
+                    }
+                }
+                amount
+                    .checked_sub(already_released)
+                    .ok_or(TimelockError::InvalidAmount)?
+            } else {
+                amount
+            };
+
             env.storage()
                 .instance()
                 .set(&State, &TimelockState::Cancelled);
@@ -815,10 +861,10 @@ mod contract {
             token::Client::new(&env, &token).transfer(
                 &env.current_contract_address(),
                 &admin,
-                &amount,
+                &refund_amount,
             );
 
-            events::cancelled(&env, &admin, amount);
+            events::cancelled(&env, &admin, refund_amount);
 
             Ok(())
         }

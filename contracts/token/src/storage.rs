@@ -41,6 +41,10 @@ pub enum DataKey {
     /// Instance storage – compliance treasury address that receives confiscated
     /// balances from blacklisted accounts (`Address`).
     ComplianceTreasury,
+    /// Persistent storage – sorted vector of `(ledger, balance)` snapshot
+    /// entries for a given account, used for O(log N) binary-search lookups
+    /// by `balance_at` (issue #1175).
+    SnapshotHistory(Address),
 }
 
 #[contracttype]
@@ -63,6 +67,20 @@ pub enum MetadataKey {
     Name,
     Symbol,
     Decimals,
+}
+
+/// A single historical balance snapshot entry stored in a per-account vector.
+///
+/// Entries are kept sorted by `ledger` in ascending order (monotonically
+/// increasing because snapshots are taken at successively later ledgers),
+/// enabling O(log N) binary search in `balance_at` (issue #1175).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    /// The ledger sequence at which the snapshot was taken.
+    pub ledger: u32,
+    /// The account balance at that ledger.
+    pub balance: i128,
 }
 
 #[cfg(test)]
@@ -96,6 +114,7 @@ mod discriminant_tests {
             DataKey::CancelledPermitNonce(_, _) => 15,
             DataKey::Blacklisted(_) => 16,
             DataKey::ComplianceTreasury => 17,
+            DataKey::SnapshotHistory(_) => 18,
         }
     }
 
@@ -146,6 +165,10 @@ mod discriminant_tests {
         );
         assert_eq!(token_data_key_index(&DataKey::Blacklisted(addr)), 16);
         assert_eq!(token_data_key_index(&DataKey::ComplianceTreasury), 17);
+        assert_eq!(
+            token_data_key_index(&DataKey::SnapshotHistory(Address::generate(&env))),
+            18
+        );
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub enum DataKey {
     AssetPrice(Symbol),
     /// Per-asset decimal precision stored in persistent storage, keyed by asset symbol.
     AssetDecimals(Symbol),
+    /// Minimum number of fresh publisher submissions required for
+    /// `get_median_price` to return a result (issue #1195).
+    MinQuorum,
 }
 
 /// Snapshot of the oracle state returned by read entry points.

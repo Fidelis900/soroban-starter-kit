@@ -9,3 +9,4 @@ OracleError::InvalidSmoothingFactor = 8
 OracleError::SubmissionTooFrequent = 9
 OracleError::InvalidPrice = 8
 OracleError::AssetNotFound = 9
+OracleError::InsufficientQuorum = 10
