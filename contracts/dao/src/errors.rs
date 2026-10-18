@@ -37,6 +37,14 @@ pub enum DaoError {
     NoLockedTokens = 16,
     /// Attempted to unlock tokens before the proposal voting window has closed.
     VotingStillOpen = 17,
+    /// An active unexecuted proposal with the identical payload hash already exists (issue #1319).
+    DuplicateProposal = 18,
+    /// Voter selected a choice symbol that is not part of the proposal's choices.
+    InvalidChoice = 19,
+    /// Multi-choice proposal created without any choices.
+    NoChoices = 20,
+    /// Voting type is not supported for this operation.
+    InvalidVotingType = 21,
 }
 
 impl_display_error!(
@@ -60,6 +68,10 @@ impl_display_error!(
     CircularDelegation      => "delegation would create a circular loop",
     NoLockedTokens          => "no locked tokens found for this voter and proposal",
     VotingStillOpen         => "voting period is still open; tokens cannot be unlocked yet",
+    DuplicateProposal       => "an active proposal with the identical payload already exists",
+    InvalidChoice           => "selected choice is not part of this proposal",
+    NoChoices               => "multi-choice proposal must define at least one choice",
+    InvalidVotingType       => "unsupported voting type",
 );
 
 #[cfg(test)]
@@ -92,7 +104,11 @@ DaoError::VotingClosed = {}\n\
 DaoError::TimelockNotExpired = {}\n\
 DaoError::CircularDelegation = {}\n\
 DaoError::NoLockedTokens = {}\n\
-DaoError::VotingStillOpen = {}\n",
+DaoError::VotingStillOpen = {}\n\
+DaoError::DuplicateProposal = {}\n\
+DaoError::InvalidChoice = {}\n\
+DaoError::NoChoices = {}\n\
+DaoError::InvalidVotingType = {}\n",
             DaoError::NotAuthorized as u32,
             DaoError::AlreadyInitialized as u32,
             DaoError::NotInitialized as u32,
@@ -112,6 +128,10 @@ DaoError::VotingStillOpen = {}\n",
             DaoError::CircularDelegation as u32,
             DaoError::NoLockedTokens as u32,
             DaoError::VotingStillOpen as u32,
+            DaoError::DuplicateProposal as u32,
+            DaoError::InvalidChoice as u32,
+            DaoError::NoChoices as u32,
+            DaoError::InvalidVotingType as u32,
         )
     }
 

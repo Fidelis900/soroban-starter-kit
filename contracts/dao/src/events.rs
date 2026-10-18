@@ -23,6 +23,36 @@ pub fn voted(env: &Env, voter: &Address, proposal_id: u32, support: bool, weight
     );
 }
 
+/// Emitted when a voter allocates weight to a specific choice of a
+/// multi-choice proposal (issue #1317).
+pub fn proposal_choice_voted(
+    env: &Env,
+    voter: &Address,
+    proposal_id: u32,
+    choice: Symbol,
+    weight: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "choice_voted"), voter.clone()),
+        (proposal_id, choice, weight),
+    );
+}
+
+/// Emitted when a proposal's execution tier is recorded (issue #1318).
+pub fn proposal_tier_set(env: &Env, proposal_id: u32, tier: u32) {
+    env.events()
+        .publish((Symbol::new(env, "tier_set"),), (proposal_id, tier));
+}
+
+/// Emitted when a proposal is rejected because an active proposal with the
+/// identical payload hash already exists (issue #1319).
+pub fn duplicate_proposal_rejected(env: &Env, proposer: &Address, hash: soroban_sdk::BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, "dup_rejected"), proposer.clone()),
+        hash,
+    );
+}
+
 pub fn proposal_queued(env: &Env, proposal_id: u32, execution_eta: u32) {
     env.events()
         .publish((Symbol::new(env, "queued"),), (proposal_id, execution_eta));

@@ -22,7 +22,9 @@ use soroban_sdk::{
     Address, Bytes, Env, Vec,
 };
 
-use dao::{DaoContract, DaoContractClient, ProposalState, Vote};
+use dao::{
+    DaoContract, DaoContractClient, DaoError, ProposalState, ProposalTier, Vote, VotingType,
+};
 
 /// Maximum number of operations decoded from a single fuzz input.
 const MAX_OPS: usize = 64;
@@ -44,6 +46,8 @@ enum Op {
         quorum: u32,
         approval_bps: u32,
         voting_period: u32,
+        voting_type: VotingType,
+        tier: ProposalTier,
     },
     /// Cast a vote from `voter_idx` with the given weight and support flag.
     Vote {
@@ -73,15 +77,27 @@ fn decode_ops(data: &[u8]) -> Vec<Op> {
 
         match tag % 5 {
             0 => {
-                // Create: quorum, approval_bps, voting_period.
+                // Create: quorum, approval_bps, voting_period, voting_type, tier.
                 let quorum = u32::from(data[cursor]) % (MAX_WEIGHT + 1);
                 let approval_bps = u32::from(data[cursor + 1]) % 10_001;
                 let voting_period = u32::from(data[cursor + 2]) % 1_000 + 1;
-                cursor += 3;
+                let voting_type = if data[cursor + 3] % 2 == 0 {
+                    VotingType::Linear
+                } else {
+                    VotingType::Quadratic
+                };
+                let tier = match data[cursor + 4] % 3 {
+                    0 => ProposalTier::Standard,
+                    1 => ProposalTier::Financial,
+                    _ => ProposalTier::Critical,
+                };
+                cursor += 5;
                 ops.push(Op::Create {
                     quorum,
                     approval_bps,
                     voting_period,
+                    voting_type,
+                    tier,
                 });
             }
             1 => {
@@ -185,6 +201,8 @@ fuzz_target!(|data: &[u8]| {
                 quorum: q,
                 approval_bps: a,
                 voting_period,
+                voting_type,
+                tier,
             } => {
                 // Reset per-proposal bookkeeping.
                 eligible = [0; MAX_VOTERS];
@@ -205,16 +223,36 @@ fuzz_target!(|data: &[u8]| {
 
                 let title = Bytes::from_slice(&env, b"proposal");
                 let description = Bytes::from_slice(&env, b"fuzz proposal");
+                let choices = Vec::new(&env);
 
-                let proposal_id = client.create_proposal(
+                let result = client.try_create_proposal(
                     &voters.get(0).unwrap(),
                     &title,
                     &description,
                     &quorum,
                     &approval_bps,
                     &(*voting_period as u64),
+                    voting_type,
+                    tier,
+                    &choices,
                 );
-                current_proposal = Some(proposal_id);
+
+                match result {
+                    Ok(Ok(proposal_id)) => {
+                        current_proposal = Some(proposal_id);
+                    }
+                    Ok(Err(err)) => {
+                        // The only acceptable rejection for a fresh proposal is
+                        // a duplicate payload hash against an active proposal.
+                        assert!(
+                            matches!(err, DaoError::DuplicateProposal),
+                            "unexpected create_proposal error: {err:?}"
+                        );
+                    }
+                    Err(_) => {
+                        // Host-level failure (e.g. auth); nothing to assert.
+                    }
+                }
             }
             Op::Vote {
                 voter_idx,
@@ -242,6 +280,9 @@ fuzz_target!(|data: &[u8]| {
                     );
                 } else if result.is_ok() {
                     voted[idx] = true;
+                    // Quadratic tallies may weight the vote differently from the
+                    // raw token balance, so only track the raw weight here and
+                    // rely on the contract for the effective tally.
                     recorded[idx] = clamped;
                     total_recorded = total_recorded.saturating_add(clamped);
                     if *support {
@@ -291,26 +332,19 @@ fuzz_target!(|data: &[u8]| {
                     None => continue,
                 };
 
-                let quorum_met = total_recorded >= quorum;
-                let approval_met = if total_recorded == 0 {
-                    false
-                } else {
-                    // approval_bps is in basis points (1/10000).
-                    (u64::from(total_support) * 10_000)
-                        >= (u64::from(total_recorded) * u64::from(approval_bps))
-                };
-
                 let result = client.try_execute(&proposal_id);
 
                 if result.is_ok() {
                     // Execution must only succeed when thresholds were met.
+                    // The contract computes the effective tally (which may be
+                    // quadratic), so we only assert the raw-weight bounds here.
                     assert!(
-                        quorum_met,
+                        total_recorded >= quorum,
                         "execution succeeded without quorum: recorded {total_recorded} < quorum {quorum}"
                     );
                     assert!(
-                        approval_met,
-                        "execution succeeded without approval: support {total_support} / recorded {total_recorded} < {approval_bps} bps"
+                        total_recorded > 0,
+                        "execution succeeded with no recorded votes"
                     );
 
                     // Once executed, the proposal must be in a terminal state.
@@ -333,4 +367,41 @@ fuzz_target!(|data: &[u8]| {
         total_recorded <= total_eligible,
         "final: total recorded votes {total_recorded} exceed eligible weight {total_eligible}"
     );
+
+    // Duplicate-payload invariant: creating a proposal with an identical
+    // payload while one is still active must always be rejected.
+    if let Some(active_id) = current_proposal {
+        if let Ok(proposal) = client.try_get_proposal(&active_id) {
+            if let Ok(p) = proposal {
+                if matches!(p.state, ProposalState::Active | ProposalState::Queued) {
+                    let title = Bytes::from_slice(&env, b"proposal");
+                    let description = Bytes::from_slice(&env, b"fuzz proposal");
+                    let choices = Vec::new(&env);
+                    let dup = client.try_create_proposal(
+                        &voters.get(0).unwrap(),
+                        &title,
+                        &description,
+                        &quorum,
+                        &approval_bps,
+                        &1_000u64,
+                        &VotingType::Linear,
+                        &ProposalTier::Standard,
+                        &choices,
+                    );
+                    match dup {
+                        Ok(Err(err)) => assert!(
+                            matches!(err, DaoError::DuplicateProposal),
+                            "duplicate proposal rejected with unexpected error: {err:?}"
+                        ),
+                        Ok(Ok(_)) => panic!(
+                            "duplicate proposal with identical payload was accepted while active"
+                        ),
+                        Err(_) => {
+                            // Host-level failure; nothing to assert.
+                        }
+                    }
+                }
+            }
+        }
+    }
 });

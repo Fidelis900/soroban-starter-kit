@@ -109,7 +109,67 @@ fn create_plain_proposal(
         &None,
         &None,
         &None,
+        &None,
+        &None,
+        &None,
     )
+}
+
+/// Helper: create a proposal with an explicit voting type and tier.
+fn create_typed_proposal(
+    client: &DaoContractClient,
+    env: &Env,
+    proposer: &Address,
+    title: &str,
+    voting_type: VotingType,
+    tier: ProposalTier,
+) -> u32 {
+    client.create_proposal(
+        proposer,
+        &String::from_str(env, title),
+        &String::from_str(env, "D"),
+        &None,
+        &None,
+        &None,
+        &Some(voting_type),
+        &None,
+        &Some(tier),
+    )
+}
+
+/// Helper: create a multi-choice proposal.
+fn create_multi_choice_proposal(
+    client: &DaoContractClient,
+    env: &Env,
+    proposer: &Address,
+    title: &str,
+    choices: &Vec<Symbol>,
+) -> u32 {
+    client.create_proposal(
+        proposer,
+        &String::from_str(env, title),
+        &String::from_str(env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &Some(choices.clone()),
+        &None,
+    )
+}
+
+/// Integer square root used to independently verify quadratic tallies.
+fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +210,9 @@ fn test_create_proposal() {
         &None,
         &None,
         &None,
+        &None,
+        &None,
+        &None,
     );
     assert_eq!(id, 0);
     assert_eq!(client.proposal_count(), 1);
@@ -175,6 +238,9 @@ fn test_create_proposal_no_tokens_fails() {
         &proposer,
         &String::from_str(&env, "Bad Proposal"),
         &String::from_str(&env, "no tokens"),
+        &None,
+        &None,
+        &None,
         &None,
         &None,
         &None,
@@ -441,6 +507,9 @@ fn test_create_proposal_with_action_payload_stored() {
         &Some(target.clone()),
         &Some(function.clone()),
         &Some(args.clone()),
+        &None,
+        &None,
+        &None,
     );
 
     let proposal = client.get_proposal(&id);
@@ -575,6 +644,12 @@ fn test_proposer_cancel_pre_vote_succeeds() {
         &admin,
         &String::from_str(&env, "Mistake"),
         &String::from_str(&env, "Oops"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     // No votes cast yet — proposer self-cancel should succeed.
@@ -595,6 +670,12 @@ fn test_proposer_cancel_after_vote_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -618,6 +699,12 @@ fn test_proposer_cancel_wrong_caller_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let impostor = Address::generate(&env);
@@ -638,6 +725,12 @@ fn test_proposer_cancel_already_cancelled_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     client.proposer_cancel_proposal(&admin, &id);
@@ -670,6 +763,12 @@ fn test_execute_meets_quorum_bps() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
     soroban_sdk::token::Client::new(&env, &token).burn(&admin, &1_000);
 
@@ -705,6 +804,12 @@ fn test_execute_below_quorum_bps_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -730,6 +835,12 @@ fn test_execute_both_quorums_met() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -776,6 +887,12 @@ fn test_vote_after_deadline_returns_voting_closed() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -808,6 +925,12 @@ fn test_flash_loan_voting_weight_capped() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     // Verify proposal captured total_supply_at_creation = 1_000
@@ -841,6 +964,12 @@ fn test_quorum_bps_uses_snapshot() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -875,6 +1004,12 @@ fn test_create_proposal_captures_real_total_supply() {
         &admin,
         &String::from_str(&env, "Supply Check"),
         &String::from_str(&env, "Verifies snapshot"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let proposal = client.get_proposal(&id);
@@ -898,6 +1033,12 @@ fn test_quorum_bps_uses_creation_snapshot_not_live_supply() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
     assert_eq!(client.get_proposal(&id).total_supply_at_creation, 1_000);
 
@@ -935,6 +1076,12 @@ fn test_tokens_locked_in_dao_on_vote() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -965,6 +1112,12 @@ fn test_unlock_tokens_after_deadline() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1000,6 +1153,12 @@ fn test_unlock_tokens_during_voting_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1028,6 +1187,12 @@ fn test_execute_before_timelock_expiry_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1057,6 +1222,12 @@ fn test_execute_after_timelock_succeeds() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1091,6 +1262,12 @@ fn test_admin_veto_queued_proposal() {
         &admin,
         &String::from_str(&env, "Malicious"),
         &String::from_str(&env, "Bad"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1119,6 +1296,12 @@ fn test_execute_active_proposal_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let voter = Address::generate(&env);
@@ -1145,6 +1328,12 @@ fn test_veto_active_proposal_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     // Proposal is still Active — veto must fail with InvalidState (#5).
@@ -1215,6 +1404,12 @@ fn test_vote_with_delegators_aggregates_weight() {
         &admin,
         &String::from_str(&env, "Delegated Vote"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     // Delegator holds 200 tokens and delegates to voter.
@@ -1250,6 +1445,12 @@ fn test_vote_with_delegators_wrong_delegatee_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let delegator = Address::generate(&env);
@@ -1281,6 +1482,12 @@ fn test_vote_with_delegators_no_locked_tokens_fails() {
         &admin,
         &String::from_str(&env, "P"),
         &String::from_str(&env, "D"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
 
     let delegator = Address::generate(&env);

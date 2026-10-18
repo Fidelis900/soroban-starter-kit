@@ -29,7 +29,7 @@ use soroban_sdk::{
     token::StellarAssetClient,
 };
 
-use crate::{DaoContract, DaoContractClient, ProposalState};
+use crate::{DaoContract, DaoContractClient, ProposalState, ProposalTier, VotingType};
 
 // ---------------------------------------------------------------------------
 // Shared setup helpers
@@ -67,6 +67,23 @@ fn make_proposal(te: &TestEnv<'_>, proposer: &Address) -> u32 {
         &None,
         &None,
         &None,
+        &VotingType::Linear,
+        &ProposalTier::Standard,
+        &soroban_sdk::Vec::new(te.env),
+    )
+}
+
+fn make_quadratic_proposal(te: &TestEnv<'_>, proposer: &Address) -> u32 {
+    te.client.create_proposal(
+        proposer,
+        &String::from_str(te.env, "P"),
+        &String::from_str(te.env, "D"),
+        &None,
+        &None,
+        &None,
+        &VotingType::Quadratic,
+        &ProposalTier::Standard,
+        &soroban_sdk::Vec::new(te.env),
     )
 }
 
@@ -228,6 +245,100 @@ proptest! {
         }
     }
 
+    /// Quadratic voting: each voter's recorded weight never exceeds
+    /// `fixed_sqrt(total_supply_at_creation)` and the tally equals the sum of
+    /// the per-voter integer square roots of their balances.
+    #[test]
+    fn prop_quadratic_vote_weight_bounded(
+        yes_weights in proptest::collection::vec(1_i128..=1_000_000, 1..=6),
+        no_weights  in proptest::collection::vec(1_i128..=1_000_000, 1..=6),
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let te = build_env(&env, 1, 0, 0);
+
+        let proposer = Address::generate(&env);
+        mint(&env, &te.token, &proposer, 10);
+        let id = make_quadratic_proposal(&te, &proposer);
+
+        let snapshot = te.client.get_proposal(&id).total_supply_at_creation;
+        let max_weight = crate::fixed_sqrt(snapshot);
+
+        let mut expected_yes = 0_i128;
+        let mut expected_no = 0_i128;
+
+        for w in &yes_weights {
+            let voter = Address::generate(&env);
+            mint(&env, &te.token, &voter, *w);
+            te.client.vote(&voter, &id, &true);
+            let weight = crate::fixed_sqrt(*w);
+            prop_assert!(
+                weight <= max_weight,
+                "quadratic weight {weight} exceeds sqrt(supply) {max_weight}"
+            );
+            expected_yes += weight;
+        }
+        for w in &no_weights {
+            let voter = Address::generate(&env);
+            mint(&env, &te.token, &voter, *w);
+            te.client.vote(&voter, &id, &false);
+            let weight = crate::fixed_sqrt(*w);
+            prop_assert!(
+                weight <= max_weight,
+                "quadratic weight {weight} exceeds sqrt(supply) {max_weight}"
+            );
+            expected_no += weight;
+        }
+
+        let p = te.client.get_proposal(&id);
+        prop_assert_eq!(p.yes_votes, expected_yes, "quadratic yes_votes mismatch");
+        prop_assert_eq!(p.no_votes, expected_no, "quadratic no_votes mismatch");
+    }
+
+    /// Duplicate proposal payloads are always rejected while the original is
+    /// still active.
+    #[test]
+    fn prop_duplicate_proposal_rejected(
+        title in "[A-Za-z0-9 ]{1,16}",
+        description in "[A-Za-z0-9 ]{1,16}",
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let te = build_env(&env, 1, 0, 0);
+
+        let proposer = Address::generate(&env);
+        mint(&env, &te.token, &proposer, 10);
+
+        let title_s = String::from_str(&env, &title);
+        let desc_s = String::from_str(&env, &description);
+
+        let first = te.client.try_create_proposal(
+            &proposer,
+            &title_s,
+            &desc_s,
+            &None,
+            &None,
+            &None,
+            &VotingType::Linear,
+            &ProposalTier::Standard,
+            &soroban_sdk::Vec::new(&env),
+        );
+        prop_assert!(first.is_ok(), "first proposal should be accepted");
+
+        let second = te.client.try_create_proposal(
+            &proposer,
+            &title_s,
+            &desc_s,
+            &None,
+            &None,
+            &None,
+            &VotingType::Linear,
+            &ProposalTier::Standard,
+            &soroban_sdk::Vec::new(&env),
+        );
+        prop_assert!(second.is_err(), "duplicate proposal should be rejected");
+    }
+
     /// An address that has already voted cannot influence the tally on a
     /// concurrent second proposal — votes are keyed per (proposal_id, voter).
     #[test]
@@ -325,6 +436,12 @@ proptest! {
             &proposer,
             &String::from_str(&env, "Test"),
             &String::from_str(&env, "Invariant check"),
+            &None,
+            &None,
+            &None,
+            &VotingType::Linear,
+            &ProposalTier::Standard,
+            &soroban_sdk::Vec::new(&env),
         ).unwrap();
 
         let snapshot = client.get_proposal(&id).total_supply_at_creation;
@@ -366,6 +483,12 @@ proptest! {
             &proposer,
             &String::from_str(&env, "Q"),
             &String::from_str(&env, "test"),
+            &None,
+            &None,
+            &None,
+            &VotingType::Linear,
+            &ProposalTier::Standard,
+            &soroban_sdk::Vec::new(&env),
         ).unwrap();
 
         let voter = Address::generate(&env);
