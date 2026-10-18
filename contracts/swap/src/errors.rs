@@ -23,6 +23,7 @@ pub enum SwapError {
     StorageError = 14,
     FeeZeroNotAllowed = 12,
     ExecutionDelayExceeded = 13,
+    SwapExpired = 15,
 }
 
 impl_display_error!(
@@ -54,6 +55,7 @@ impl_display_error!(
     InvalidFee             => "invalid fee basis points",
     FeeZeroNotAllowed      => "fee truncated to zero or below minimum required",
     ExecutionDelayExceeded => "maximum execution delay exceeded",
+    SwapExpired            => "swap has expired",
 );
 
 #[cfg(test)]
@@ -75,7 +77,8 @@ SwapError::DeadlineExpired = {}\n\
 SwapError::InvalidAmount = {}\n\
 SwapError::InvalidDeadline = {}\n\
 SwapError::AlreadyCompleted = {}\n\
-SwapError::AlreadyCancelled = {}\n",
+SwapError::AlreadyCancelled = {}\n\
+SwapError::SwapExpired = {}\n",
             SwapError::NotAuthorized as u32,
             SwapError::SwapNotFound as u32,
             SwapError::InvalidState as u32,
@@ -84,6 +87,7 @@ SwapError::AlreadyCancelled = {}\n",
             SwapError::InvalidDeadline as u32,
             SwapError::AlreadyCompleted as u32,
             SwapError::AlreadyCancelled as u32,
+            SwapError::SwapExpired as u32,
         )
     }
 

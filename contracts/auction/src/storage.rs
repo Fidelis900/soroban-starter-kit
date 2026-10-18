@@ -47,6 +47,13 @@ pub enum DataKey {
     SellerPending(Address),
     /// Optional buy-it-now price that immediately settles the auction (issue #1294).
     BuyItNowPrice,
+    /// Per-auction state keyed by auction id, enabling batch operations such as
+    /// `cancel_auctions_batch` (issue #1296).
+    Auction(u32),
+    /// Per-auction cancelled flag keyed by auction id (issue #1296).
+    AuctionCancelled(u32),
+    /// Per-auction anti-sniping extension window in ledgers (issue #1297).
+    AntiSnipingExtensionLedgers(u32),
 }
 
 /// Linear price-decay schedule for a Dutch auction (issue #1071).

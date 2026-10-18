@@ -31,6 +31,8 @@ pub enum AuctionError {
     AuctionNotStarted = 16,
     /// Exactly one of `nft_contract` / `token_id` was supplied.
     InvalidNftParams = 17,
+    /// `cancel_auctions_batch` was called with an auction that already has a bid.
+    BatchCancelFailed = 18,
 }
 
 impl_display_error!(
@@ -53,6 +55,7 @@ impl_display_error!(
     WrongMode          => "operation not supported in this auction mode",
     AuctionNotStarted  => "auction has not started",
     InvalidNftParams   => "nft_contract and token_id must be supplied together",
+    BatchCancelFailed  => "batch cancellation failed: auction has active bids",
 );
 
 #[cfg(test)]
@@ -83,7 +86,8 @@ AuctionError::BidAlreadyPlaced = {}\n\
 AuctionError::Overflow = {}\n\
 AuctionError::WrongMode = {}\n\
 AuctionError::AuctionNotStarted = {}\n\
-AuctionError::InvalidNftParams = {}\n",
+AuctionError::InvalidNftParams = {}\n\
+AuctionError::BatchCancelFailed = {}\n",
             AuctionError::AlreadyInitialized as u32,
             AuctionError::NotInitialized as u32,
             AuctionError::AuctionEnded as u32,
@@ -101,6 +105,7 @@ AuctionError::InvalidNftParams = {}\n",
             AuctionError::WrongMode as u32,
             AuctionError::AuctionNotStarted as u32,
             AuctionError::InvalidNftParams as u32,
+            AuctionError::BatchCancelFailed as u32,
         )
     }
 

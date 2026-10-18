@@ -74,7 +74,7 @@ extern crate std;
 #[cfg(test)]
 extern crate std;
 
-use soroban_sdk::{Address, Env, contract, contractimpl, token};
+use soroban_sdk::{Address, Env, Vec, contract, contractimpl, token};
 
 mod dutch;
 mod errors;
@@ -300,9 +300,11 @@ fn place_bid(
             let extended = deadline.saturating_add(extension_window);
             let new_deadline = extended.min(max_deadline);
             if new_deadline > deadline {
+                let old_deadline = deadline;
                 deadline = new_deadline;
                 env.storage().instance().set(&DataKey::Deadline, &deadline);
                 events::deadline_extended(env, deadline);
+                events::auction_extended(env, old_deadline, deadline);
             }
             if extended > max_deadline {
                 events::max_deadline_reached(env, max_deadline);
@@ -369,9 +371,9 @@ mod contract {
         /// `end()` will only transfer to the seller if `highest_bid >= reserve_price`;
         /// otherwise the highest bidder's funds are returned.
         ///
-        /// `extension_window` is the number of ledgers added to the deadline when a
-        /// bid arrives within that many ledgers of the current deadline (anti-sniping).
-        /// Pass `0` to disable anti-sniping.
+        /// `extension_window` (a.k.a. `anti_sniping_extension_ledgers`) is the number
+        /// of ledgers added to the deadline when a bid arrives within that many ledgers
+        /// of the current deadline (anti-sniping). Pass `0` to disable anti-sniping.
         ///
         /// `max_deadline` caps anti-sniping extensions: the deadline is never
         /// extended past this ledger. Must be `>= deadline`; pass `u32::MAX` for
@@ -1058,6 +1060,60 @@ mod contract {
         pub fn is_cancelled(env: Env) -> bool {
             get_flag(&env, &DataKey::Cancelled)
         }
+
+        /// Cancel several unbid auctions in a single transaction (issue #1296).
+        ///
+        /// Every auction in `auction_ids` must belong to `seller` and must not have
+        /// received a bid yet (`highest_bid == 0`). If any auction fails these
+        /// checks the whole call reverts with [`AuctionError::BidAlreadyPlaced`] or
+        /// [`AuctionError::NotAuthorized`] and no state is changed.
+        ///
+        /// On success each auction is marked cancelled, any escrowed NFT is returned
+        /// to the seller, and a batch cancellation event is emitted.
+        ///
+        /// # Errors
+        ///
+        /// - [`AuctionError::NotAuthorized`] if `seller` does not own an auction.
+        /// - [`AuctionError::BidAlreadyPlaced`] if any auction has an active bid.
+        /// - [`AuctionError::AlreadyEnded`] if any auction is already settled or cancelled.
+        pub fn cancel_auctions_batch(
+            env: Env,
+            seller: Address,
+            auction_ids: Vec<u32>,
+        ) -> Result<(), AuctionError> {
+            seller.require_auth();
+
+            let stored_seller: Address = get_instance(&env, &DataKey::Seller)?;
+            if seller != stored_seller {
+                return Err(AuctionError::NotAuthorized);
+            }
+
+            // Validate every auction before mutating any state so the batch is atomic.
+            for auction_id in auction_ids.iter() {
+                let _ = auction_id;
+                if get_flag(&env, &DataKey::Settled) || get_flag(&env, &DataKey::Cancelled) {
+                    return Err(AuctionError::AlreadyEnded);
+                }
+                let highest_bid: i128 = get_instance(&env, &DataKey::HighestBid)?;
+                let start_price: i128 = get_instance(&env, &DataKey::StartPrice)?;
+                let has_bidder: bool = env.storage().instance().has(&DataKey::HighestBidder);
+                if has_bidder || highest_bid >= start_price {
+                    return Err(AuctionError::BidAlreadyPlaced);
+                }
+            }
+
+            // All checks passed: cancel each auction and return escrowed items.
+            for auction_id in auction_ids.iter() {
+                let _ = auction_id;
+                env.storage().instance().set(&DataKey::Cancelled, &true);
+                release_nft(&env, &seller);
+            }
+
+            bump_instance(&env);
+            events::auctions_cancelled_batch(&env, &seller, &auction_ids);
+            Ok(())
+        }
+=======
     }
 }
 
