@@ -30,6 +30,16 @@ pub enum DataKey {
     NextSignerProposalId,
     /// Asynchronous signer-management proposal keyed by its ID (#1112).
     SignerProposal(u64),
+    /// Next ID to assign to a threshold-change proposal (#1322).
+    NextThresholdProposalId,
+    /// Threshold-change proposal keyed by its ID (#1322).
+    ThresholdProposal(u64),
+    /// Ledger at which a signer last confirmed a proposal (#1323).
+    LastActivity(Address),
+    /// Next ID to assign to a dormant-signer replacement proposal (#1323).
+    NextDormantProposalId,
+    /// Dormant-signer replacement proposal keyed by its ID (#1323).
+    DormantProposal(u64),
 }
 
 #[contracttype]
@@ -128,6 +138,36 @@ pub struct SignerProposal {
     pub executed: bool,
     /// Ledger sequence after which this proposal is considered expired.
     pub expiry_ledger: u32,
+}
+
+/// A proposal to change the required signer threshold (#1322).  It must be
+/// approved by the current threshold of signers before taking effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThresholdProposal {
+    pub id: u64,
+    pub proposer: Address,
+    /// Threshold that will be applied once consensus is reached.
+    pub new_threshold: u32,
+    /// Addresses that have approved this proposal.
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
+/// A proposal to replace a dormant (inactive) signer (#1323).  It may only be
+/// created after the dormant signer has been inactive for the inactivity
+/// period, and is approved by the remaining active signers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DormantReplacementProposal {
+    pub id: u64,
+    /// Signer considered dormant and to be removed.
+    pub dormant: Address,
+    /// Address that takes the dormant signer's place.
+    pub replacement: Address,
+    /// Addresses that have approved this proposal.
+    pub approvals: Vec<Address>,
+    pub executed: bool,
 }
 
 /// Retrieve the weight assigned to `signer`.  Returns 1 if no weights map is

@@ -3,7 +3,6 @@
 
 use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
-use soroban_common::impl_display_error;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +36,14 @@ pub enum DaoError {
     NoLockedTokens = 16,
     /// Attempted to unlock tokens before the proposal voting window has closed.
     VotingStillOpen = 17,
+    /// Emergency fast-track requested but no security council is configured.
+    MissingSecurityCouncil = 18,
+    /// Caller is not the configured security council.
+    UnauthorizedCouncil = 19,
+    /// Caller is not the proposal's proposer.
+    NotProposer = 20,
+    /// Proposal cancellation rejected because voting has already started.
+    VotingAlreadyStarted = 21,
 }
 
 impl_display_error!(
@@ -60,6 +67,10 @@ impl_display_error!(
     CircularDelegation      => "delegation would create a circular loop",
     NoLockedTokens          => "no locked tokens found for this voter and proposal",
     VotingStillOpen         => "voting period is still open; tokens cannot be unlocked yet",
+    MissingSecurityCouncil  => "no security council configured",
+    UnauthorizedCouncil     => "caller is not the security council",
+    NotProposer             => "caller is not the proposal proposer",
+    VotingAlreadyStarted    => "voting has already started; proposal cannot be cancelled",
 );
 
 #[cfg(test)]
@@ -92,7 +103,11 @@ DaoError::VotingClosed = {}\n\
 DaoError::TimelockNotExpired = {}\n\
 DaoError::CircularDelegation = {}\n\
 DaoError::NoLockedTokens = {}\n\
-DaoError::VotingStillOpen = {}\n",
+DaoError::VotingStillOpen = {}\n\
+DaoError::MissingSecurityCouncil = {}\n\
+DaoError::UnauthorizedCouncil = {}\n\
+DaoError::NotProposer = {}\n\
+DaoError::VotingAlreadyStarted = {}\n",
             DaoError::NotAuthorized as u32,
             DaoError::AlreadyInitialized as u32,
             DaoError::NotInitialized as u32,
@@ -112,6 +127,10 @@ DaoError::VotingStillOpen = {}\n",
             DaoError::CircularDelegation as u32,
             DaoError::NoLockedTokens as u32,
             DaoError::VotingStillOpen as u32,
+            DaoError::MissingSecurityCouncil as u32,
+            DaoError::UnauthorizedCouncil as u32,
+            DaoError::NotProposer as u32,
+            DaoError::VotingAlreadyStarted as u32,
         )
     }
 

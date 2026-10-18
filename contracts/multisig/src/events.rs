@@ -139,3 +139,47 @@ pub fn signer_change_executed(env: &Env, proposal_id: u64) {
         (),
     );
 }
+
+/// Emitted when a threshold change proposal is created (#1322).
+pub fn threshold_change_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "threshold_change_proposed"), proposer.clone()),
+        proposal_id,
+    );
+}
+
+/// Emitted when a signer approves a threshold change proposal (#1322).
+pub fn threshold_change_approved(env: &Env, proposal_id: u64, signer: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "threshold_change_approved"),
+            signer.clone(),
+            proposal_id,
+        ),
+        (),
+    );
+}
+
+/// Emitted when a threshold change proposal reaches consensus and is applied (#1322).
+pub fn threshold_change_applied(env: &Env, proposal_id: u64, new_threshold: u32) {
+    env.events().publish(
+        (Symbol::new(env, "threshold_change_applied"), proposal_id),
+        new_threshold,
+    );
+}
+
+/// Emitted when a signer is detected as dormant/inactive (#1323).
+pub fn dormant_signer_detected(env: &Env, signer: &Address, last_activity: u32) {
+    env.events().publish(
+        (Symbol::new(env, "dormant_detected"), signer.clone()),
+        last_activity,
+    );
+}
+
+/// Emitted when a dormant signer is replaced by a new signer (#1323).
+pub fn dormant_signer_replaced(env: &Env, old_signer: &Address, new_signer: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "dormant_replaced"), old_signer.clone()),
+        new_signer.clone(),
+    );
+}

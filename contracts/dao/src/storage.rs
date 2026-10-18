@@ -2,7 +2,6 @@
 #![allow(missing_docs)]
 
 use soroban_sdk::{Address, String, Symbol, Val, Vec, contracttype};
-use soroban_sdk::{Address, String, Vec, contracttype};
 
 /// Instance-storage keys (contract-level state).
 #[contracttype]
@@ -31,6 +30,9 @@ pub enum DataKey {
     /// Number of ledgers a passed proposal must wait in `Queued` state before
     /// it can be executed. Zero means immediate execution is allowed.
     ExecutionDelay,
+    /// Optional emergency security council address (multisig) allowed to
+    /// fast-track emergency proposals (issue #1320).
+    SecurityCouncil,
 }
 
 /// Persistent-storage keys (per-proposal and per-vote data).
@@ -123,6 +125,9 @@ pub struct Proposal {
     /// Earliest ledger at which this proposal may be executed once it is
     /// queued (= `deadline` + `execution_delay`). Zero when not yet queued.
     pub execution_eta: u32,
+    /// Ledger at which voting opens. The proposer may cancel the proposal
+    /// strictly before this ledger (issue #1321).
+    pub voting_start: u32,
 }
 
 /// One page of results from `get_proposals` (#1110).

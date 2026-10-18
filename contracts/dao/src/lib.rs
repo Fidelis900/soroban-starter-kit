@@ -18,7 +18,6 @@
 //!   historical participation keeps quorum between `min_quorum_bps` and
 //!   `max_quorum_bps`, bounded in basis points (0–10 000).
 
-use soroban_sdk::{Address, Env, String, Symbol, Val, Vec, contract, contractimpl, token};
 //! ## Quorum modes
 //!
 //! Two quorum controls can be set at initialization; both must be satisfied
@@ -64,15 +63,17 @@ use soroban_sdk::{Address, Env, String, Symbol, Val, Vec, contract, contractimpl
 //! order, optionally filtered by [`ProposalState`], at most [`MAX_PAGE_SIZE`]
 //! per call. Pass the returned `next_cursor` to fetch the following page.
 
-use soroban_sdk::{Address, Env, String, Symbol, Vec, contract, contractimpl, token};
+use soroban_sdk::{Address, Env, String, Symbol, Val, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
 mod storage;
 
 pub use errors::DaoError;
-pub use storage::{DataKey, DelegateKey, LockedTokensKey, Proposal, ProposalKey, ProposalState, VoteKey};
-pub use storage::{DataKey, Proposal, ProposalKey, ProposalPage, ProposalState, VoteKey};
+pub use storage::{
+    DataKey, DelegateKey, LockedTokensKey, Proposal, ProposalKey, ProposalPage, ProposalState,
+    VoteKey,
+};
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, paginate};
 
@@ -197,6 +198,8 @@ mod contract {
             env.storage()
                 .instance()
                 .set(&DataKey::QuorumEmaCount, &0u32);
+            env.storage()
+                .instance()
                 .set(&DataKey::QuorumBps, &quorum_bps);
             env.storage()
                 .instance()
@@ -251,8 +254,6 @@ mod contract {
             let token_client = token::Client::new(&env, &token_addr);
 
             let balance = token_client.balance(&proposer);
-
-            let balance = token::Client::new(&env, &token).balance(&proposer);
             if balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
@@ -277,7 +278,7 @@ mod contract {
             //   (a) the quorum_bps percentage check in execute_proposal, and
             //   (b) capping each voter's weight to prevent flash-loan attacks.
             let total_supply_at_creation: i128 = env.invoke_contract(
-                &token,
+                &token_addr,
                 &Symbol::new(&env, "total_supply"),
                 Vec::new(&env),
             );
@@ -294,13 +295,15 @@ mod contract {
                 .instance()
                 .get(&DataKey::VotingPeriod)
                 .ok_or(DaoError::NotInitialized)?;
-            let deadline = env.ledger().sequence() + voting_period;
+            let voting_start = env.ledger().sequence();
+            let deadline = voting_start + voting_period;
 
             let proposal = Proposal {
                 id: proposal_id,
                 proposer: proposer.clone(),
                 title,
                 description,
+                voting_start,
                 deadline,
                 yes_votes: 0,
                 no_votes: 0,
@@ -862,21 +865,6 @@ mod contract {
                     .checked_mul(proposal.total_supply_at_creation)
                     .ok_or(DaoError::NotInitialized)?;
                 if lhs < rhs {
-                let token: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Token)
-                    .ok_or(DaoError::NotInitialized)?;
-                // `total_supply` is not part of the SEP-41 `TokenInterface`, so it is
-                // unreachable through `token::Client`. Invoke it by symbol instead; this
-                // requires the configured governance token to implement `total_supply`
-                // (as `soroban-token-template` does).
-                let total_supply: i128 =
-                    env.invoke_contract(&token, &Symbol::new(&env, "total_supply"), Vec::new(&env));
-                // total_votes / total_supply >= quorum_bps / 10_000
-                // ⟺ total_votes * 10_000 >= quorum_bps * total_supply
-                if total_votes * 10_000 < i128::from(quorum_bps) * proposal.total_supply_at_creation
-                {
                     return Err(DaoError::QuorumNotMet);
                 }
             }
@@ -975,6 +963,15 @@ mod contract {
             }
 
             // ── Update adaptive quorum EMA (issue #1107) ─────────────────────
+            let quorum: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Quorum)
+                .unwrap_or(0);
+            let total_votes = proposal
+                .yes_votes
+                .checked_add(proposal.no_votes)
+                .unwrap_or(0);
             Self::update_quorum_ema(&env, Self::participation_bps(total_votes, quorum));
 
             Ok(())
@@ -1032,7 +1029,7 @@ mod contract {
         /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
         /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
         /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
-        pub fn cancel_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
+        pub fn admin_cancel_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
             Self::require_initialized(&env)?;
 
             let admin: Address = env
@@ -1064,6 +1061,195 @@ mod contract {
 
             bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
             events::proposal_cancelled(&env, &admin, proposal_id);
+
+            Ok(())
+        }
+
+        /// Cancel a proposal as its original proposer before voting opens (#1321).
+        ///
+        /// This lets a proposer retract a proposal that contains a mistake before
+        /// any voting begins, refunding the proposal bond instead of slashing it.
+        /// Cancellation is only permitted strictly before `proposal.voting_start`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::NotProposer`] if the caller is not the original proposer.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
+        /// Returns [`DaoError::VotingAlreadyStarted`] if voting has already opened.
+        pub fn cancel_proposal(
+            env: Env,
+            proposer: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            proposer.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.proposer != proposer {
+                return Err(DaoError::NotProposer);
+            }
+
+            if proposal.state != ProposalState::Active {
+                return Err(DaoError::InvalidState);
+            }
+
+            // Cancellation is only allowed strictly before voting starts.
+            if env.ledger().sequence() >= proposal.voting_start {
+                return Err(DaoError::VotingAlreadyStarted);
+            }
+
+            proposal.state = ProposalState::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+
+            // Refund the proposal bond to the proposer (#1321).
+            if proposal.bond_amount > 0 {
+                let token_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Token)
+                    .ok_or(DaoError::NotInitialized)?;
+                let dao_addr = env.current_contract_address();
+                token::Client::new(&env, &token_addr).transfer(
+                    &dao_addr,
+                    &proposal.proposer,
+                    &proposal.bond_amount,
+                );
+                events::bond_refunded(&env, &proposal.proposer, proposal_id, proposal.bond_amount);
+            }
+
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            events::proposal_cancelled(&env, &proposer, proposal_id);
+
+            Ok(())
+        }
+
+        /// Set the optional emergency security council address (#1320).
+        ///
+        /// The security council may fast-track emergency proposals via
+        /// [`emergency_execute_proposal`], bypassing the standard voting and
+        /// timelock periods during an active exploit.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_security_council(
+            env: Env,
+            admin: Address,
+            council: Address,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(DaoError::NotInitialized)?;
+            if stored_admin != admin {
+                return Err(DaoError::NotAuthorized);
+            }
+            admin.require_auth();
+
+            env.storage()
+                .instance()
+                .set(&DataKey::SecurityCouncil, &council);
+            bump_instance(&env);
+
+            Ok(())
+        }
+
+        /// Return the configured security council address, if any (#1320).
+        #[must_use]
+        pub fn security_council(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::SecurityCouncil)
+        }
+
+        /// Fast-track execution of an emergency proposal by the security council (#1320).
+        ///
+        /// The caller must be the configured security council. The proposal must
+        /// be `Active` or `Queued` (i.e. not already executed or cancelled). The
+        /// proposal is marked `Executed` immediately, bypassing the standard
+        /// voting duration and execution timelock, and any action payload is
+        /// dispatched atomically.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::MissingSecurityCouncil`] if no council is configured.
+        /// Returns [`DaoError::UnauthorizedCouncil`] if the caller is not the council.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active` or `Queued`.
+        pub fn emergency_execute_proposal(
+            env: Env,
+            council: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_council: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecurityCouncil)
+                .ok_or(DaoError::MissingSecurityCouncil)?;
+            if stored_council != council {
+                return Err(DaoError::UnauthorizedCouncil);
+            }
+            council.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Active
+                && proposal.state != ProposalState::Queued
+            {
+                return Err(DaoError::InvalidState);
+            }
+
+            proposal.state = ProposalState::Executed;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            // Refund the bond to the proposer on emergency execution.
+            if proposal.bond_amount > 0 {
+                let token_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Token)
+                    .ok_or(DaoError::NotInitialized)?;
+                let dao_addr = env.current_contract_address();
+                token::Client::new(&env, &token_addr).transfer(
+                    &dao_addr,
+                    &proposal.proposer,
+                    &proposal.bond_amount,
+                );
+                events::bond_refunded(&env, &proposal.proposer, proposal_id, proposal.bond_amount);
+            }
+
+            events::emergency_proposal_executed(&env, &council, proposal_id);
+
+            // ── Dispatch action payload (issue #1108) ─────────────────────────
+            if let (Some(target), Some(function), Some(args)) = (
+                proposal.action_target.clone(),
+                proposal.action_function.clone(),
+                proposal.action_args.clone(),
+            ) {
+                let return_val: Val = env.invoke_contract(&target, &function, args);
+                events::proposal_action_executed(&env, proposal_id, return_val);
+            }
 
             Ok(())
         }
@@ -1154,6 +1340,7 @@ mod contract {
         pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
             let key = DelegateKey { delegator };
             env.storage().persistent().get(&key)
+        }
         /// List proposals with cursor-based pagination (#1110).
         ///
         /// `cursor` is the proposal ID to resume scanning from (pass `0` to
