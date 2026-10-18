@@ -52,6 +52,18 @@ pub enum EscrowError {
     EmptyTokenList = 15,
     /// Token lists and amount lists must have the same length.
     TokenListMismatch = 16,
+    /// The arbiter fee in basis points exceeds the maximum allowed (2 000).
+    ArbiterFeeTooHigh = 17,
+    /// The arbiter threshold is zero or exceeds the number of configured arbiters.
+    InvalidThreshold = 18,
+    /// Not enough distinct arbiter approvals have been collected to resolve the dispute.
+    InsufficientArbiterApprovals = 19,
+    /// The same arbiter has already approved this dispute resolution.
+    DuplicateArbiterApproval = 20,
+    /// The partial release amount is negative or exceeds the milestone allocation.
+    InvalidPartialAmount = 21,
+    /// Mutual cancellation is not allowed in the escrow's current state.
+    MutualCancelNotAllowed = 22,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -84,6 +96,12 @@ impl_display_error!(
     Reentrancy                => "reentrant call detected",
     EmptyTokenList            => "token list must not be empty",
     TokenListMismatch         => "token and amount lists must have the same length",
+    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (2 000 bps)",
+    InvalidThreshold          => "invalid arbiter threshold",
+    InsufficientArbiterApprovals => "insufficient arbiter approvals",
+    DuplicateArbiterApproval  => "duplicate arbiter approval",
+    InvalidPartialAmount      => "invalid partial release amount",
+    MutualCancelNotAllowed    => "mutual cancellation not allowed",
 );
 
 #[cfg(test)]
@@ -113,7 +131,13 @@ EscrowError::MilestoneNotFound = {}\n\
 EscrowError::FeeTooHigh = {}\n\
 EscrowError::Reentrancy = {}\n\
 EscrowError::EmptyTokenList = {}\n\
-EscrowError::TokenListMismatch = {}\n",
+EscrowError::TokenListMismatch = {}\n\
+EscrowError::ArbiterFeeTooHigh = {}\n\
+EscrowError::InvalidThreshold = {}\n\
+EscrowError::InsufficientArbiterApprovals = {}\n\
+EscrowError::DuplicateArbiterApproval = {}\n\
+EscrowError::InvalidPartialAmount = {}\n\
+EscrowError::MutualCancelNotAllowed = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -130,6 +154,12 @@ EscrowError::TokenListMismatch = {}\n",
             EscrowError::Reentrancy as u32,
             EscrowError::EmptyTokenList as u32,
             EscrowError::TokenListMismatch as u32,
+            EscrowError::ArbiterFeeTooHigh as u32,
+            EscrowError::InvalidThreshold as u32,
+            EscrowError::InsufficientArbiterApprovals as u32,
+            EscrowError::DuplicateArbiterApproval as u32,
+            EscrowError::InvalidPartialAmount as u32,
+            EscrowError::MutualCancelNotAllowed as u32,
         )
     }
 

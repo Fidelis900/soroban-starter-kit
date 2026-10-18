@@ -55,6 +55,7 @@ mod contract {
             dispute_timeout_ledgers: u32,
             grace_period_ledgers: Option<u32>,
             metadata_hash: Option<soroban_sdk::BytesN<32>>,
+            arbiter_fee_bps: Option<u32>,
         ) -> Result<(), EscrowError> {
             lifecycle::initialize(
                 env,
@@ -68,6 +69,7 @@ mod contract {
                 dispute_timeout_ledgers,
                 grace_period_ledgers,
                 metadata_hash,
+                arbiter_fee_bps,
             )
         }
 
@@ -114,6 +116,7 @@ mod contract {
             required_signatures: u32,
             dispute_timeout_ledgers: u32,
             metadata_hash: Option<soroban_sdk::BytesN<32>>,
+            arbiter_fee_bps: Option<u32>,
         ) -> Result<(), EscrowError> {
             lifecycle::initialize_with_arbiters(
                 env,
@@ -127,6 +130,7 @@ mod contract {
                 required_signatures,
                 dispute_timeout_ledgers,
                 metadata_hash,
+                arbiter_fee_bps,
             )
         }
 
@@ -174,12 +178,38 @@ mod contract {
             dispute::resolve_dispute(env, caller, release_to_seller)
         }
 
+        /// Record an arbiter's approval for the current dispute verdict.
+        ///
+        /// In a multi-arbiter (M-of-N) escrow, each arbiter must approve the
+        /// same verdict until `threshold` distinct approvals are collected,
+        /// at which point the dispute is resolved automatically.
+        pub fn approve_dispute(
+            env: Env,
+            arbiter: Address,
+            release_to_seller: bool,
+        ) -> Result<(), EscrowError> {
+            dispute::approve_dispute(env, arbiter, release_to_seller)
+        }
+
         pub fn claim_dispute_timeout(env: Env) -> Result<(), EscrowError> {
             dispute::claim_dispute_timeout(env)
         }
 
         pub fn cancel(env: Env) -> Result<(), EscrowError> {
             lifecycle::cancel(env)
+        }
+
+        /// Cancel a funded escrow by mutual agreement of both parties.
+        ///
+        /// Requires authentication from both the buyer (depositor) and the
+        /// seller (beneficiary).  All unreleased funds are refunded to the
+        /// depositor and the escrow transitions to `Cancelled`.
+        pub fn mutual_cancel(
+            env: Env,
+            buyer: Address,
+            seller: Address,
+        ) -> Result<(), EscrowError> {
+            lifecycle::mutual_cancel(env, buyer, seller)
         }
 
         pub fn extend_deadline(env: Env, new_deadline: u32) -> Result<(), EscrowError> {
@@ -231,6 +261,19 @@ mod contract {
             milestone_index: u32,
         ) -> Result<(), EscrowError> {
             lifecycle::release_milestone(env, caller, milestone_index)
+        }
+
+        /// Approve a partial release of a single milestone.
+        ///
+        /// `release_amount` is paid to the seller and the remainder of the
+        /// milestone allocation is refunded to the buyer.  `release_amount`
+        /// must not exceed the milestone's allocated amount.
+        pub fn approve_milestone_partial(
+            env: Env,
+            milestone_id: u32,
+            release_amount: i128,
+        ) -> Result<(), EscrowError> {
+            lifecycle::approve_milestone_partial(env, milestone_id, release_amount)
         }
 
         /// Configure the fee deducted from each release and the treasury address

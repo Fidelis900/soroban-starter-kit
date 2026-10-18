@@ -50,12 +50,40 @@ fn validate_parties_multi(
     {
         return Err(EscrowError::InvalidParties);
     }
-    for arbiter in arbiters.iter() {
-        if &arbiter == buyer || &arbiter == seller {
+    // Reject duplicate arbiters so a single key cannot satisfy multiple
+    // signatures of the M-of-N threshold.
+    for i in 0..arbiters.len() {
+        let a = arbiters.get(i).unwrap();
+        if &a == buyer || &a == seller {
             return Err(EscrowError::InvalidParties);
+        }
+        for j in (i + 1)..arbiters.len() {
+            if a == arbiters.get(j).unwrap() {
+                return Err(EscrowError::InvalidParties);
+            }
         }
     }
     Ok(())
+}
+
+/// Maximum arbiter fee, in basis points (20 %).
+const MAX_ARBITER_FEE_BPS: u32 = 2_000;
+
+fn validate_arbiter_fee(fee_bps: Option<u32>) -> Result<(), EscrowError> {
+    if let Some(bps) = fee_bps {
+        if bps > MAX_ARBITER_FEE_BPS {
+            return Err(EscrowError::FeeTooHigh);
+        }
+    }
+    Ok(())
+}
+
+fn store_arbiter_fee(env: &Env, fee_bps: Option<u32>) {
+    if let Some(bps) = fee_bps {
+        env.storage()
+            .instance()
+            .set(&DataKey::ArbiterFeeBps, &bps);
+    }
 }
 
 pub(crate) fn extend_ttl(env: &Env) {
@@ -111,12 +139,14 @@ pub fn initialize(
     dispute_timeout_ledgers: u32,
     grace_period_ledgers: Option<u32>,
     metadata_hash: Option<soroban_sdk::BytesN<32>>,
+    arbiter_fee_bps: Option<u32>,
 ) -> Result<(), EscrowError> {
     if env.storage().instance().has(&State) {
         return Err(EscrowError::AlreadyInitialized);
     }
     validate_amount(amount)?;
     validate_parties(&buyer, &seller, &arbiter)?;
+    validate_arbiter_fee(arbiter_fee_bps)?;
     validate_deadline::<EscrowError>(&env, deadline_ledger)?;
     token::Client::new(&env, &token_contract).decimals();
     env.storage()
@@ -134,6 +164,7 @@ pub fn initialize(
         dispute_timeout_ledgers,
         0,
     );
+    store_arbiter_fee(&env, arbiter_fee_bps);
     if let Some(hash) = metadata_hash {
         env.storage().instance().set(&DataKey::MetadataHash, &hash);
     }
@@ -476,6 +507,148 @@ pub fn cancel(env: Env) -> Result<(), EscrowError> {
     extend_ttl(&env);
 
     events::escrow_cancelled(&env, &buyer);
+
+    Ok(())
+}
+
+/// Two-sided mutual cancellation (issue #1289).
+///
+/// Both the depositor (buyer) and beneficiary (seller) must authorize.  All
+/// unreleased funds — including unreleased milestones — are refunded to the
+/// depositor and the escrow transitions to `Cancelled`.
+pub fn mutual_cancel(env: Env, buyer: Address, seller: Address) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let stored_buyer: Address = get_required(&env, &Buyer)?;
+    let stored_seller: Address = get_required(&env, &Seller)?;
+    if buyer != stored_buyer || seller != stored_seller {
+        return Err(EscrowError::NotAuthorized);
+    }
+
+    // Both parties must sign off on the cancellation.
+    buyer.require_auth();
+    seller.require_auth();
+
+    let state: EscrowState = get_required(&env, &State)?;
+    if !matches!(state, EscrowState::Funded | EscrowState::Delivered) {
+        return Err(EscrowError::InvalidState);
+    }
+
+    // Only redistribute unreleased remainder (issue #1189).
+    let amount: i128 = sync_disputable_amount(&env)?;
+
+    // CEI: finalise state and zero out amount before any external transfer.
+    env.storage()
+        .instance()
+        .set(&State, &EscrowState::Cancelled);
+    env.storage().instance().set(&Amount, &0i128);
+    mark_all_milestones_released(&env);
+    extend_ttl(&env);
+
+    if amount > 0 {
+        acquire_lock(&env)?;
+        admin::transfer_token(&env, &env.current_contract_address(), &buyer, amount);
+        release_lock(&env);
+    }
+
+    events::mutual_cancelled(&env, &buyer, &seller, amount);
+
+    Ok(())
+}
+
+/// Partial milestone delivery approval (issue #1290).
+///
+/// The buyer approves releasing `release_amount` of the milestone at
+/// `milestone_id` to the seller; the remainder of that milestone is refunded
+/// to the buyer.  The milestone is marked released and the stored remaining
+/// amount is reduced by the full milestone allocation.
+pub fn approve_milestone_partial(
+    env: Env,
+    milestone_id: u32,
+    release_amount: i128,
+) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let buyer: Address = get_required(&env, &Buyer)?;
+    buyer.require_auth();
+
+    let state: EscrowState = get_required(&env, &State)?;
+    if state != EscrowState::Funded {
+        return Err(EscrowError::InvalidState);
+    }
+
+    if release_amount < 0 {
+        return Err(EscrowError::InvalidAmount);
+    }
+
+    let mut milestones: Vec<Milestone> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Milestones)
+        .ok_or(EscrowError::MilestoneNotFound)?;
+
+    let idx = milestone_id as usize;
+    if idx >= milestones.len() as usize {
+        return Err(EscrowError::MilestoneNotFound);
+    }
+
+    let mut m = milestones
+        .get(milestone_id)
+        .ok_or(EscrowError::MilestoneNotFound)?;
+    if m.released {
+        return Err(EscrowError::InvalidState);
+    }
+    let allocated = m.amount;
+    if release_amount > allocated {
+        return Err(EscrowError::InvalidAmount);
+    }
+    #[allow(clippy::arithmetic_side_effects)]
+    let refund = allocated - release_amount;
+
+    m.released = true;
+    milestones.set(milestone_id, m);
+    env.storage()
+        .instance()
+        .set(&DataKey::Milestones, &milestones);
+
+    // Reduce the stored remaining amount by the full milestone allocation.
+    let remaining: i128 = get_required(&env, &Amount)?;
+    #[allow(clippy::arithmetic_side_effects)]
+    let new_remaining = remaining - allocated;
+    env.storage().instance().set(&Amount, &new_remaining);
+
+    extend_ttl(&env);
+
+    let seller: Address = get_required(&env, &Seller)?;
+    acquire_lock(&env)?;
+    if release_amount > 0 {
+        let (net, fee) = apply_fee(&env, release_amount);
+        admin::transfer_token(&env, &env.current_contract_address(), &seller, net);
+        maybe_pay_fee(&env, fee);
+    }
+    if refund > 0 {
+        admin::transfer_token(&env, &env.current_contract_address(), &buyer, refund);
+    }
+    release_lock(&env);
+
+    events::milestone_partial_released(
+        &env,
+        &seller,
+        &buyer,
+        milestone_id,
+        release_amount,
+        refund,
+    );
+
+    // Transition to Completed when all milestones are released.
+    let all_done = milestones.iter().all(|m| m.released);
+    if all_done {
+        env.storage()
+            .instance()
+            .set(&State, &EscrowState::Completed);
+    }
 
     Ok(())
 }
