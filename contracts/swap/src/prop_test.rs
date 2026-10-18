@@ -6,19 +6,13 @@
 
 use std::format;
 
-use proptest::prelude::*;
-use soroban_sdk::{
-    Address, Env,
-    testutils::Address as _,
-    token::{Client as TokenClient, StellarAssetClient},
 extern crate std;
 
-use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
     Address, Env,
     testutils::{Address as _, Ledger},
-    token::StellarAssetClient,
+    token::{Client as TokenClient, StellarAssetClient},
 };
 use std::vec::Vec;
 
@@ -33,7 +27,6 @@ fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
     StellarAssetClient::new(env, token).mint(to, &amount);
 }
 
-proptest! {
 #[derive(Clone, Debug)]
 enum Command {
     Propose { amount_a: i128, amount_b: i128 },
@@ -52,7 +45,8 @@ fn commands() -> impl Strategy<Value = Vec<Command>> {
         1..=32,
     )
 }
-use crate::{SwapContract, SwapContractClient, calculate_and_validate_fee};
+
+use crate::calculate_and_validate_fee;
 
 fn setup(
     env: &Env,
@@ -189,6 +183,7 @@ proptest! {
             &token_b,
             &amount_b,
             &expires_at,
+            &true,
             &None,
             &None,
         );
@@ -252,7 +247,8 @@ proptest! {
                 Command::Propose { amount_a, amount_b } => {
                     let expiry = env.ledger().sequence() + 100;
                     let _ = client.try_propose_swap(
-                        &party_a, &token_a, &amount_a, &token_b, &amount_b, &expiry,
+                        &party_a, &token_a, &amount_a, &token_b, &amount_b, &expiry, &true,
+                        &None, &None,
                     );
                 }
                 Command::Accept { index } => {
@@ -349,5 +345,179 @@ proptest! {
         let after = token_a_client.balance(&party_a);
         let _ = (party_b, fill);
         prop_assert_eq!(after, before);
+    }
+
+    /// Property: The sum of successive partial fills equals the original offer
+    /// amount, and the remaining amount never goes negative.
+    #[test]
+    fn prop_partial_fills_sum_to_amount_a(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        first_fill in 1i128..=10_000i128,
+        second_fill in 1i128..=10_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a);
+        mint(&env, &token_b, &party_b, amount_b);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let first = first_fill.min(amount_a);
+        let _ = client.try_accept_swap_partial(&party_b, &swap_id, &first);
+        let swap = client.get_swap(&swap_id);
+        prop_assert!(swap.remaining_amount >= 0, "remaining amount went negative");
+
+        let second = second_fill.min(swap.remaining_amount);
+        let _ = client.try_accept_swap_partial(&party_b, &swap_id, &second);
+
+        let swap = client.get_swap(&swap_id);
+        prop_assert!(swap.remaining_amount >= 0, "remaining amount went negative");
+        prop_assert_eq!(
+            swap.filled_amount + swap.remaining_amount,
+            amount_a,
+            "filled + remaining must equal original offer"
+        );
+        prop_assert!(swap.filled_amount <= amount_a);
+    }
+
+    /// Property: Each partial fill delivers a proportional counterparty amount
+    /// (never more than the proportional share, never zero for a non-zero fill).
+    #[test]
+    fn prop_partial_fill_proportional_payment(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        fill in 1i128..=10_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a);
+        mint(&env, &token_b, &party_b, amount_b);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let fill = fill.min(amount_a);
+        let token_b_client = TokenClient::new(&env, &token_b);
+        let before_b = token_b_client.balance(&party_a);
+        let result = client.try_accept_swap_partial(&party_b, &swap_id, &fill);
+        if result.is_err() {
+            return Ok(());
+        }
+        let received = token_b_client.balance(&party_a) - before_b;
+
+        // Proportional share, rounded down, must not exceed the exact ratio.
+        let expected_max = amount_b * fill / amount_a;
+        prop_assert!(received <= expected_max, "over-delivered counterparty amount");
+        prop_assert!(received > 0, "non-zero fill must deliver a non-zero amount");
+    }
+
+    /// Property: Batch cancellation refunds every escrowed balance and leaves
+    /// the contract with no residual funds.
+    #[test]
+    fn prop_batch_cancel_conserves_balances(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        count in 1usize..=5usize,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a * count as i128);
+        mint(&env, &token_b, &party_a, amount_b * count as i128);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let token_a_client = TokenClient::new(&env, &token_a);
+        let token_b_client = TokenClient::new(&env, &token_b);
+        let before_a = token_a_client.balance(&party_a);
+        let before_b = token_b_client.balance(&party_a);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let mut ids: Vec<u32> = Vec::new();
+        for _ in 0..count {
+            let id = client.propose_swap_with_options(
+                &party_a,
+                &token_a,
+                &amount_a,
+                &token_b,
+                &amount_b,
+                &expires_at,
+                &true,
+                &false,
+                &None,
+                &None,
+            );
+            ids.push(id);
+        }
+
+        let mut batch: soroban_sdk::Vec<u32> = soroban_sdk::Vec::new(&env);
+        for id in ids.iter() {
+            batch.push_back(*id);
+        }
+        client.cancel_swaps_batch(&party_a, &batch);
+
+        prop_assert_eq!(token_a_client.balance(&party_a), before_a);
+        prop_assert_eq!(token_b_client.balance(&party_a), before_b);
+        prop_assert_eq!(token_a_client.balance(&contract_addr), 0);
+        prop_assert_eq!(token_b_client.balance(&contract_addr), 0);
+        for id in ids.iter() {
+            prop_assert_eq!(client.get_swap(id).state, SwapState::Cancelled);
+        }
     }
 }
