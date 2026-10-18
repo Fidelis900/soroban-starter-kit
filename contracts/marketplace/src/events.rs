@@ -98,3 +98,64 @@ pub fn royalty_splits_set(env: &Env, admin: &Address, total_bps: u32) {
     env.events()
         .publish((Symbol::new(env, "royalty_splits"),), (admin.clone(), total_bps));
 }
+
+pub fn dutch_listed(
+    env: &Env,
+    listing_id: u64,
+    seller: &Address,
+    start_price: i128,
+    end_price: i128,
+    start_ledger: u32,
+    end_ledger: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "dutch_listed"), listing_id),
+        (
+            seller.clone(),
+            start_price,
+            end_price,
+            start_ledger,
+            end_ledger,
+        ),
+    );
+}
+
+pub fn dutch_sold(
+    env: &Env,
+    listing_id: u64,
+    buyer: &Address,
+    price_paid: i128,
+    refund: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "dutch_sold"), listing_id),
+        (buyer.clone(), price_paid, refund),
+    );
+}
+
+pub fn bundle_listed(
+    env: &Env,
+    bundle_id: u64,
+    seller: &Address,
+    total_price: i128,
+    count: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "bundle_listed"), bundle_id),
+        (seller.clone(), total_price, count),
+    );
+}
+
+pub fn bundle_sold(env: &Env, bundle_id: u64, buyer: &Address, total_price: i128) {
+    env.events().publish(
+        (Symbol::new(env, "bundle_sold"), bundle_id),
+        (buyer.clone(), total_price),
+    );
+}
+
+pub fn bundle_cancelled(env: &Env, bundle_id: u64, seller: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "bundle_cancelled"), bundle_id),
+        seller.clone(),
+    );
+}

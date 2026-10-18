@@ -23,8 +23,10 @@ mod events;
 mod storage;
 
 pub use errors::MarketplaceError;
-pub use storage::{DataKey, Listing, ListingEntry, ListingPage, ListingParams};
-pub use storage::{CollectionOffer, DataKey, Listing, ListingEntry, ListingPage};
+pub use storage::{
+    BundleListing, CollectionOffer, DataKey, Listing, ListingEntry, ListingPage, ListingParams,
+    ListingType,
+};
 
 /// Maximum number of listings a single [`MarketplaceContract::get_active_listings`] call
 /// may return, regardless of the requested `limit`.
@@ -64,6 +66,14 @@ fn bump_collection_offer(env: &Env, id: u64) {
 fn bump_offer(env: &Env, id: u64, buyer: &Address) {
     env.storage().persistent().extend_ttl(
         &DataKey::Offer(id, buyer.clone()),
+        LEDGER_LIFETIME_THRESHOLD,
+        LEDGER_BUMP_AMOUNT,
+    );
+}
+
+fn bump_bundle(env: &Env, id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Bundle(id),
         LEDGER_LIFETIME_THRESHOLD,
         LEDGER_BUMP_AMOUNT,
     );
@@ -294,6 +304,324 @@ mod contract {
             )
         }
 
+        /// List an NFT as a Dutch auction: the asking price decays linearly from
+        /// `start_price` at `start_ledger` down to `end_price` at `end_ledger`.
+        ///
+        /// The seller must have approved this marketplace as a spender on the NFT.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not yet initialized.
+        /// Returns [`MarketplaceError::InvalidPrice`] if `start_price < end_price` or
+        /// `end_price <= 0`.
+        /// Returns [`MarketplaceError::InvalidExpiry`] if `end_ledger <= start_ledger` or
+        /// `start_ledger` is in the past.
+        /// Returns [`MarketplaceError::PaymentTokenNotAllowed`] if the whitelist is enabled and
+        /// `payment_token` is not on it.
+        #[allow(clippy::too_many_arguments)]
+        pub fn list_dutch(
+            env: Env,
+            seller: Address,
+            nft_contract: Address,
+            token_id: u32,
+            start_price: i128,
+            end_price: i128,
+            start_ledger: u32,
+            end_ledger: u32,
+            payment_token: Address,
+        ) -> Result<u64, MarketplaceError> {
+            seller.require_auth();
+            Self::list_dutch_impl(
+                &env,
+                &seller,
+                nft_contract,
+                token_id,
+                start_price,
+                end_price,
+                start_ledger,
+                end_ledger,
+                payment_token,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn list_dutch_impl(
+            env: &Env,
+            seller: &Address,
+            nft_contract: Address,
+            token_id: u32,
+            start_price: i128,
+            end_price: i128,
+            start_ledger: u32,
+            end_ledger: u32,
+            payment_token: Address,
+        ) -> Result<u64, MarketplaceError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+            if end_price <= 0 || start_price < end_price {
+                return Err(MarketplaceError::InvalidPrice);
+            }
+            if end_ledger <= start_ledger || start_ledger < env.ledger().sequence() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+            if Self::is_whitelist_enabled(env.clone())
+                && !Self::is_payment_token_allowed(env.clone(), payment_token.clone())
+            {
+                return Err(MarketplaceError::PaymentTokenNotAllowed);
+            }
+
+            let id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextListingId)
+                .unwrap_or(0);
+
+            let listing = Listing {
+                nft_contract,
+                token_id,
+                seller: seller.clone(),
+                price: start_price,
+                payment_token,
+                active: true,
+                expires_at: None,
+                listing_type: ListingType::Dutch {
+                    start_price,
+                    end_price,
+                    start_ledger,
+                    end_ledger,
+                },
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Listing(id), &listing);
+            env.storage()
+                .instance()
+                .set(&DataKey::NextListingId, &(id + 1));
+            bump_listing(env, id);
+            bump_instance(env);
+
+            events::dutch_listed(env, id, seller, start_price, end_price, start_ledger, end_ledger);
+            Ok(id)
+        }
+
+        /// Create a bundle listing: sell several NFTs of `nft_contract` together for
+        /// `total_price` in `payment_token`. All NFTs must be owned by `seller` and the
+        /// marketplace must be approved as a spender on each of them.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not yet initialized.
+        /// Returns [`MarketplaceError::EmptyBatch`] if `token_ids` is empty.
+        /// Returns [`MarketplaceError::InvalidPrice`] if `total_price <= 0`.
+        /// Returns [`MarketplaceError::DuplicateTokenId`] if `token_ids` contains duplicates.
+        /// Returns [`MarketplaceError::SellerNotOwner`] if the seller does not own every token.
+        /// Returns [`MarketplaceError::PaymentTokenNotAllowed`] if the whitelist is enabled and
+        /// `payment_token` is not on it.
+        pub fn create_bundle_listing(
+            env: Env,
+            seller: Address,
+            nft_contract: Address,
+            token_ids: Vec<u32>,
+            total_price: i128,
+            payment_token: Address,
+        ) -> Result<u64, MarketplaceError> {
+            seller.require_auth();
+
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+            if token_ids.is_empty() {
+                return Err(MarketplaceError::EmptyBatch);
+            }
+            if total_price <= 0 {
+                return Err(MarketplaceError::InvalidPrice);
+            }
+            if Self::is_whitelist_enabled(env.clone())
+                && !Self::is_payment_token_allowed(env.clone(), payment_token.clone())
+            {
+                return Err(MarketplaceError::PaymentTokenNotAllowed);
+            }
+
+            // Reject duplicates: a bundle must not list the same token twice.
+            let mut seen: Vec<u32> = Vec::new(&env);
+            for token_id in token_ids.iter() {
+                if seen.contains(token_id) {
+                    return Err(MarketplaceError::DuplicateTokenId);
+                }
+                seen.push_back(token_id);
+            }
+
+            // Verify the seller owns every token in the bundle.
+            let nft = NftClient::new(&env, &nft_contract);
+            for token_id in token_ids.iter() {
+                match nft.try_owner_of(&token_id) {
+                    Ok(Ok(owner)) if owner == seller => {}
+                    _ => return Err(MarketplaceError::SellerNotOwner),
+                }
+            }
+
+            let id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextBundleId)
+                .unwrap_or(0);
+
+            let bundle = BundleListing {
+                nft_contract,
+                token_ids: token_ids.clone(),
+                seller: seller.clone(),
+                total_price,
+                payment_token,
+                active: true,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Bundle(id), &bundle);
+            env.storage()
+                .instance()
+                .set(&DataKey::NextBundleId, &(id + 1));
+            bump_bundle(&env, id);
+            bump_instance(&env);
+
+            events::bundle_listed(&env, id, &seller, total_price);
+            Ok(id)
+        }
+
+        /// Buy a bundle listing: pays `total_price` (minus royalty) to the seller and
+        /// transfers every NFT in the bundle to the buyer atomically. If any transfer
+        /// fails the whole call reverts.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::BundleNotFound`] if `bundle_id` does not exist.
+        /// Returns [`MarketplaceError::ListingInactive`] if the bundle was cancelled or sold.
+        /// Returns [`MarketplaceError::SellerNotOwner`] if the seller no longer owns every token.
+        pub fn buy_bundle(
+            env: Env,
+            buyer: Address,
+            bundle_id: u64,
+        ) -> Result<(), MarketplaceError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+
+            buyer.require_auth();
+
+            let mut bundle: BundleListing = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Bundle(bundle_id))
+                .ok_or(MarketplaceError::BundleNotFound)?;
+            if !bundle.active {
+                return Err(MarketplaceError::ListingInactive);
+            }
+
+            // Ghost-listing check: seller must still own every token.
+            let nft = NftClient::new(&env, &bundle.nft_contract);
+            for token_id in bundle.token_ids.iter() {
+                match nft.try_owner_of(&token_id) {
+                    Ok(Ok(owner)) if owner == bundle.seller => {}
+                    _ => return Err(MarketplaceError::SellerNotOwner),
+                }
+            }
+
+            Self::acquire_lock(&env)?;
+
+            // Checks-effects-interactions: mark inactive before external calls.
+            bundle.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Bundle(bundle_id), &bundle);
+            bump_bundle(&env, bundle_id);
+            bump_instance(&env);
+
+            // Pay the seller (minus royalty) and royalty recipients.
+            let royalties = Self::resolve_royalty(
+                &env,
+                &bundle.nft_contract,
+                bundle.token_ids.get(0).unwrap_or(0),
+                bundle.total_price,
+            );
+            let mut royalty_total: i128 = 0;
+            for (_, amount) in royalties.iter() {
+                royalty_total = royalty_total.saturating_add(amount);
+            }
+            #[allow(clippy::arithmetic_side_effects)]
+            let seller_amount = bundle.total_price - royalty_total;
+
+            let tok = token::Client::new(&env, &bundle.payment_token);
+            tok.transfer(&buyer, &bundle.seller, &seller_amount);
+            for (recipient, amount) in royalties.iter() {
+                if amount > 0 {
+                    tok.transfer(&buyer, &recipient, &amount);
+                }
+            }
+
+            // Transfer every NFT to the buyer. Any failure reverts the whole call.
+            for token_id in bundle.token_ids.iter() {
+                nft.transfer_from(
+                    &env.current_contract_address(),
+                    &bundle.seller,
+                    &buyer,
+                    &token_id,
+                );
+            }
+
+            Self::release_lock(&env);
+            events::bundle_sold(&env, bundle_id, &buyer, bundle.total_price);
+            Ok(())
+        }
+
+        /// Cancel a bundle listing. Only the original seller may cancel.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::BundleNotFound`] if the bundle does not exist.
+        /// Returns [`MarketplaceError::ListingInactive`] if already sold or cancelled.
+        /// Returns [`MarketplaceError::NotAuthorized`] if caller is not the seller.
+        pub fn delist_bundle(
+            env: Env,
+            seller: Address,
+            bundle_id: u64,
+        ) -> Result<(), MarketplaceError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+
+            seller.require_auth();
+
+            let mut bundle: BundleListing = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Bundle(bundle_id))
+                .ok_or(MarketplaceError::BundleNotFound)?;
+            if !bundle.active {
+                return Err(MarketplaceError::ListingInactive);
+            }
+            if bundle.seller != seller {
+                return Err(MarketplaceError::NotAuthorized);
+            }
+
+            bundle.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Bundle(bundle_id), &bundle);
+            bump_bundle(&env, bundle_id);
+            bump_instance(&env);
+
+            events::bundle_cancelled(&env, bundle_id, &seller);
+            Ok(())
+        }
+
+        /// Return a bundle listing, or `None` if not found.
+        pub fn get_bundle(env: Env, bundle_id: u64) -> Option<BundleListing> {
+            env.storage().persistent().get(&DataKey::Bundle(bundle_id))
+        }
+
         /// List an NFT for sale, priced in `payment_token`, with an expiry ledger sequence.
         /// Once `env.ledger().sequence()` passes `expires_at`, `buy` will reject purchase
         /// attempts and the seller may call `sweep_expired` to reclaim the listing.
@@ -388,6 +716,7 @@ mod contract {
                 payment_token: params.payment_token,
                 active: true,
                 expires_at: params.expires_at,
+                listing_type: ListingType::Fixed,
             };
 
             env.storage()
@@ -506,7 +835,30 @@ mod contract {
             if !Self::seller_owns(env, &listing) {
                 return Err(MarketplaceError::SellerNotOwner);
             }
-            if listing.price > max_price {
+            // Resolve the current asking price. Dutch listings decay linearly over time.
+            let price = match &listing.listing_type {
+                ListingType::Fixed => listing.price,
+                ListingType::Dutch {
+                    start_price,
+                    end_price,
+                    start_ledger,
+                    end_ledger,
+                } => {
+                    let current_ledger = env.ledger().sequence();
+                    if current_ledger < *start_ledger {
+                        return Err(MarketplaceError::DutchNotStarted);
+                    }
+                    Self::dutch_price(
+                        *start_price,
+                        *end_price,
+                        *start_ledger,
+                        *end_ledger,
+                        current_ledger,
+                    )
+                }
+            };
+
+            if price > max_price {
                 return Err(MarketplaceError::PriceExceedsMax);
             }
 
@@ -518,7 +870,7 @@ mod contract {
             bump_listing(env, listing_id);
             bump_instance(env);
 
-            let price = listing.price;
+            let is_dutch = matches!(listing.listing_type, ListingType::Dutch { .. });
             let (royalty, royalty_recipient) = Self::resolve_royalty(
                 env,
                 &listing.nft_contract,
@@ -553,8 +905,44 @@ mod contract {
                 price,
             );
 
-            events::sold(env, listing_id, buyer, price);
+            if is_dutch {
+                events::dutch_sold(env, listing_id, buyer, price);
+            } else {
+                events::sold(env, listing_id, buyer, price);
+            }
             Ok(())
+        }
+
+        /// Compute the current Dutch-auction price for `current_ledger`.
+        ///
+        /// Linearly interpolates from `start_price` at `start_ledger` to `end_price` at
+        /// `end_ledger`, clamped at `end_price` once `end_ledger` has passed.
+        fn dutch_price(
+            start_price: i128,
+            end_price: i128,
+            start_ledger: u32,
+            end_ledger: u32,
+            current_ledger: u32,
+        ) -> i128 {
+            let effective = if current_ledger > end_ledger {
+                end_ledger
+            } else {
+                current_ledger
+            };
+            let elapsed = effective.saturating_sub(start_ledger);
+            let duration = end_ledger.saturating_sub(start_ledger);
+            if duration == 0 {
+                return end_price;
+            }
+            let decay = start_price.saturating_sub(end_price);
+            let reduction = soroban_common::math::mul_div(
+                decay,
+                i128::from(elapsed),
+                i128::from(duration),
+            )
+            .unwrap_or(decay);
+            let price = start_price.saturating_sub(reduction);
+            if price < end_price { end_price } else { price }
         }
 
         // -----------------------------------------------------------------

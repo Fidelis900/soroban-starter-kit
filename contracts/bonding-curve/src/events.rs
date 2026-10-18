@@ -51,3 +51,28 @@ pub fn sold(
         (tokens_in, tokens_out, new_spot_price, fee_paid),
     );
 }
+
+/// Emitted when the admin updates the single-transaction purchase cap.
+/// `bps` is the cap expressed in basis points of total max supply.
+pub fn max_buy_bps_set(env: &Env, admin: &Address, bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "max_buy_bps_set"), admin.clone()),
+        (bps,),
+    );
+}
+
+/// Emitted when the volatility circuit breaker trips and buys are halted.
+/// `reference_price` is the historical spot price used as the baseline,
+/// `current_price` is the spot price that exceeded the surge threshold, and
+/// `ledger` is the ledger sequence at which the breaker tripped.
+pub fn price_surge_detected(
+    env: &Env,
+    reference_price: i128,
+    current_price: i128,
+    ledger: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "price_surge_detected"),),
+        (reference_price, current_price, ledger),
+    );
+}

@@ -33,6 +33,30 @@ pub enum DataKey {
     NextCollectionOfferId,
     /// Escrowed collection-wide floor offer (persistent).
     CollectionOffer(u64),
+    /// Next bundle listing ID counter (instance).
+    NextBundleId,
+    /// Per-bundle listing details (persistent).
+    Bundle(u64),
+}
+
+/// Pricing model of a listing.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ListingType {
+    /// A fixed asking price.
+    Fixed,
+    /// A Dutch auction whose price decays linearly from `start_price` at
+    /// `start_ledger` down to `end_price` at `end_ledger`.
+    Dutch {
+        /// Price at `start_ledger`.
+        start_price: i128,
+        /// Price at (and after) `end_ledger`.
+        end_price: i128,
+        /// Ledger sequence at which the auction starts.
+        start_ledger: u32,
+        /// Ledger sequence at which the price reaches `end_price`.
+        end_ledger: u32,
+    },
 }
 
 /// State of a single NFT listing.
@@ -54,6 +78,9 @@ pub struct Listing {
     pub active: bool,
     /// Optional ledger sequence after which the listing can no longer be bought.
     pub expires_at: Option<u32>,
+    /// Pricing model of the listing. `Fixed` listings use `price` directly;
+    /// `Dutch` listings compute the spot price from the elapsed ledgers.
+    pub listing_type: ListingType,
 }
 
 /// A listing paired with its ID, as returned by [`super::MarketplaceContract::get_active_listings`].
@@ -92,6 +119,28 @@ pub struct ListingParams {
     pub payment_token: Address,
     /// Optional ledger sequence after which the listing can no longer be bought.
     pub expires_at: Option<u32>,
+    /// Pricing model of the listing. Defaults to `Fixed` when omitted.
+    pub listing_type: ListingType,
+}
+
+/// A bundle listing selling several NFTs of one collection atomically.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BundleListing {
+    /// The seller of the bundle.
+    pub seller: Address,
+    /// The NFT contract address shared by all tokens in the bundle.
+    pub nft_contract: Address,
+    /// The token IDs sold together.
+    pub token_ids: soroban_sdk::Vec<u32>,
+    /// Total asking price for the whole bundle in `payment_token` units.
+    pub total_price: i128,
+    /// Token the seller accepts as payment for the bundle.
+    pub payment_token: Address,
+    /// Whether the bundle is still open.
+    pub active: bool,
+}
+
 /// An escrowed collection-wide floor offer: `buyer` will pay `amount` for ANY
 /// token of `nft_contract`, and any holder of such a token may accept it.
 #[contracttype]

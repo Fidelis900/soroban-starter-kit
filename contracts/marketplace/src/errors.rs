@@ -28,6 +28,12 @@ pub enum MarketplaceError {
     PriceExceedsMax = 13,
     CollectionOfferNotFound = 14,
     CollectionOfferExpired = 15,
+    InvalidDutchParams = 19,
+    DutchNotStarted = 20,
+    EmptyBundle = 21,
+    DuplicateTokenId = 22,
+    BundleNotFound = 23,
+    BundleInactive = 24,
 }
 
 impl_display_error!(
@@ -53,6 +59,12 @@ impl_display_error!(
     PriceExceedsMax     => "listing price exceeds buyer max price",
     CollectionOfferNotFound => "collection offer not found",
     CollectionOfferExpired  => "collection offer expired",
+    InvalidDutchParams  => "invalid dutch auction parameters",
+    DutchNotStarted     => "dutch auction has not started",
+    EmptyBundle         => "empty bundle",
+    DuplicateTokenId    => "duplicate token id in bundle",
+    BundleNotFound      => "bundle not found",
+    BundleInactive      => "bundle inactive",
 );
 
 #[cfg(test)]
@@ -87,7 +99,13 @@ MarketplaceError::ListingStillActive = {}\n\
 MarketplaceError::Reentrant = {}\n",
 MarketplaceError::PriceExceedsMax = {}\n\
 MarketplaceError::CollectionOfferNotFound = {}\n\
-MarketplaceError::CollectionOfferExpired = {}\n",
+MarketplaceError::CollectionOfferExpired = {}\n\
+MarketplaceError::InvalidDutchParams = {}\n\
+MarketplaceError::DutchNotStarted = {}\n\
+MarketplaceError::EmptyBundle = {}\n\
+MarketplaceError::DuplicateTokenId = {}\n\
+MarketplaceError::BundleNotFound = {}\n\
+MarketplaceError::BundleInactive = {}\n",
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
             MarketplaceError::NotAuthorized as u32,
@@ -109,6 +127,12 @@ MarketplaceError::CollectionOfferExpired = {}\n",
             MarketplaceError::PriceExceedsMax as u32,
             MarketplaceError::CollectionOfferNotFound as u32,
             MarketplaceError::CollectionOfferExpired as u32,
+            MarketplaceError::InvalidDutchParams as u32,
+            MarketplaceError::DutchNotStarted as u32,
+            MarketplaceError::EmptyBundle as u32,
+            MarketplaceError::DuplicateTokenId as u32,
+            MarketplaceError::BundleNotFound as u32,
+            MarketplaceError::BundleInactive as u32,
         )
     }
 
