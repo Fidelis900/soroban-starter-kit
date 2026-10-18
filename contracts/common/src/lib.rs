@@ -19,7 +19,7 @@ pub mod math;
 pub mod merkle;
 
 pub use math::{
-    FixedPoint128, FixedPointError, from_scale, mul_div, mul_div_nearest, mul_div_up,
+    FixedPoint128, FixedPointError, fixed_sqrt, from_scale, mul_div, mul_div_nearest, mul_div_up,
     to_scale,
 };
 pub use merkle::{hash_pair_sorted, verify_merkle_multi_proof, verify_merkle_proof};
