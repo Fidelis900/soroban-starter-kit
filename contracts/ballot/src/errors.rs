@@ -20,8 +20,13 @@ pub enum BallotError {
     NoChoices = 11,
     InvalidRanking = 12,
     DuplicateRanking = 13,
-    VotingNotClosed = 12,
-    TallyNotAvailable = 13,
+    VotingNotClosed = 14,
+    TallyNotAvailable = 15,
+    Tied = 16,
+    AlreadyCertified = 17,
+    QuorumNotMet = 18,
+    ResultsNotReady = 19,
+    InvalidTieResolution = 20,
 }
 
 impl_display_error!(
@@ -41,4 +46,9 @@ impl_display_error!(
     DuplicateRanking     => "duplicate choice in ranking",
     VotingNotClosed      => "voting window has not closed",
     TallyNotAvailable    => "tally not available",
+    Tied                 => "leading choices are tied",
+    AlreadyCertified     => "results already certified",
+    QuorumNotMet         => "quorum not met",
+    ResultsNotReady      => "no votes to certify",
+    InvalidTieResolution => "choice is not among the tied choices",
 );
