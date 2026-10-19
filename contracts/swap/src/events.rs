@@ -47,6 +47,13 @@ pub fn swap_cancelled(env: &Env, party_a: &Address, swap_id: u32) {
         .publish((Symbol::new(env, "cancelled"), party_a.clone()), swap_id);
 }
 
+pub fn swap_expired(env: &Env, swap_id: u32, creator: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "swap_expired"), creator.clone()),
+        swap_id,
+    );
+}
+
 pub fn basket_swap_proposed(env: &Env, party_a: &Address, swap_id: u32, expires_at: u32) {
     env.events().publish(
         (Symbol::new(env, "basket_proposed"), party_a.clone()),

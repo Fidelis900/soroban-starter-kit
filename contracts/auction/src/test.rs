@@ -1726,3 +1726,237 @@ fn test_withdraw_seller_proceeds_nothing_pending_fails() {
         Err(Ok(AuctionError::NothingToWithdraw))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1296 — Batch cancellation of unbid auctions
+// ---------------------------------------------------------------------------
+
+/// Seller cancels several unbid auctions in one call and every escrowed NFT
+/// is returned to the seller.
+#[test]
+fn test_cancel_auctions_batch_returns_all_items() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, _, _, token) = setup(&env);
+
+    let mut ids: Vec<u32> = Vec::new(&env);
+    let mut nfts: Vec<(NftContractClient, u32)> = Vec::new(&env);
+    for _ in 0..3 {
+        let (nft, nft_addr, token_id) = setup_nft(&env, &seller);
+        let deadline = env.ledger().sequence() + 100;
+        let id = client.start(
+            &seller,
+            &token,
+            &1_000,
+            &100,
+            &deadline,
+            &None,
+            &0,
+            &Some(nft_addr),
+            &Some(token_id),
+        );
+        assert_eq!(nft.owner_of(&token_id), client.address);
+        ids.push_back(id);
+        nfts.push_back((nft, token_id));
+    }
+
+    client.cancel_auctions_batch(&seller, &ids);
+
+    for (nft, token_id) in nfts.iter() {
+        assert_eq!(nft.owner_of(&token_id), seller);
+    }
+    for id in ids.iter() {
+        assert!(client.is_cancelled(&id));
+    }
+}
+
+/// The batch is rejected atomically if any target auction already has a bid.
+#[test]
+fn test_cancel_auctions_batch_rejects_when_any_auction_has_bid() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let id_a = client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &0,
+        &None,
+        &None,
+    );
+    let id_b = client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &0,
+        &None,
+        &None,
+    );
+    client.bid(&b1, &1_000);
+
+    let mut ids: Vec<u32> = Vec::new(&env);
+    ids.push_back(id_a);
+    ids.push_back(id_b);
+    assert_eq!(
+        client.try_cancel_auctions_batch(&seller, &ids),
+        Err(Ok(AuctionError::BidAlreadyPlaced))
+    );
+    // Nothing was cancelled by the failed batch.
+    assert!(!client.is_cancelled(&id_a));
+    assert!(!client.is_cancelled(&id_b));
+}
+
+/// Only the seller may batch cancel.
+#[test]
+fn test_cancel_auctions_batch_rejects_non_seller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let id = client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &0,
+        &None,
+        &None,
+    );
+
+    let mut ids: Vec<u32> = Vec::new(&env);
+    ids.push_back(id);
+    assert_eq!(
+        client.try_cancel_auctions_batch(&b1, &ids),
+        Err(Ok(AuctionError::NotAuthorized))
+    );
+    assert!(!client.is_cancelled(&id));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1297 — Dynamic anti-sniping extension window
+// ---------------------------------------------------------------------------
+
+/// A late bid inside the extension window extends `end_ledger` and emits
+/// `AuctionExtended`.
+#[test]
+fn test_late_bid_extends_and_emits_event() {
+    use soroban_sdk::{IntoVal, Symbol, testutils::Events as _};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    let window: u32 = 20;
+    client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &window,
+        &u32::MAX,
+        &0,
+        &0,
+        &None,
+        &None,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = deadline - 5);
+    client.bid(&b1, &1_000);
+
+    let info = client.get_info();
+    assert_eq!(info.deadline, deadline - 5 + window);
+
+    let (contract, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(contract, client.address);
+    let name: Symbol = topics.get(0).unwrap().into_val(&env);
+    assert_eq!(name, Symbol::new(&env, "AuctionExtended"));
+    let payload: AuctionExtended = data.into_val(&env);
+    assert_eq!(payload.old_deadline, deadline);
+    assert_eq!(payload.new_deadline, deadline - 5 + window);
+}
+
+/// An early bid outside the window leaves `end_ledger` untouched and emits no
+/// `AuctionExtended` event.
+#[test]
+fn test_early_bid_does_not_extend_or_emit() {
+    use soroban_sdk::{IntoVal, Symbol, testutils::Events as _};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    let window: u32 = 20;
+    client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &window,
+        &u32::MAX,
+        &0,
+        &0,
+        &None,
+        &None,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.bid(&b1, &1_000);
+
+    assert_eq!(client.get_info().deadline, deadline);
+    let extended = env.events().all().iter().any(|(_, topics, _)| {
+        let name: Symbol = topics.get(0).unwrap().into_val(&env);
+        name == Symbol::new(&env, "AuctionExtended")
+    });
+    assert!(!extended, "early bid must not emit AuctionExtended");
+}
+
+/// Extensions never push `end_ledger` past `max_deadline`.
+#[test]
+fn test_extension_capped_by_max_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, b2, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    let window: u32 = 20;
+    let max_deadline: u32 = 110;
+    client.start(
+        &seller,
+        &token,
+        &1_000,
+        &100,
+        &deadline,
+        &None,
+        &window,
+        &max_deadline,
+        &0,
+        &0,
+        &None,
+        &None,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = 95);
+    client.bid(&b1, &1_000);
+    assert_eq!(client.get_info().deadline, max_deadline);
+
+    env.ledger().with_mut(|l| l.sequence_number = 105);
+    client.bid(&b2, &1_100);
+    assert_eq!(client.get_info().deadline, max_deadline);
+}
