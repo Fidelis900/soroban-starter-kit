@@ -11,7 +11,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, Address, Env, String,
+    token, Address, BytesN, Env, String,
 };
 
 use soroban_swap_template::SwapContractClient;
@@ -188,6 +188,139 @@ fn bench_get_price(c: &mut Criterion) {
     group.finish();
 }
 
+/// Proposes an open swap with partial fills enabled and returns its id.
+fn propose_partial_swap(
+    env: &Env,
+    client: &SwapContractClient<'_>,
+    creator: &Address,
+    token_offered: &Address,
+    token_requested: &Address,
+    offer_amount: i128,
+    request_amount: i128,
+) -> u32 {
+    client.propose_swap(
+        creator,
+        token_offered,
+        token_requested,
+        &offer_amount,
+        &request_amount,
+        &true,  // allow_partial_fills
+        &None,  // hash_lock
+        &0_u64, // deadline
+    )
+}
+
+fn bench_fill_swap_partial(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swap_fill_swap_partial");
+
+    group.bench_function("fill_swap_partial", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup_swap();
+            let creator = Address::generate(&env);
+            let taker = Address::generate(&env);
+
+            let (token_offered, _) = create_token(&env, &admin, &creator, 1_000_000_000);
+            let (token_requested, _) = create_token(&env, &admin, &taker, 1_000_000_000);
+
+            client.initialize(&admin, &token_offered, &token_requested);
+
+            let swap_id = propose_partial_swap(
+                &env,
+                &client,
+                &creator,
+                &token_offered,
+                &token_requested,
+                1_000_000_i128,
+                1_000_000_i128,
+            );
+
+            client.fill_swap_partial(
+                black_box(&taker),
+                black_box(&swap_id),
+                black_box(&250_000_i128),
+            );
+
+            black_box(env.budget().cpu_instruction_cost());
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_cancel_swaps_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swap_cancel_swaps_batch");
+
+    group.bench_function("cancel_swaps_batch", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup_swap();
+            let creator = Address::generate(&env);
+
+            let (token_offered, _) = create_token(&env, &admin, &creator, 1_000_000_000);
+            let (token_requested, _) = create_token(&env, &admin, &creator, 1_000_000_000);
+
+            client.initialize(&admin, &token_offered, &token_requested);
+
+            let mut swap_ids = soroban_sdk::Vec::new(&env);
+            for _ in 0..5 {
+                let swap_id = propose_partial_swap(
+                    &env,
+                    &client,
+                    &creator,
+                    &token_offered,
+                    &token_requested,
+                    100_000_i128,
+                    100_000_i128,
+                );
+                swap_ids.push_back(swap_id);
+            }
+
+            client.cancel_swaps_batch(black_box(&creator), black_box(&swap_ids));
+
+            black_box(env.budget().cpu_instruction_cost());
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_execute_swap_with_referrer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swap_execute_swap_with_referrer");
+
+    group.bench_function("execute_swap_with_referrer", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup_swap();
+            let creator = Address::generate(&env);
+            let taker = Address::generate(&env);
+            let referrer = Address::generate(&env);
+
+            let (token_offered, _) = create_token(&env, &admin, &creator, 1_000_000_000);
+            let (token_requested, _) = create_token(&env, &admin, &taker, 1_000_000_000);
+
+            client.initialize(&admin, &token_offered, &token_requested);
+
+            let swap_id = propose_partial_swap(
+                &env,
+                &client,
+                &creator,
+                &token_offered,
+                &token_requested,
+                1_000_000_i128,
+                1_000_000_i128,
+            );
+
+            client.execute_swap(
+                black_box(&taker),
+                black_box(&swap_id),
+                black_box(&Some(referrer.clone())),
+            );
+
+            black_box(env.budget().cpu_instruction_cost());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_initialize,
@@ -196,5 +329,8 @@ criterion_group!(
     bench_remove_liquidity,
     bench_get_reserves,
     bench_get_price,
+    bench_fill_swap_partial,
+    bench_cancel_swaps_batch,
+    bench_execute_swap_with_referrer,
 );
 criterion_main!(benches);
