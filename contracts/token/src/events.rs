@@ -32,8 +32,9 @@ pub fn admin_changed(env: &Env, old_admin: &Address, new_admin: &Address) {
     );
 }
 
-/// Emitted when an allowance is approved.
-/// Topics: (Symbol, Address, Address) — event name, owner, spender
+/// Emitted when a new admin is proposed (two-step ownership transfer).
+/// Topics: (Symbol, Address) — event name, current admin
+/// Data: proposed (pending) admin
 pub fn admin_proposed(env: &Env, current_admin: &Address, pending_admin: &Address) {
     env.events().publish(
         (Symbol::new(env, "admin_proposed"), current_admin.clone()),
@@ -41,15 +42,69 @@ pub fn admin_proposed(env: &Env, current_admin: &Address, pending_admin: &Addres
     );
 }
 
+/// Emitted when the pending admin accepts ownership.
+/// Topics: (Symbol, Address) — event name, new admin
 pub fn admin_accepted(env: &Env, new_admin: &Address) {
     env.events()
         .publish((Symbol::new(env, "admin_accepted"), new_admin.clone()), ());
 }
 
+/// Emitted when a pending admin proposal is cancelled by the current admin.
+/// Topics: (Symbol, Address) — event name, admin
 pub fn admin_proposal_cancelled(env: &Env, admin: &Address) {
     env.events().publish(
         (Symbol::new(env, "admin_proposal_cancelled"), admin.clone()),
         (),
+    );
+}
+
+/// Emitted when a transfer lockup deadline is set for an account.
+/// Topics: (Symbol, Address) — event name, account
+/// Data: lock ledger (transfers are rejected until this ledger sequence)
+pub fn transfer_lock_set(env: &Env, account: &Address, lock_ledger: u32) {
+    env.events().publish(
+        (Symbol::new(env, "transfer_lock_set"), account.clone()),
+        lock_ledger,
+    );
+}
+
+/// Emitted when an allowance is increased.
+/// Topics: (Symbol, Address, Address) — event name, owner, spender
+/// Data: (delta, new allowance)
+pub fn allowance_increased(
+    env: &Env,
+    from: &Address,
+    spender: &Address,
+    delta: i128,
+    new_allowance: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "allowance_increased"),
+            from.clone(),
+            spender.clone(),
+        ),
+        (delta, new_allowance),
+    );
+}
+
+/// Emitted when an allowance is decreased.
+/// Topics: (Symbol, Address, Address) — event name, owner, spender
+/// Data: (delta, new allowance)
+pub fn allowance_decreased(
+    env: &Env,
+    from: &Address,
+    spender: &Address,
+    delta: i128,
+    new_allowance: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "allowance_decreased"),
+            from.clone(),
+            spender.clone(),
+        ),
+        (delta, new_allowance),
     );
 }
 

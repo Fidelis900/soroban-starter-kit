@@ -76,6 +76,10 @@ pub fn swap_cancelled_batch(env: &Env, creator: &Address, swap_ids: &Vec<u32>) {
     env.events().publish(
         (Symbol::new(env, "cancelled_batch"), creator.clone()),
         swap_ids.clone(),
+pub fn swap_expired(env: &Env, swap_id: u32, creator: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "swap_expired"), creator.clone()),
+        swap_id,
     );
 }
 

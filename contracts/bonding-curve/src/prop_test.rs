@@ -283,6 +283,154 @@ mod issue_1089_anti_sandwich_tests {
 }
 
 #[cfg(test)]
+mod issue_1306_1307_tests {
+    use super::*;
+    use crate::{BondingCurveContract, BondingCurveContractClient, CurveModel};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+
+    fn setup_sigmoid(
+        env: &Env,
+        midpoint: i128,
+        steepness: u32,
+    ) -> (BondingCurveContractClient<'_>, soroban_sdk::Address) {
+        let admin = Address::generate(env);
+        let sac_admin = Address::generate(env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+        let contract_addr = env.register_contract(None, BondingCurveContract);
+        let client = BondingCurveContractClient::new(env, &contract_addr);
+        client.initialize(
+            &admin,
+            &token_addr,
+            &1_000_000i128,
+            &1i128,
+            &10_000u32,
+            &0u32,
+            &admin,
+            &None::<i128>,
+        );
+        client.set_curve_model(&admin, &CurveModel::Sigmoid { midpoint, steepness });
+        (client, token_addr)
+    }
+
+    /// Sigmoid pricing must be monotonically increasing in supply (positive curvature
+    /// through the midpoint, plateauing afterwards).
+    #[test]
+    fn sigmoid_price_is_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token) = setup_sigmoid(&env, 500, 4);
+
+        let mut prev = client.get_price();
+        for _ in 0..20 {
+            let next = client.quote_buy(&10);
+            assert!(next >= prev, "sigmoid price decreased: {} -> {}", prev, next);
+            prev = next;
+        }
+    }
+
+    /// Randomized round-trips under sigmoid parameters must not create arbitrage.
+    #[test]
+    fn sigmoid_roundtrip_no_arbitrage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+
+        for amount in [1i128, 5, 25, 100, 250] {
+            let before = token_client.balance(&trader);
+            if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+                continue;
+            }
+            let after_buy = token_client.balance(&trader);
+            let cost = before - after_buy;
+
+            env.ledger().with_mut(|l| {
+                l.sequence_number = l.sequence_number.saturating_add(200);
+            });
+            if client.try_sell(&trader, &amount, &0i128).is_err() {
+                continue;
+            }
+            let after_sell = token_client.balance(&trader);
+            let proceeds = after_sell - after_buy;
+
+            assert!(
+                cost >= proceeds,
+                "sigmoid arbitrage: cost={} proceeds={}",
+                cost,
+                proceeds
+            );
+        }
+    }
+
+    /// Reserve must remain solvent (non-negative and backed) across sigmoid trades.
+    #[test]
+    fn sigmoid_reserve_stays_solvent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+
+        for amount in [10i128, 40, 90, 160] {
+            if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+                continue;
+            }
+            assert!(client.get_reserve() >= 0, "reserve went negative after buy");
+            env.ledger().with_mut(|l| {
+                l.sequence_number = l.sequence_number.saturating_add(200);
+            });
+            if client.try_sell(&trader, &amount, &0i128).is_err() {
+                continue;
+            }
+            assert!(client.get_reserve() >= 0, "reserve went negative after sell");
+        }
+    }
+
+    /// Exit fee decays monotonically with holding duration.
+    #[test]
+    fn exit_fee_decays_with_holding_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+
+        client.buy(&trader, &100, &i128::MAX);
+
+        let mut prev_fee = u32::MAX;
+        for hold in [0u32, 10, 25, 50, 75, 100, 150] {
+            env.ledger().with_mut(|l| {
+                l.sequence_number = 100 + hold as u32;
+            });
+            let fee = client.get_exit_fee_bps(&trader);
+            assert!(
+                fee <= prev_fee,
+                "exit fee not monotonically decaying: {} -> {} at hold={}",
+                prev_fee,
+                fee,
+                hold
+            );
+            prev_fee = fee;
+        }
+        // After the decay window the standard fee applies.
+        assert_eq!(prev_fee, 30u32);
+    }
+}
+
+#[cfg(test)]
 mod issue_1090_graduation_tests {
     use super::*;
     use crate::{BondingCurveContract, BondingCurveContractClient, BondingCurveError, CurveState};

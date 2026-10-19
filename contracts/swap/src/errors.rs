@@ -29,6 +29,9 @@ pub enum SwapError {
     NotCreator = 20,
     EmptyBatch = 21,
     SecretNotRevealed = 22,
+    FeeZeroNotAllowed = 12,
+    ExecutionDelayExceeded = 13,
+    SwapExpired = 15,
 }
 
 impl_display_error!(
@@ -55,6 +58,7 @@ impl_display_error!(
     NotCreator             => "caller is not the swap creator",
     EmptyBatch             => "batch must contain at least one swap",
     SecretNotRevealed      => "secret has not been revealed",
+    SwapExpired            => "swap has expired",
 );
 
 #[cfg(test)]
@@ -83,6 +87,7 @@ SwapError::HashLockMismatch = {}\n\
 SwapError::NotCreator = {}\n\
 SwapError::EmptyBatch = {}\n\
 SwapError::SecretNotRevealed = {}\n",
+SwapError::SwapExpired = {}\n",
             SwapError::NotAuthorized as u32,
             SwapError::SwapNotFound as u32,
             SwapError::InvalidState as u32,
@@ -97,6 +102,7 @@ SwapError::SecretNotRevealed = {}\n",
             SwapError::NotCreator as u32,
             SwapError::EmptyBatch as u32,
             SwapError::SecretNotRevealed as u32,
+            SwapError::SwapExpired as u32,
         )
     }
 

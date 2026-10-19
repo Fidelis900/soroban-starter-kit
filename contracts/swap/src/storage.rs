@@ -28,6 +28,7 @@ pub enum SwapState {
     Executed = 1,
     Accepted = 1,
     Cancelled = 2,
+    Expired = 3,
 }
 
 impl core::fmt::Display for SwapState {
@@ -37,6 +38,7 @@ impl core::fmt::Display for SwapState {
             SwapState::Executed => "executed",
             SwapState::Accepted => "accepted",
             SwapState::Cancelled => "cancelled",
+            SwapState::Expired => "expired",
         })
     }
 }

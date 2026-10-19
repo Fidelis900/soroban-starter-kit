@@ -1,5 +1,4 @@
 #![no_std]
-#![no_std]
 #![deny(missing_docs)]
 //! Bonding-curve token sale contract template.
 //!
@@ -24,7 +23,7 @@ use storage::{BPS_DENOMINATOR, MAX_FEE_BPS, MIN_CONNECTOR_WEIGHT_BPS};
 
 use soroban_common::math::{FixedPoint, FixedPointError, apply_bps_fee};
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance};
-use storage::{BUY_COOLDOWN_LEDGERS, CurveState, MAX_BUYS_PER_LEDGER};
+use storage::{BUY_COOLDOWN_LEDGERS, MAX_BUYS_PER_LEDGER};
 
 impl From<FixedPointError> for BondingCurveError {
     fn from(_: FixedPointError) -> Self {
@@ -91,7 +90,11 @@ fn calculate_price(
     if reserve <= 0 || supply <= 0 {
         return Ok(linear);
     }
-    let reserve_price = FixedPoint::mul_div(reserve, PRICE_SCALE, supply)?;
+    let reserve_price = reserve
+        .checked_mul(PRICE_SCALE)
+        .ok_or(BondingCurveError::Overflow)?
+        .checked_div(supply)
+        .ok_or(BondingCurveError::Overflow)?;
     Ok(linear.max(reserve_price))
 }
 
@@ -946,6 +949,32 @@ mod test {
     fn test_buy_cost_bootstrap_is_non_zero() {
         let cost = buy_cost(0, 0, 100, 1, 1_000_000, 10_000).unwrap();
         assert!(cost > 0);
+    }
+
+    #[test]
+    fn test_calculate_price_spot_across_supply_points() {
+        // With no reserve, price follows the linear curve b + m*S.
+        let base = 1 * PRICE_SCALE;
+        let slope = 1 * PRICE_SCALE;
+        let p0 = calculate_price(0, 0, base, slope).unwrap();
+        let p1 = calculate_price(0, 1, base, slope).unwrap();
+        let p10 = calculate_price(0, 10, base, slope).unwrap();
+        let p1000 = calculate_price(0, 1000, base, slope).unwrap();
+        assert_eq!(p0, base);
+        assert_eq!(p1, base + slope);
+        assert_eq!(p10, base + 10 * slope);
+        assert_eq!(p1000, base + 1000 * slope);
+        assert!(p0 < p1 && p1 < p10 && p10 < p1000);
+
+        // With reserve, price is the max of linear and reserve/supply.
+        let reserve = 1_000 * PRICE_SCALE;
+        let r1 = calculate_price(reserve, 1, base, slope).unwrap();
+        let r10 = calculate_price(reserve, 10, base, slope).unwrap();
+        let r1000 = calculate_price(reserve, 1000, base, slope).unwrap();
+        assert_eq!(r1, reserve);
+        assert_eq!(r10, reserve / 10);
+        assert_eq!(r1000, reserve / 1000);
+        assert!(r1 > r10 && r10 > r1000);
     }
 
     #[test]
