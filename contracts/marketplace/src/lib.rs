@@ -24,7 +24,7 @@ mod storage;
 
 pub use errors::MarketplaceError;
 pub use storage::{DataKey, Listing, ListingEntry, ListingPage, ListingParams};
-pub use storage::{CollectionOffer, DataKey, Listing, ListingEntry, ListingPage};
+pub use storage::{CollectionOffer, DataKey, Listing, ListingEntry, ListingPage, Offer};
 
 /// Maximum number of listings a single [`MarketplaceContract::get_active_listings`] call
 /// may return, regardless of the requested `limit`.
@@ -36,6 +36,19 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// Maximum number of recipients in a marketplace royalty split, bounding the
 /// number of token transfers a single sale performs.
 pub const MAX_ROYALTY_RECIPIENTS: u32 = 10;
+
+/// Minimum staked balance (in stroops) required for the first fee-discount tier.
+pub const STAKING_TIER_1_THRESHOLD: i128 = 1_000_0000000;
+/// Minimum staked balance (in stroops) required for the second fee-discount tier.
+pub const STAKING_TIER_2_THRESHOLD: i128 = 10_000_0000000;
+/// Minimum staked balance (in stroops) required for the top fee-discount tier.
+pub const STAKING_TIER_3_THRESHOLD: i128 = 100_000_0000000;
+/// Fee discount (in basis points) applied at tier 1 (20% off).
+pub const STAKING_TIER_1_DISCOUNT_BPS: u32 = 2_000;
+/// Fee discount (in basis points) applied at tier 2 (35% off).
+pub const STAKING_TIER_2_DISCOUNT_BPS: u32 = 3_500;
+/// Fee discount (in basis points) applied at tier 3 (50% off).
+pub const STAKING_TIER_3_DISCOUNT_BPS: u32 = 5_000;
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
 
@@ -101,6 +114,13 @@ mod contract {
         fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u32);
         fn owner_of(env: Env, token_id: u32) -> Address;
         fn royalty_info(env: Env, token_id: u32, sale_price: i128) -> Option<RoyaltyInfo>;
+    }
+
+    /// Minimal interface we need from an optional staking contract to compute
+    /// fee-discount tiers for stakers.
+    #[contractclient(name = "StakingClient")]
+    pub trait StakingInterface {
+        fn staked_balance(env: Env, user: Address) -> i128;
     }
 
     /// NFT marketplace contract.
@@ -234,6 +254,88 @@ mod contract {
 
             events::whitelist_enabled(&env, enabled);
             Ok(())
+        }
+
+        /// Configure (or clear, with `None`) the optional staking contract used to
+        /// compute fee-discount tiers for stakers. Only the admin may call this.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::NotAuthorized`] if `admin` is not the marketplace admin.
+        pub fn set_staking_contract(
+            env: Env,
+            admin: Address,
+            staking_contract: Option<Address>,
+        ) -> Result<(), MarketplaceError> {
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(MarketplaceError::NotInitialized)?;
+            if admin != stored_admin {
+                return Err(MarketplaceError::NotAuthorized);
+            }
+
+            admin.require_auth();
+
+            match staking_contract {
+                Some(addr) => env
+                    .storage()
+                    .instance()
+                    .set(&DataKey::StakingContract, &addr),
+                None => env.storage().instance().remove(&DataKey::StakingContract),
+            }
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Return the configured staking contract, or `None` if not set.
+        pub fn get_staking_contract(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::StakingContract)
+        }
+
+        /// Set the minimum percentage increment (in basis points) that a new offer
+        /// must exceed the current highest offer on a listing by. Only the admin may
+        /// call this. A value of `0` disables the requirement.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::NotAuthorized`] if `admin` is not the marketplace admin.
+        /// Returns [`MarketplaceError::InvalidRoyalty`] if `bps > 10_000`.
+        pub fn set_min_counter_offer_bps(
+            env: Env,
+            admin: Address,
+            bps: u32,
+        ) -> Result<(), MarketplaceError> {
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(MarketplaceError::NotInitialized)?;
+            if admin != stored_admin {
+                return Err(MarketplaceError::NotAuthorized);
+            }
+            if bps > 10_000 {
+                return Err(MarketplaceError::InvalidRoyalty);
+            }
+
+            admin.require_auth();
+
+            env.storage()
+                .instance()
+                .set(&DataKey::MinCounterOfferBps, &bps);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Return the configured minimum counter-offer increment in basis points.
+        pub fn get_min_counter_offer_bps(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::MinCounterOfferBps)
+                .unwrap_or(0)
         }
 
         /// Return whether the payment-token whitelist is enforced on new listings.
@@ -751,11 +853,15 @@ mod contract {
         /// Returns [`MarketplaceError::ListingNotFound`] if the listing does not exist.
         /// Returns [`MarketplaceError::ListingInactive`] if already sold or cancelled.
         /// Returns [`MarketplaceError::InvalidOfferAmount`] if `amount <= 0` or `amount >= price`.
+        /// Returns [`MarketplaceError::InvalidExpiry`] if `expiration_ledger` is not in the future.
+        /// Returns [`MarketplaceError::CounterOfferTooLow`] if a higher offer already exists on
+        /// the listing and `amount` does not exceed it by the configured minimum increment.
         pub fn make_offer(
             env: Env,
             buyer: Address,
             listing_id: u64,
             amount: i128,
+            expiration_ledger: u32,
         ) -> Result<(), MarketplaceError> {
             if !env.storage().instance().has(&DataKey::Admin) {
                 return Err(MarketplaceError::NotInitialized);
@@ -774,6 +880,21 @@ mod contract {
             if amount <= 0 || amount >= listing.price {
                 return Err(MarketplaceError::InvalidOfferAmount);
             }
+            if expiration_ledger <= env.ledger().sequence() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+
+            // Enforce the minimum counter-offer increment over the current highest offer
+            // on this listing, if one exists and the requirement is enabled.
+            let min_bps = Self::get_min_counter_offer_bps(env.clone());
+            if min_bps > 0
+                && let Some(highest) = Self::highest_offer(&env, listing_id)
+            {
+                let min_required = Self::min_counter_offer_amount(highest, min_bps)?;
+                if amount < min_required {
+                    return Err(MarketplaceError::CounterOfferTooLow);
+                }
+            }
 
             let tok = token::Client::new(&env, &listing.payment_token);
             let offer_key = DataKey::Offer(listing_id, buyer.clone());
@@ -784,6 +905,7 @@ mod contract {
                 .storage()
                 .persistent()
                 .get(&offer_key)
+                .map(|o: Offer| o.amount)
                 .unwrap_or(0i128);
 
             #[allow(clippy::arithmetic_side_effects)]
@@ -803,11 +925,111 @@ mod contract {
                 }
             }
 
-            env.storage().persistent().set(&offer_key, &amount);
+            let offer = Offer {
+                amount,
+                expiration_ledger,
+            };
+            env.storage().persistent().set(&offer_key, &offer);
             bump_offer(&env, listing_id, &buyer);
+
+            // Track the highest offer on this listing for the counter-offer increment check.
+            let current_highest = Self::highest_offer(&env, listing_id).unwrap_or(0);
+            if amount > current_highest {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::HighestOffer(listing_id), &amount);
+            }
+
             bump_instance(&env);
 
             events::offer_made(&env, listing_id, &buyer, amount);
+            Ok(())
+        }
+
+        /// Create escrowed offers on several listings in one transaction, transferring the
+        /// total escrow in a single token transfer per payment token.
+        ///
+        /// `token_ids` and `prices` must have the same length; each pair creates (or updates)
+        /// an offer on the listing for that token, all sharing `expiration_ledger`. All-or-nothing:
+        /// if any item is invalid, no offer is created.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::EmptyBatch`] if `token_ids` is empty.
+        /// Returns [`MarketplaceError::BatchTooLarge`] if `token_ids` exceeds [`MAX_BATCH_SIZE`].
+        /// Returns [`MarketplaceError::InvalidOfferAmount`] if the lengths differ.
+        /// Otherwise the same errors as [`Self::make_offer`] for the first failing item.
+        pub fn make_offers_batch(
+            env: Env,
+            buyer: Address,
+            token_ids: Vec<u32>,
+            prices: Vec<i128>,
+            expiration: u32,
+        ) -> Result<(), MarketplaceError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+            Self::check_batch_len(token_ids.len())?;
+            if token_ids.len() != prices.len() {
+                return Err(MarketplaceError::InvalidOfferAmount);
+            }
+            if expiration <= env.ledger().sequence() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+
+            buyer.require_auth();
+
+            // Validate every item and aggregate the total escrow required, per payment token.
+            // We assume a single payment token for the batch (the default token) to allow a
+            // single transfer; listings priced in other tokens are rejected.
+            let default_token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::PaymentToken)
+                .ok_or(MarketplaceError::NotInitialized)?;
+
+            let mut total: i128 = 0;
+            for i in 0..token_ids.len() {
+                let token_id = token_ids.get(i).unwrap();
+                let amount = prices.get(i).unwrap();
+                let listing = Self::find_listing_by_token(&env, token_id)?;
+                if !listing.active {
+                    return Err(MarketplaceError::ListingInactive);
+                }
+                if amount <= 0 || amount >= listing.price {
+                    return Err(MarketplaceError::InvalidOfferAmount);
+                }
+                if listing.payment_token != default_token {
+                    return Err(MarketplaceError::PaymentTokenNotAllowed);
+                }
+                total = total
+                    .checked_add(amount)
+                    .ok_or(MarketplaceError::InvalidOfferAmount)?;
+            }
+
+            // Single escrow transfer for the whole batch.
+            token::Client::new(&env, &default_token).transfer(
+                &buyer,
+                &env.current_contract_address(),
+                &total,
+            );
+
+            // Store each offer.
+            for i in 0..token_ids.len() {
+                let token_id = token_ids.get(i).unwrap();
+                let amount = prices.get(i).unwrap();
+                let listing = Self::find_listing_by_token(&env, token_id)?;
+                let offer_key = DataKey::Offer(listing.id, buyer.clone());
+                let offer = Offer {
+                    amount,
+                    expiration_ledger: expiration,
+                };
+                env.storage().persistent().set(&offer_key, &offer);
+                bump_offer(&env, listing.id, &buyer);
+                events::offer_made(&env, listing.id, &buyer, amount);
+            }
+
+            bump_instance(&env);
             Ok(())
         }
 
@@ -853,11 +1075,15 @@ mod contract {
 
             // Re-check the escrowed offer at accept time.
             let offer_key = DataKey::Offer(listing_id, buyer.clone());
-            let amount: i128 = env
+            let offer: Offer = env
                 .storage()
                 .persistent()
                 .get(&offer_key)
                 .ok_or(MarketplaceError::OfferNotFound)?;
+            if env.ledger().sequence() > offer.expiration_ledger {
+                return Err(MarketplaceError::OfferExpired);
+            }
+            let amount = offer.amount;
 
             if !Self::seller_owns(&env, &listing) {
                 return Err(MarketplaceError::SellerNotOwner);
@@ -936,7 +1162,7 @@ mod contract {
                 .ok_or(MarketplaceError::ListingNotFound)?;
 
             let offer_key = DataKey::Offer(listing_id, buyer.clone());
-            let amount: i128 = env
+            let offer: Offer = env
                 .storage()
                 .persistent()
                 .get(&offer_key)
@@ -948,10 +1174,59 @@ mod contract {
             token::Client::new(&env, &listing.payment_token).transfer(
                 &env.current_contract_address(),
                 &buyer,
-                &amount,
+                &offer.amount,
             );
 
             events::offer_cancelled(&env, listing_id, &buyer);
+            Ok(())
+        }
+
+        /// Permissionlessly expire an offer whose `expiration_ledger` has passed, refunding
+        /// the escrowed amount to the buyer in the listing's payment token. Anyone may call
+        /// this once the offer has expired.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::ListingNotFound`] if the listing does not exist.
+        /// Returns [`MarketplaceError::OfferNotFound`] if `buyer` has no active offer on this listing.
+        /// Returns [`MarketplaceError::OfferNotExpired`] if the offer has not yet expired.
+        pub fn expire_offer(
+            env: Env,
+            listing_id: u64,
+            buyer: Address,
+        ) -> Result<(), MarketplaceError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(MarketplaceError::NotInitialized);
+            }
+
+            let listing: Listing = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Listing(listing_id))
+                .ok_or(MarketplaceError::ListingNotFound)?;
+
+            let offer_key = DataKey::Offer(listing_id, buyer.clone());
+            let offer: Offer = env
+                .storage()
+                .persistent()
+                .get(&offer_key)
+                .ok_or(MarketplaceError::OfferNotFound)?;
+            if env.ledger().sequence() <= offer.expiration_ledger {
+                return Err(MarketplaceError::OfferNotExpired);
+            }
+
+            // Clear the offer before transferring.
+            env.storage().persistent().remove(&offer_key);
+            bump_instance(&env);
+
+            token::Client::new(&env, &listing.payment_token).transfer(
+                &env.current_contract_address(),
+                &buyer,
+                &offer.amount,
+            );
+
+            events::offer_expired(&env, listing_id, &buyer, offer.amount);
             Ok(())
         }
 
@@ -1001,16 +1276,16 @@ mod contract {
             let mut refunded: u32 = 0;
             for buyer in buyers.iter() {
                 let offer_key = DataKey::Offer(listing_id, buyer.clone());
-                let Some(amount) = env.storage().persistent().get::<_, i128>(&offer_key) else {
+                let Some(offer) = env.storage().persistent().get::<_, Offer>(&offer_key) else {
                     continue;
                 };
 
                 // Clear the offer before transferring so a duplicate buyer in `buyers`
                 // cannot be refunded twice.
                 env.storage().persistent().remove(&offer_key);
-                tok.transfer(&env.current_contract_address(), &buyer, &amount);
+                tok.transfer(&env.current_contract_address(), &buyer, &offer.amount);
 
-                events::offer_refunded(&env, listing_id, &buyer, amount);
+                events::offer_refunded(&env, listing_id, &buyer, offer.amount);
                 refunded = refunded.saturating_add(1);
             }
 
@@ -1258,8 +1533,8 @@ mod contract {
                 .get(&DataKey::Listing(listing_id))
         }
 
-        /// Return the escrowed offer amount from `buyer` on `listing_id`, or `None` if none exists.
-        pub fn get_offer(env: Env, listing_id: u64, buyer: Address) -> Option<i128> {
+        /// Return the escrowed offer from `buyer` on `listing_id`, or `None` if none exists.
+        pub fn get_offer(env: Env, listing_id: u64, buyer: Address) -> Option<Offer> {
             env.storage()
                 .persistent()
                 .get(&DataKey::Offer(listing_id, buyer))
@@ -1339,6 +1614,84 @@ mod contract {
             Ok((royalty_bps, royalty_recipient))
         }
 
+        /// Compute the fee-discount basis points for `user` based on their staked balance
+        /// in the configured staking contract. Returns `0` if no staking contract is set or
+        /// the user's balance is below the first tier.
+        fn fee_discount_bps(env: &Env, user: &Address) -> u32 {
+            let Some(staking) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&DataKey::StakingContract)
+            else {
+                return 0;
+            };
+
+            let balance = match StakingClient::new(env, &staking).try_staked_balance(user) {
+                Ok(Ok(b)) => b,
+                _ => return 0,
+            };
+
+            if balance >= STAKING_TIER_3_THRESHOLD {
+                STAKING_TIER_3_DISCOUNT_BPS
+            } else if balance >= STAKING_TIER_2_THRESHOLD {
+                STAKING_TIER_2_DISCOUNT_BPS
+            } else if balance >= STAKING_TIER_1_THRESHOLD {
+                STAKING_TIER_1_DISCOUNT_BPS
+            } else {
+                0
+            }
+        }
+
+        /// Return the highest current offer amount on `listing_id`, scanning the known
+        /// offer keys. Returns `None` if no offers exist.
+        fn highest_offer(env: &Env, listing_id: u64) -> Option<i128> {
+            // The contract does not maintain a per-listing offer index, so the highest
+            // offer is tracked via the `HighestOffer` key updated on each `make_offer`.
+            env.storage()
+                .persistent()
+                .get(&DataKey::HighestOffer(listing_id))
+        }
+
+        /// Compute the minimum acceptable counter-offer amount given the current highest
+        /// offer and the required increment in basis points.
+        fn min_counter_offer_amount(
+            highest: i128,
+            min_bps: u32,
+        ) -> Result<i128, MarketplaceError> {
+            let numerator = highest
+                .checked_mul(i128::from(10_000u32) + i128::from(min_bps))
+                .ok_or(MarketplaceError::InvalidOfferAmount)?;
+            let min_required = numerator
+                .checked_div(10_000)
+                .ok_or(MarketplaceError::InvalidOfferAmount)?;
+            Ok(min_required)
+        }
+
+        /// Find the active listing for `token_id` (the most recent one). Used by batch offer
+        /// creation where callers reference tokens rather than listing IDs.
+        fn find_listing_by_token(env: &Env, token_id: u32) -> Result<Listing, MarketplaceError> {
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextListingId)
+                .unwrap_or(0);
+            let mut found: Option<Listing> = None;
+            let mut id = 0u64;
+            while id < next_id {
+                if let Some(listing) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Listing>(&DataKey::Listing(id))
+                    && listing.token_id == token_id
+                    && listing.active
+                {
+                    found = Some(listing);
+                }
+                id = id.saturating_add(1);
+            }
+            found.ok_or(MarketplaceError::ListingNotFound)
+        }
+
         fn write_token_allowed(env: &Env, token: &Address, allowed: bool) {
             let key = DataKey::AllowedToken(token.clone());
             if allowed {
@@ -1402,6 +1755,7 @@ mod contract {
             nft_contract: &Address,
             token_id: u32,
             sale_price: i128,
+            discount_bps: u32,
         ) -> Vec<(Address, i128)> {
             let mut payments = Vec::new(env);
             if let Some(nft_royalty) = NftClient::new(env, nft_contract)
@@ -1436,10 +1790,19 @@ mod contract {
             };
 
             for (recipient, bps) in splits.iter() {
+                // Apply the staker fee discount to the marketplace royalty share.
+                let effective_bps = if discount_bps > 0 {
+                    #[allow(clippy::arithmetic_side_effects)]
+                    let reduced = bps.saturating_sub(bps.saturating_mul(discount_bps) / 10_000);
+                    reduced
+                } else {
+                    bps
+                };
                 // Floor-rounded via the audited fixed-point primitive; rounding dust
                 // stays with the seller.
-                let amount = soroban_common::math::mul_div(sale_price, i128::from(bps), 10_000)
-                    .unwrap_or(0);
+                let amount =
+                    soroban_common::math::mul_div(sale_price, i128::from(effective_bps), 10_000)
+                        .unwrap_or(0);
                 payments.push_back((recipient, amount));
             }
             payments
@@ -1458,7 +1821,10 @@ mod contract {
             token_id: u32,
             price: i128,
         ) {
-            let royalties = Self::resolve_royalty(env, nft_contract, token_id, price);
+            // Apply any staker fee discount to the marketplace royalty portion.
+            let discount_bps = Self::fee_discount_bps(env, seller);
+            let royalties =
+                Self::resolve_royalty(env, nft_contract, token_id, price, discount_bps);
             let mut royalty_total: i128 = 0;
             for (_, amount) in royalties.iter() {
                 royalty_total = royalty_total.saturating_add(amount);

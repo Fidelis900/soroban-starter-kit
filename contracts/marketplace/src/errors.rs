@@ -28,6 +28,9 @@ pub enum MarketplaceError {
     PriceExceedsMax = 13,
     CollectionOfferNotFound = 14,
     CollectionOfferExpired = 15,
+    OfferExpired = 16,
+    CounterOfferTooLow = 17,
+    InvalidMinCounterOfferBps = 18,
 }
 
 impl_display_error!(
@@ -53,6 +56,9 @@ impl_display_error!(
     PriceExceedsMax     => "listing price exceeds buyer max price",
     CollectionOfferNotFound => "collection offer not found",
     CollectionOfferExpired  => "collection offer expired",
+    OfferExpired        => "offer expired",
+    CounterOfferTooLow  => "counter offer below minimum increment",
+    InvalidMinCounterOfferBps => "invalid minimum counter offer bps",
 );
 
 #[cfg(test)]
@@ -87,7 +93,10 @@ MarketplaceError::ListingStillActive = {}\n\
 MarketplaceError::Reentrant = {}\n",
 MarketplaceError::PriceExceedsMax = {}\n\
 MarketplaceError::CollectionOfferNotFound = {}\n\
-MarketplaceError::CollectionOfferExpired = {}\n",
+MarketplaceError::CollectionOfferExpired = {}\n\
+MarketplaceError::OfferExpired = {}\n\
+MarketplaceError::CounterOfferTooLow = {}\n\
+MarketplaceError::InvalidMinCounterOfferBps = {}\n",
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
             MarketplaceError::NotAuthorized as u32,
@@ -109,6 +118,9 @@ MarketplaceError::CollectionOfferExpired = {}\n",
             MarketplaceError::PriceExceedsMax as u32,
             MarketplaceError::CollectionOfferNotFound as u32,
             MarketplaceError::CollectionOfferExpired as u32,
+            MarketplaceError::OfferExpired as u32,
+            MarketplaceError::CounterOfferTooLow as u32,
+            MarketplaceError::InvalidMinCounterOfferBps as u32,
         )
     }
 

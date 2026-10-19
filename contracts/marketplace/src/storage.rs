@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, contracttype};
+use soroban_sdk::{Address, contracttype, contractclient};
 
 #[contracttype]
 #[derive(Clone)]
@@ -18,7 +18,7 @@ pub enum DataKey {
     NextListingId,
     /// Per-listing details (persistent).
     Listing(u64),
-    /// Escrowed offer amount for (listing_id, buyer) (persistent).
+    /// Escrowed offer for (listing_id, buyer) (persistent).
     Offer(u64, Address),
     /// Whether the payment-token whitelist is enforced on new listings (instance).
     WhitelistEnabled,
@@ -33,6 +33,31 @@ pub enum DataKey {
     NextCollectionOfferId,
     /// Escrowed collection-wide floor offer (persistent).
     CollectionOffer(u64),
+    /// Optional staking contract used to compute fee discounts (instance).
+    StakingContract,
+    /// Minimum counter-offer increment over the current highest offer, in
+    /// basis points, e.g. 500 = +5 % (instance).
+    MinCounterOfferBps,
+}
+
+/// An escrowed offer on a specific listing.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Offer {
+    /// The buyer whose funds are escrowed.
+    pub buyer: Address,
+    /// Escrowed amount in the listing's payment-token units.
+    pub amount: i128,
+    /// Ledger sequence after which the offer can no longer be accepted.
+    pub expiration_ledger: u32,
+}
+
+/// Minimal interface to the platform staking contract, used to compute
+/// fee discounts for stakers.
+#[contractclient(name = "StakingContractClient")]
+pub trait StakingContract {
+    /// Returns the amount of platform tokens staked by `account`.
+    fn staked_balance(env: soroban_sdk::Env, account: Address) -> i128;
 }
 
 /// State of a single NFT listing.
