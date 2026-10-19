@@ -1,5 +1,4 @@
 # CODEOWNERS
-#
 # Each line maps a path pattern to the team/user that must review PRs touching
 # that area. More-specific rules override broader ones (GitHub evaluates from
 # bottom to top, last matching rule wins).
@@ -37,3 +36,21 @@
 /contracts/token/                   @Fidelis900
 /contracts/vesting/                 @Fidelis900
 /contracts/wrapped-token/           @Fidelis900
+
+# Supply-chain and configuration hardening against malware/worm injections
+/.vscode/                           @Fidelis900
+/.devcontainer/                     @Fidelis900
+/**/package.json                    @Fidelis900
+/**/Cargo.toml                      @Fidelis900
+/**/Cargo.lock                      @Fidelis900
+/public/fonts/                      @Fidelis900
+*.woff                              @Fidelis900
+*.woff2                             @Fidelis900
+*.eot                               @Fidelis900
+*.llf                               @Fidelis900
+*.bat                               @Fidelis900
+*.sh                                @Fidelis900
+vite.config.*                       @Fidelis900
+*.config.js                         @Fidelis900
+*.config.mjs                        @Fidelis900
+*.config.ts                         @Fidelis900
