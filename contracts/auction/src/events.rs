@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, Env, Symbol, contracttype};
+use soroban_sdk::{Address, Env, Symbol, Vec, contracttype};
 
 /// Payload of the `cancelled_with_compensation` event, emitted when the seller
 /// cancels inside the grace window after at least one bid has been placed.
@@ -80,6 +80,15 @@ pub fn deadline_extended(env: &Env, new_deadline: u32) {
         .publish((Symbol::new(env, "deadline_extended"),), new_deadline);
 }
 
+/// Emitted when a late bid triggers an anti-sniping extension of the auction
+/// deadline, identifying the affected auction and its new `end_ledger`.
+pub fn auction_extended(env: &Env, auction_id: u32, new_deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "auction_extended"), auction_id),
+        new_deadline,
+    );
+}
+
 pub fn max_deadline_reached(env: &Env, max_deadline: u32) {
     env.events()
         .publish((Symbol::new(env, "max_deadline_reached"),), max_deadline);
@@ -88,6 +97,14 @@ pub fn max_deadline_reached(env: &Env, max_deadline: u32) {
 pub fn cancelled(env: &Env, seller: &Address) {
     env.events()
         .publish((Symbol::new(env, "cancelled"), seller.clone()), ());
+}
+
+/// Emitted when a seller cancels several unbid auctions in a single call.
+pub fn cancelled_batch(env: &Env, seller: &Address, auction_ids: &Vec<u32>) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled_batch"), seller.clone()),
+        auction_ids.clone(),
+    );
 }
 
 pub fn cancelled_with_compensation(

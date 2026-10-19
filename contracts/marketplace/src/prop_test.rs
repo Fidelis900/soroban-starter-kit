@@ -206,6 +206,184 @@ proptest! {
         prop_assert_eq!(listing1.unwrap().price, price, "Price mismatch on first read");
         prop_assert_eq!(listing2.unwrap().price, price, "Price mismatch on second read");
     }
+
+    /// Property: Dutch auction spot price is monotonically non-increasing over
+    /// ledgers and always stays within `[end_price, start_price]`.
+    #[test]
+    fn prop_dutch_price_decays_monotonically(
+        start_price in 1_000i128..=1_000_000i128,
+        decay in 0i128..=1_000i128,
+        duration in 1u32..=100u32,
+        step in 1u32..=10u32,
+    ) {
+        let end_price = start_price - decay.min(start_price);
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let royalty_recipient = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let sac_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+
+        let marketplace_addr = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, &marketplace_addr);
+        client.initialize(&admin, &token_addr, &250u32, &royalty_recipient);
+
+        let nft_addr = Address::generate(&env);
+        let start_ledger = env.ledger().sequence();
+        let end_ledger = start_ledger + duration;
+
+        let listing_id = client.list_dutch(
+            &seller,
+            &nft_addr,
+            &1u32,
+            &start_price,
+            &end_price,
+            &start_ledger,
+            &end_ledger,
+        );
+
+        let mut prev = client.current_price(&listing_id);
+        prop_assert!(prev <= start_price, "price above start_price: {}", prev);
+        prop_assert!(prev >= end_price, "price below end_price: {}", prev);
+
+        // Walk forward through the auction window in `step`-sized jumps.
+        let mut elapsed = 0u32;
+        while elapsed < duration {
+            env.ledger().with_mut(|l| l.sequence_number += step);
+            elapsed += step;
+
+            let price = client.current_price(&listing_id);
+            prop_assert!(price <= prev, "price increased: {} -> {}", prev, price);
+            prop_assert!(price <= start_price, "price above start_price: {}", price);
+            prop_assert!(price >= end_price, "price below end_price: {}", price);
+            prev = price;
+        }
+
+        // Past the end ledger the price is pinned at end_price.
+        env.ledger().with_mut(|l| l.sequence_number += duration);
+        prop_assert_eq!(client.current_price(&listing_id), end_price);
+    }
+
+    /// Property: buying a Dutch auction refunds exactly `payment - current_price`.
+    #[test]
+    fn prop_dutch_refund_exact(
+        start_price in 1_000i128..=100_000i128,
+        decay in 0i128..=500i128,
+        duration in 1u32..=50u32,
+        elapsed in 0u32..=60u32,
+        overpay in 0i128..=10_000i128,
+    ) {
+        let end_price = start_price - decay.min(start_price);
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let royalty_recipient = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+
+        let sac_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+
+        let marketplace_addr = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, &marketplace_addr);
+        client.initialize(&admin, &token_addr, &250u32, &royalty_recipient);
+
+        let nft_addr = Address::generate(&env);
+        let start_ledger = env.ledger().sequence();
+        let end_ledger = start_ledger + duration;
+
+        let listing_id = client.list_dutch(
+            &seller,
+            &nft_addr,
+            &1u32,
+            &start_price,
+            &end_price,
+            &start_ledger,
+            &end_ledger,
+        );
+
+        env.ledger().with_mut(|l| l.sequence_number += elapsed);
+
+        let current = client.current_price(&listing_id);
+        let payment = current + overpay;
+        StellarAssetClient::new(&env, &token_addr).mint(&buyer, &payment);
+
+        let buyer_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&buyer);
+        let _ = client.try_buy(&buyer, &listing_id, &payment);
+        let buyer_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&buyer);
+
+        // If the purchase went through, the buyer paid exactly `current`.
+        if buyer_after < buyer_before {
+            prop_assert_eq!(buyer_before - buyer_after, current,
+                "buyer paid {} but current price was {}", buyer_before - buyer_after, current);
+            prop_assert_eq!(buyer_after, overpay,
+                "refund incorrect: expected {}, got {}", overpay, buyer_after);
+        }
+    }
+
+    /// Property: bundle purchase is all-or-nothing — either every token in the
+    /// bundle transfers, or none do and no funds move.
+    #[test]
+    fn prop_bundle_purchase_atomic(
+        price in 100i128..=10_000i128,
+        bundle_len in 1u32..=4u32,
+        fund in 0i128..=20_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let royalty_recipient = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+
+        let sac_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+
+        StellarAssetClient::new(&env, &token_addr).mint(&buyer, &fund);
+
+        let marketplace_addr = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, &marketplace_addr);
+        client.initialize(&admin, &token_addr, &250u32, &royalty_recipient);
+
+        let nft_addr = Address::generate(&env);
+        let mut token_ids = soroban_sdk::vec![&env];
+        for id in 1..=bundle_len {
+            token_ids.push_back(id);
+        }
+
+        let bundle_id = client.create_bundle_listing(&seller, &nft_addr, &token_ids, &price);
+
+        let seller_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&seller);
+        let buyer_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&buyer);
+        let market_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&marketplace_addr);
+
+        let result = client.try_buy_bundle(&buyer, &bundle_id, &price);
+
+        let seller_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&seller);
+        let buyer_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&buyer);
+        let market_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&marketplace_addr);
+
+        if result.is_err() {
+            // All-or-nothing: a failed bundle purchase moves no funds at all.
+            prop_assert_eq!(seller_after, seller_before, "seller paid on failed bundle");
+            prop_assert_eq!(buyer_after, buyer_before, "buyer charged on failed bundle");
+            prop_assert_eq!(market_after, market_before, "marketplace balance changed on failed bundle");
+        } else {
+            // A successful purchase charges the buyer and pays the seller.
+            prop_assert_eq!(buyer_before - buyer_after, price, "buyer not charged bundle price");
+            prop_assert!(seller_after > seller_before, "seller not paid on bundle sale");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +586,12 @@ mod stateful {
                     res.is_ok()
                 }
                 Op::MakeOffer { buyer, listing, amount } => {
-                    let _ = self.client.try_make_offer(&self.buyers[buyer], &listing, &amount);
+                    let _ = self.client.try_make_offer(
+                        &self.buyers[buyer],
+                        &listing,
+                        &amount,
+                        &(seq + 20),
+                    );
                     false
                 }
                 Op::AcceptOffer { listing, buyer } => {
@@ -566,8 +749,9 @@ mod stateful {
         let mut h = Harness::new(&env);
         h.apply(&Op::List { token: 1, price: 1_000 });
         let b = h.buyers[0].clone();
-        h.client.make_offer(&b, &0, &300);
-        h.client.make_offer(&b, &0, &700);
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b, &0, &300, &expiry);
+        h.client.make_offer(&b, &0, &700, &expiry);
         assert_eq!(h.client.get_offer(&0, &b), Some(700));
         assert_eq!(h.token.balance(&h.marketplace), 700);
         assert_eq!(h.token.balance(&b), MINT - 700);
@@ -583,8 +767,9 @@ mod stateful {
         h.apply(&Op::ListWithExpiry { token: 1, price: 1_000, ttl: 5 });
         h.apply(&Op::List { token: 2, price: 1_000 });
         let (b0, b1) = (h.buyers[0].clone(), h.buyers[1].clone());
-        h.client.make_offer(&b0, &0, &400);
-        h.client.make_offer(&b0, &1, &500);
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b0, &0, &400, &expiry);
+        h.client.make_offer(&b0, &1, &500, &expiry);
 
         h.apply(&Op::AdvanceLedger { by: 10 });
         assert_eq!(
@@ -611,5 +796,81 @@ mod stateful {
         assert_eq!(h.nft.owner_of(&1), h.seller);
         h.drain().unwrap();
         assert_eq!(h.token.balance(&h.buyers[2]), MINT);
+    }
+
+    /// Edge case: an expired listing offer cannot be accepted, but anyone can
+    /// call `expire_offer` to refund the bidder's escrowed funds.
+    #[test]
+    fn expired_offer_refunded_by_anyone() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        h.apply(&Op::List { token: 1, price: 1_000 });
+        let bidder = h.buyers[0].clone();
+        let stranger = h.buyers[1].clone();
+        let expiry = h.env.ledger().sequence() + 5;
+        h.client.make_offer(&bidder, &0, &400, &expiry);
+        assert_eq!(h.token.balance(&h.marketplace), 400);
+
+        // Not yet expired: acceptance is allowed, expiry is rejected.
+        assert!(h.client.try_expire_offer(&stranger, &0, &bidder).is_err());
+
+        h.apply(&Op::AdvanceLedger { by: 10 });
+        // Acceptance of an expired offer must fail.
+        assert!(h.client.try_accept_offer(&h.seller, &0, &bidder).is_err());
+        // Permissionless expiry refunds the bidder.
+        h.client.expire_offer(&stranger, &0, &bidder);
+        assert_eq!(h.client.get_offer(&0, &bidder), None);
+        assert_eq!(h.token.balance(&bidder), MINT);
+        assert_eq!(h.token.balance(&h.marketplace), 0);
+        h.drain().unwrap();
+    }
+
+    /// Edge case: batch offer creation escrows the aggregate sum in one transfer
+    /// and each individual offer is recorded.
+    #[test]
+    fn batch_offers_escrow_aggregate() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        for token in 1..=3u32 {
+            h.apply(&Op::List { token, price: 1_000 });
+        }
+        let buyer = h.buyers[0].clone();
+        let expiry = h.env.ledger().sequence() + 50;
+        let token_ids = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+        let prices = soroban_sdk::vec![&env, 100i128, 200i128, 300i128];
+        h.client
+            .make_offers_batch(&buyer, &token_ids, &prices, &expiry);
+
+        assert_eq!(h.token.balance(&buyer), MINT - 600);
+        assert_eq!(h.token.balance(&h.marketplace), 600);
+        assert_eq!(h.client.get_offer(&0, &buyer), Some(100));
+        assert_eq!(h.client.get_offer(&1, &buyer), Some(200));
+        assert_eq!(h.client.get_offer(&2, &buyer), Some(300));
+        h.drain().unwrap();
+        assert_eq!(h.token.balance(&buyer), MINT);
+    }
+
+    /// Edge case: a counter-offer must improve on the current highest offer by
+    /// at least the configured minimum increment.
+    #[test]
+    fn counter_offer_min_increment_enforced() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        h.apply(&Op::List { token: 1, price: 10_000 });
+        let (b0, b1) = (h.buyers[0].clone(), h.buyers[1].clone());
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b0, &0, &1_000, &expiry);
+
+        // +1 stroop is below the minimum increment and must be rejected.
+        assert!(h.client.try_make_offer(&b1, &0, &1_001, &expiry).is_err());
+        assert_eq!(h.client.get_offer(&0, &b0), Some(1_000));
+        assert_eq!(h.token.balance(&h.marketplace), 1_000);
+
+        // A genuine improvement is accepted.
+        h.client.make_offer(&b1, &0, &1_100, &expiry);
+        assert_eq!(h.client.get_offer(&0, &b1), Some(1_100));
+        // The superseded bidder is refunded.
+        assert_eq!(h.token.balance(&b0), MINT);
+        h.drain().unwrap();
     }
 }

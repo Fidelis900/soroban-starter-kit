@@ -62,6 +62,7 @@ fn test_full_escrow_lifecycle_with_real_token() {
         &deadline,
         &0u32,
         &None,
+        &None,
     );
 
     escrow.fund();
@@ -77,5 +78,90 @@ fn test_full_escrow_lifecycle_with_real_token() {
     assert_eq!(token.balance(&escrow_addr), 0);
     assert_eq!(token.balance(&seller), amount);
     assert_eq!(token.balance(&buyer), 0);
+    assert_eq!(token.total_supply(), amount);
+}
+
+/// fund → mutual_cancel with both signatures refunds the depositor in full.
+#[test]
+fn test_mutual_cancel_refunds_depositor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let escrow_admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let amount = 1_000i128;
+    let deadline = env.ledger().sequence() + 200;
+
+    let (token, token_addr) = deploy_token(&env, &token_admin);
+    token.mint(&buyer, &amount);
+
+    let (escrow, escrow_addr) = deploy_escrow(&env);
+    escrow.initialize(
+        &escrow_admin,
+        &buyer,
+        &seller,
+        &arbiter,
+        &token_addr,
+        &amount,
+        &deadline,
+        &0u32,
+        &None,
+        &None,
+    );
+
+    escrow.fund();
+    assert_eq!(token.balance(&buyer), 0);
+    assert_eq!(token.balance(&escrow_addr), amount);
+
+    escrow.mutual_cancel(&buyer, &seller);
+    assert_eq!(escrow.get_state(), Some(EscrowState::Cancelled));
+    assert_eq!(token.balance(&escrow_addr), 0);
+    assert_eq!(token.balance(&buyer), amount);
+    assert_eq!(token.balance(&seller), 0);
+    assert_eq!(token.total_supply(), amount);
+}
+
+/// fund → approve_milestone_partial splits the milestone between seller and buyer.
+#[test]
+fn test_partial_milestone_settlement_with_real_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let escrow_admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let amount = 1_000i128;
+    let release_amount = 800i128;
+    let deadline = env.ledger().sequence() + 200;
+
+    let (token, token_addr) = deploy_token(&env, &token_admin);
+    token.mint(&buyer, &amount);
+
+    let (escrow, escrow_addr) = deploy_escrow(&env);
+    escrow.initialize(
+        &escrow_admin,
+        &buyer,
+        &seller,
+        &arbiter,
+        &token_addr,
+        &amount,
+        &deadline,
+        &0u32,
+        &None,
+        &None,
+    );
+
+    escrow.fund();
+    assert_eq!(token.balance(&escrow_addr), amount);
+
+    escrow.approve_milestone_partial(&0u32, &release_amount);
+    assert_eq!(token.balance(&seller), release_amount);
+    assert_eq!(token.balance(&buyer), amount - release_amount);
+    assert_eq!(token.balance(&escrow_addr), 0);
     assert_eq!(token.total_supply(), amount);
 }

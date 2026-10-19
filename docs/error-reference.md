@@ -1403,6 +1403,36 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 ---
 
+### `OfferExpired` (code 16)
+
+**Description:** The offer's `expiration_ledger` has passed, so it can no longer be accepted.
+
+**Common cause:** Calling `accept_offer` after the offer's `expiration_ledger` (set when the buyer called `make_offer`) has elapsed.
+
+**Resolution:** Offers must be accepted before `get_offer(listing_id, buyer).expiration_ledger`. Once expired, anyone may call `expire_offer` to refund the escrowed funds to the bidder, after which the buyer can submit a fresh `make_offer`.
+
+---
+
+### `CounterOfferTooLow` (code 17)
+
+**Description:** A counter-offer does not improve on the current highest offer for the listing by at least the configured minimum increment.
+
+**Common cause:** Submitting an offer that is only marginally above the existing highest offer (e.g. by 1 stroop) instead of meeting the `min_counter_offer_bps` threshold.
+
+**Resolution:** Compute the required minimum as `highest_offer + (highest_offer * min_counter_offer_bps / 10_000)` and offer at least that amount. Read the current highest offer and the configured increment before calling `make_offer`.
+
+---
+
+### `InvalidMinCounterOfferBps` (code 18)
+
+**Description:** The `min_counter_offer_bps` value supplied to `initialize` is outside the valid range.
+
+**Common cause:** Passing a basis-points value above `10_000` (100%) when configuring the marketplace.
+
+**Resolution:** Set `min_counter_offer_bps` within `0`–`10_000` (e.g. `500` for a required +5% increment over the current highest offer).
+
+---
+
 ## Multisig Contract — `MultisigError`
 
 ### `ProposalExpired` (code 11)

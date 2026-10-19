@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, contracttype};
+use soroban_sdk::{Address, BytesN, contracttype};
 
 /// Configuration and persistent swap keys.
 ///
@@ -28,6 +28,7 @@ pub enum SwapState {
     Executed = 1,
     Accepted = 1,
     Cancelled = 2,
+    Expired = 3,
 }
 
 impl core::fmt::Display for SwapState {
@@ -37,6 +38,7 @@ impl core::fmt::Display for SwapState {
             SwapState::Executed => "executed",
             SwapState::Accepted => "accepted",
             SwapState::Cancelled => "cancelled",
+            SwapState::Expired => "expired",
         })
     }
 }
@@ -49,7 +51,6 @@ pub struct BasketLeg {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SwapInfo {
     pub id: u32,
@@ -63,6 +64,12 @@ pub struct SwapInfo {
     pub filled_amount: i128,
     pub allow_partial: bool,
     pub escrowed: bool,
+    /// Whether takers may fill less than the full offered amount.
+    pub allow_partial_fills: bool,
+    /// Optional SHA-256 hash lock; takers must reveal a matching preimage.
+    pub hash_lock: Option<BytesN<32>>,
+    /// Remaining amount of `token_a` still available to be filled.
+    pub remaining_amount: i128,
 }
 
 #[contracttype]
@@ -74,8 +81,6 @@ pub struct BasketSwapInfo {
     pub demands: soroban_sdk::Vec<BasketLeg>,
     pub expires_at: u32,
     pub state: SwapState,
-}
-}
     pub allowed_counterparty: Option<Address>,
     pub max_execution_delay: Option<u32>,
     pub created_at: u32,

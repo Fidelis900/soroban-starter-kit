@@ -56,6 +56,14 @@ pub enum MultisigError {
     NotProposer = 14,
     /// The signer has not signed the proposal, so there is nothing to revoke.
     NotSigned = 15,
+    /// The proposed threshold change is invalid (e.g. zero or exceeds total weight).
+    InvalidThresholdChange = 23,
+    /// No pending threshold-change proposal exists.
+    ThresholdChangeNotFound = 24,
+    /// The signer has not been inactive long enough to be considered dormant.
+    SignerNotDormant = 25,
+    /// No pending dormant-signer replacement proposal exists.
+    DormantReplacementNotFound = 26,
 }
 
 impl_display_error!(
@@ -84,4 +92,8 @@ impl_display_error!(
     InvalidAmount       => "invalid amount",
     NotProposer         => "not proposer",
     NotSigned           => "not signed",
+    InvalidThresholdChange => "invalid threshold change",
+    ThresholdChangeNotFound => "threshold change not found",
+    SignerNotDormant    => "signer not dormant",
+    DormantReplacementNotFound => "dormant replacement not found",
 );

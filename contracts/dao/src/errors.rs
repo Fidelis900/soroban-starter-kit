@@ -3,7 +3,6 @@
 
 use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
-use soroban_common::impl_display_error;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +44,14 @@ pub enum DaoError {
     NoChoices = 20,
     /// Voting type is not supported for this operation.
     InvalidVotingType = 21,
+    /// Emergency fast-track requested but no security council is configured.
+    MissingSecurityCouncil = 18,
+    /// Caller is not the configured security council.
+    UnauthorizedCouncil = 19,
+    /// Caller is not the proposal's proposer.
+    NotProposer = 20,
+    /// Proposal cancellation rejected because voting has already started.
+    VotingAlreadyStarted = 21,
 }
 
 impl_display_error!(
@@ -72,6 +79,10 @@ impl_display_error!(
     InvalidChoice           => "selected choice is not part of this proposal",
     NoChoices               => "multi-choice proposal must define at least one choice",
     InvalidVotingType       => "unsupported voting type",
+    MissingSecurityCouncil  => "no security council configured",
+    UnauthorizedCouncil     => "caller is not the security council",
+    NotProposer             => "caller is not the proposal proposer",
+    VotingAlreadyStarted    => "voting has already started; proposal cannot be cancelled",
 );
 
 #[cfg(test)]
@@ -109,6 +120,10 @@ DaoError::DuplicateProposal = {}\n\
 DaoError::InvalidChoice = {}\n\
 DaoError::NoChoices = {}\n\
 DaoError::InvalidVotingType = {}\n",
+DaoError::MissingSecurityCouncil = {}\n\
+DaoError::UnauthorizedCouncil = {}\n\
+DaoError::NotProposer = {}\n\
+DaoError::VotingAlreadyStarted = {}\n",
             DaoError::NotAuthorized as u32,
             DaoError::AlreadyInitialized as u32,
             DaoError::NotInitialized as u32,
@@ -132,6 +147,10 @@ DaoError::InvalidVotingType = {}\n",
             DaoError::InvalidChoice as u32,
             DaoError::NoChoices as u32,
             DaoError::InvalidVotingType as u32,
+            DaoError::MissingSecurityCouncil as u32,
+            DaoError::UnauthorizedCouncil as u32,
+            DaoError::NotProposer as u32,
+            DaoError::VotingAlreadyStarted as u32,
         )
     }
 

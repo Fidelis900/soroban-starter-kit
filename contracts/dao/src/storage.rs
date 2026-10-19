@@ -2,6 +2,7 @@
 #![allow(missing_docs)]
 
 use soroban_sdk::{Address, BytesN, String, Symbol, Val, Vec, contracttype};
+use soroban_sdk::{Address, String, Symbol, Val, Vec, contracttype};
 
 /// Instance-storage keys (contract-level state).
 #[contracttype]
@@ -39,6 +40,9 @@ pub enum DataKey {
     /// Execution delay (in ledgers) for `ProposalTier::Critical` proposals
     /// (issue #1318).
     CriticalDelay,
+    /// Optional emergency security council address (multisig) allowed to
+    /// fast-track emergency proposals (issue #1320).
+    SecurityCouncil,
 }
 
 /// Persistent-storage keys (per-proposal and per-vote data).
@@ -184,6 +188,9 @@ pub struct Proposal {
     // ── Duplicate detection (issue #1319) ────────────────────────────────────
     /// SHA-256 hash of the proposal payload, title, and action target.
     pub payload_hash: BytesN<32>,
+    /// Ledger at which voting opens. The proposer may cancel the proposal
+    /// strictly before this ledger (issue #1321).
+    pub voting_start: u32,
 }
 
 /// One page of results from `get_proposals` (#1110).

@@ -283,6 +283,364 @@ mod issue_1089_anti_sandwich_tests {
 }
 
 #[cfg(test)]
+mod issue_1308_max_buy_tests {
+    use super::*;
+    use crate::{BondingCurveContract, BondingCurveContractClient, BondingCurveError};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+
+    fn setup_with_max_buy(
+        env: &Env,
+        max_buy_bps: Option<u32>,
+    ) -> (BondingCurveContractClient<'_>, soroban_sdk::Address, soroban_sdk::Address) {
+mod issue_1306_1307_tests {
+    use super::*;
+    use crate::{BondingCurveContract, BondingCurveContractClient, CurveModel};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+
+    fn setup_sigmoid(
+        env: &Env,
+        midpoint: i128,
+        steepness: u32,
+    ) -> (BondingCurveContractClient<'_>, soroban_sdk::Address) {
+        let admin = Address::generate(env);
+        let sac_admin = Address::generate(env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+        let contract_addr = env.register_contract(None, BondingCurveContract);
+        let client = BondingCurveContractClient::new(env, &contract_addr);
+        client.initialize(
+            &admin,
+            &token_addr,
+            &1_000_000i128,
+            &1i128,
+            &10_000u32,
+            &0u32,
+            &admin,
+            &None::<i128>,
+            &max_buy_bps,
+        );
+        (client, token_addr, admin)
+    }
+
+    /// With `max_buy_bps` unset, arbitrarily large buys are permitted.
+    #[test]
+    fn unset_max_buy_permits_large_buys() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_max_buy(&env, None);
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        // Buy a large fraction of supply — must succeed with no cap configured.
+        client.buy(&buyer, &500_000, &i128::MAX);
+        assert_eq!(client.balance(&buyer), 500_000);
+    }
+
+    /// A buy exactly at the limit (total_max_supply * bps / 10_000) succeeds.
+    #[test]
+    fn buy_exactly_at_limit_succeeds() {
+        );
+        client.set_curve_model(&admin, &CurveModel::Sigmoid { midpoint, steepness });
+        (client, token_addr)
+    }
+
+    /// Sigmoid pricing must be monotonically increasing in supply (positive curvature
+    /// through the midpoint, plateauing afterwards).
+    #[test]
+    fn sigmoid_price_is_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token) = setup_sigmoid(&env, 500, 4);
+
+        let mut prev = client.get_price();
+        for _ in 0..20 {
+            let next = client.quote_buy(&10);
+            assert!(next >= prev, "sigmoid price decreased: {} -> {}", prev, next);
+            prev = next;
+        }
+    }
+
+    /// Randomized round-trips under sigmoid parameters must not create arbitrage.
+    #[test]
+    fn sigmoid_roundtrip_no_arbitrage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        // 100 bps = 1% of 1_000_000 = 10_000.
+        let (client, token, _) = setup_with_max_buy(&env, Some(100));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        client.buy(&buyer, &10_000, &i128::MAX);
+        assert_eq!(client.balance(&buyer), 10_000);
+    }
+
+    /// A buy one unit above the limit is rejected with `PurchaseExceedsLimit`.
+    #[test]
+    fn buy_above_limit_rejected() {
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+
+        for amount in [1i128, 5, 25, 100, 250] {
+            let before = token_client.balance(&trader);
+            if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+                continue;
+            }
+            let after_buy = token_client.balance(&trader);
+            let cost = before - after_buy;
+
+            env.ledger().with_mut(|l| {
+                l.sequence_number = l.sequence_number.saturating_add(200);
+            });
+            if client.try_sell(&trader, &amount, &0i128).is_err() {
+                continue;
+            }
+            let after_sell = token_client.balance(&trader);
+            let proceeds = after_sell - after_buy;
+
+            assert!(
+                cost >= proceeds,
+                "sigmoid arbitrage: cost={} proceeds={}",
+                cost,
+                proceeds
+            );
+        }
+    }
+
+    /// Reserve must remain solvent (non-negative and backed) across sigmoid trades.
+    #[test]
+    fn sigmoid_reserve_stays_solvent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_max_buy(&env, Some(100));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        let result = client.try_buy(&buyer, &10_001, &i128::MAX);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            BondingCurveError::PurchaseExceedsLimit
+        );
+        assert_eq!(client.balance(&buyer), 0);
+    }
+
+    /// A 0 bps limit rejects any non-zero buy.
+    #[test]
+    fn zero_bps_rejects_any_buy() {
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+
+        for amount in [10i128, 40, 90, 160] {
+            if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+                continue;
+            }
+            assert!(client.get_reserve() >= 0, "reserve went negative after buy");
+            env.ledger().with_mut(|l| {
+                l.sequence_number = l.sequence_number.saturating_add(200);
+            });
+            if client.try_sell(&trader, &amount, &0i128).is_err() {
+                continue;
+            }
+            assert!(client.get_reserve() >= 0, "reserve went negative after sell");
+        }
+    }
+
+    /// Exit fee decays monotonically with holding duration.
+    #[test]
+    fn exit_fee_decays_with_holding_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_max_buy(&env, Some(0));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        let result = client.try_buy(&buyer, &1, &i128::MAX);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            BondingCurveError::PurchaseExceedsLimit
+        );
+    }
+
+    /// A 10_000 bps (100%) limit permits buying the entire supply.
+    #[test]
+    fn full_bps_permits_entire_supply() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_max_buy(&env, Some(10_000));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        client.buy(&buyer, &1_000_000, &i128::MAX);
+        assert_eq!(client.balance(&buyer), 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod issue_1309_price_surge_tests {
+    use super::*;
+    use crate::{BondingCurveContract, BondingCurveContractClient, BondingCurveError};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+
+    fn setup_with_surge(
+        env: &Env,
+        max_surge_pct: Option<u32>,
+    ) -> (BondingCurveContractClient<'_>, soroban_sdk::Address, soroban_sdk::Address) {
+        let admin = Address::generate(env);
+        let sac_admin = Address::generate(env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+        let contract_addr = env.register_contract(None, BondingCurveContract);
+        let client = BondingCurveContractClient::new(env, &contract_addr);
+        client.initialize(
+            &admin,
+            &token_addr,
+            &1_000_000i128,
+            &1i128,
+            &10_000u32,
+            &0u32,
+            &admin,
+            &None::<i128>,
+            &None::<u32>,
+            &max_surge_pct,
+        );
+        (client, token_addr, admin)
+    }
+
+    /// A price surge beyond the configured threshold halts buys.
+    #[test]
+    fn surge_halts_buys() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        // +100% threshold.
+        let (client, token, _) = setup_with_surge(&env, Some(100));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        // First buy establishes the reference price.
+        client.buy(&buyer, &100, &i128::MAX);
+
+        // Advance within the surge window and buy enough to more than double price.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 105;
+        });
+        client.buy(&buyer, &10_000, &i128::MAX);
+
+        // Next buy within the window must be rejected by the circuit breaker.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 110;
+        });
+        let result = client.try_buy(&buyer, &100, &i128::MAX);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            BondingCurveError::PriceSurgeDetected
+        );
+    }
+
+    /// Buys are allowed again once the surge window has passed.
+    #[test]
+    fn buys_resume_after_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_surge(&env, Some(100));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        client.buy(&buyer, &100, &i128::MAX);
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 105;
+        });
+        client.buy(&buyer, &10_000, &i128::MAX);
+
+        // Advance well past the surge window / cool-down.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 1_000;
+        });
+        client.buy(&buyer, &100, &i128::MAX); // must not error
+    }
+
+    /// Sells continue to work while buys are halted by the circuit breaker.
+    #[test]
+    fn sells_allowed_during_halt() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+        });
+        let (client, token, _) = setup_with_surge(&env, Some(100));
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&buyer, &100_000_000);
+
+        client.buy(&buyer, &100, &i128::MAX);
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 105;
+        });
+        client.buy(&buyer, &10_000, &i128::MAX);
+
+        // Buys are halted.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 110;
+        });
+        assert_eq!(
+            client.try_buy(&buyer, &100, &i128::MAX).unwrap_err().unwrap(),
+            BondingCurveError::PriceSurgeDetected
+        );
+
+        // Sells must still succeed.
+        client.sell(&buyer, &100, &0i128);
+        assert_eq!(client.balance(&buyer), 10_000);
+        let (client, token) = setup_sigmoid(&env, 500, 4);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&trader, &10_000_000);
+
+        client.buy(&trader, &100, &i128::MAX);
+
+        let mut prev_fee = u32::MAX;
+        for hold in [0u32, 10, 25, 50, 75, 100, 150] {
+            env.ledger().with_mut(|l| {
+                l.sequence_number = 100 + hold as u32;
+            });
+            let fee = client.get_exit_fee_bps(&trader);
+            assert!(
+                fee <= prev_fee,
+                "exit fee not monotonically decaying: {} -> {} at hold={}",
+                prev_fee,
+                fee,
+                hold
+            );
+            prev_fee = fee;
+        }
+        // After the decay window the standard fee applies.
+        assert_eq!(prev_fee, 30u32);
+    }
+}
+
+#[cfg(test)]
 mod issue_1090_graduation_tests {
     use super::*;
     use crate::{BondingCurveContract, BondingCurveContractClient, BondingCurveError, CurveState};

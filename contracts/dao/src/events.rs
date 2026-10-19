@@ -137,3 +137,19 @@ pub fn undelegated(env: &Env, delegator: &Address) {
     env.events()
         .publish((Symbol::new(env, "undelegated"), delegator.clone()), ());
 }
+
+/// Emitted when the emergency security council fast-tracks a proposal (issue #1320).
+pub fn emergency_proposal_executed(env: &Env, council: &Address, proposal_id: u32) {
+    env.events().publish(
+        (Symbol::new(env, "emergency_executed"), council.clone()),
+        proposal_id,
+    );
+}
+
+/// Emitted when the original proposer cancels their proposal before voting opens (issue #1321).
+pub fn proposal_cancelled_by_proposer(env: &Env, proposer: &Address, proposal_id: u32) {
+    env.events().publish(
+        (Symbol::new(env, "proposer_cancelled"), proposer.clone()),
+        proposal_id,
+    );
+}

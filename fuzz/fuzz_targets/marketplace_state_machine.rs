@@ -12,8 +12,8 @@
 //!
 //! Each 6-byte chunk of input decodes to one operation (list, list_with_expiry,
 //! buy, make_offer, accept_offer, cancel_offer, cancel, sweep_expired,
-//! make/accept/cancel_collection_offer, advance ledger). After every operation
-//! the target asserts:
+//! make/accept/cancel_collection_offer, expire_offer, make_offers_batch,
+//! advance ledger). After every operation the target asserts:
 //! - marketplace token balance == sum of all escrowed listing + collection offers;
 //! - total payment-token supply is conserved;
 //! - an NFT only changes owner through a successful sale that paid its previous owner.
@@ -130,12 +130,18 @@ fuzz_target!(|data: &[u8]| {
 
     let mut listings: u64 = 0;
     let mut collection_offers: u64 = 0;
+    let mut batch_offers: u64 = 0;
 
-    let escrowed = |listings: u64, collection_offers: u64| -> i128 {
+    let escrowed = |listings: u64, collection_offers: u64, batch_offers: u64| -> i128 {
         let mut sum = 0i128;
         for l in 0..listings {
             for b in &buyers {
                 sum += client.get_offer(&l, b).unwrap_or(0);
+            }
+        }
+        for o in 0..batch_offers {
+            if let Some(offer) = client.get_offer(&o, buyer) {
+                sum += offer;
             }
         }
         for o in 0..collection_offers {
@@ -159,7 +165,7 @@ fuzz_target!(|data: &[u8]| {
         let balances_before: Vec<i128> = actors.iter().map(|x| tok.balance(x)).collect();
         let mut sold = false;
 
-        match op % 12 {
+        match op % 14 {
             0 => {
                 let owner = nft.owner_of(&token);
                 if client.try_list(&owner, &nft_addr, &token, &amount).is_ok() {
@@ -187,7 +193,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             3 => {
-                let _ = client.try_make_offer(buyer, &listing, &amount);
+                let _ = client.try_make_offer(buyer, &listing, &amount, &(seq + ttl));
             }
             4 => {
                 if let Some(l) = client.get_listing(&listing) {
@@ -231,6 +237,27 @@ fuzz_target!(|data: &[u8]| {
                 let offer = u64::from(b) % (collection_offers + 1);
                 let _ = client.try_cancel_collection_offer(buyer, &offer);
             }
+            11 => {
+                // Permissionless expiration: anyone may refund an expired offer.
+                let caller = &actors[usize::from(chunk[5]) % actors.len()];
+                let _ = client.try_expire_offer(caller, &listing, buyer);
+            }
+            12 => {
+                // Batch offer creation: escrows the aggregate sum in one transfer.
+                let mut token_ids = soroban_sdk::vec![&env];
+                let mut prices = soroban_sdk::vec![&env];
+                let count = u32::from(chunk[5] % 4) + 1;
+                for i in 0..count {
+                    token_ids.push_back(u32::from(a).wrapping_add(i) % TOKENS + 1);
+                    prices.push_back(amount);
+                }
+                if client
+                    .try_make_offers_batch(buyer, &token_ids, &prices, &(seq + ttl))
+                    .is_ok()
+                {
+                    batch_offers += u64::from(count);
+                }
+            }
             _ => {
                 env.ledger()
                     .with_mut(|l| l.sequence_number += u32::from(chunk[5] % 32));
@@ -239,7 +266,11 @@ fuzz_target!(|data: &[u8]| {
 
         // Solvency.
         let held = tok.balance(&marketplace);
-        assert_eq!(held, escrowed(listings, collection_offers), "escrow mismatch");
+        assert_eq!(
+            held,
+            escrowed(listings, collection_offers, batch_offers),
+            "escrow mismatch"
+        );
 
         // Conservation.
         let total: i128 = held + actors.iter().map(|x| tok.balance(x)).sum::<i128>();
@@ -270,6 +301,11 @@ fuzz_target!(|data: &[u8]| {
     for o in 0..collection_offers {
         if let Some(offer) = client.get_collection_offer(&o) {
             client.cancel_collection_offer(&offer.buyer, &o);
+        }
+    }
+    for o in 0..batch_offers {
+        if client.get_offer(&o, buyer).is_some() {
+            client.cancel_offer(buyer, &o);
         }
     }
     assert_eq!(tok.balance(&marketplace), 0, "funds trapped in marketplace");

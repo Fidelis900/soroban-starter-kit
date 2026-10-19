@@ -359,7 +359,8 @@ fn test_offer_escrowed_in_listing_token() {
     let usdc = new_token(&env, &t.admin, &t.buyer, 10_000);
 
     let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &usdc);
-    t.client.make_offer(&t.buyer, &id, &800i128);
+    let expiry = env.ledger().sequence() + 100;
+    t.client.make_offer(&t.buyer, &id, &800i128, &expiry);
     assert_eq!(tok(&env, &usdc).balance(&t.marketplace), 800);
     assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 0);
 
@@ -498,8 +499,9 @@ fn test_sweep_offers_refunds_buyers_after_cancel() {
     StellarAssetClient::new(&env, &t.token).mint(&buyer2, &10_000i128);
 
     let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
-    t.client.make_offer(&t.buyer, &id, &600i128);
-    t.client.make_offer(&buyer2, &id, &700i128);
+    let expiry = env.ledger().sequence() + 100;
+    t.client.make_offer(&t.buyer, &id, &600i128, &expiry);
+    t.client.make_offer(&buyer2, &id, &700i128, &expiry);
 
     // Cannot sweep while the listing is open.
     let res = t.client.try_sweep_offers(&id, &soroban_sdk::vec![&env, t.buyer.clone()]);
@@ -531,7 +533,7 @@ fn test_sweep_offers_after_expiry_sweep() {
     let id = t
         .client
         .list_with_expiry(&t.seller, &t.nft, &1u32, &1_000i128, &t.token, &expires_at);
-    t.client.make_offer(&t.buyer, &id, &500i128);
+    t.client.make_offer(&t.buyer, &id, &500i128, &(expires_at + 100));
 
     env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
     t.client.sweep_expired(&t.seller, &id);
@@ -589,7 +591,7 @@ fn test_ghost_listing_offers_can_be_refunded() {
     let env = Env::default();
     let t = setup(&env);
     let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
-    t.client.make_offer(&t.buyer, &id, &500i128);
+    t.client.make_offer(&t.buyer, &id, &500i128, &(env.ledger().sequence() + 100));
 
     MockNftClient::new(&env, &t.nft).set_owner(&1u32, &Address::generate(&env));
     let res = t.client.try_accept_offer(&t.seller, &id, &t.buyer);
@@ -598,6 +600,264 @@ fn test_ghost_listing_offers_can_be_refunded() {
     t.client.invalidate_listing(&id);
     assert_eq!(t.client.sweep_offers(&id, &soroban_sdk::vec![&env, t.buyer.clone()]), 1);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// #1310 – Dutch auction listings with linear price decay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dutch_auction_price_decays_linearly() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &100i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    // At the start ledger the spot price is the start price.
+    assert_eq!(t.client.get_spot_price(&id), 1_000);
+
+    // Halfway through the auction the price is the midpoint.
+    env.ledger().with_mut(|l| l.sequence_number = start + 50);
+    assert_eq!(t.client.get_spot_price(&id), 550);
+
+    // At (and past) the end ledger the price floors at the end price.
+    env.ledger().with_mut(|l| l.sequence_number = end);
+    assert_eq!(t.client.get_spot_price(&id), 100);
+    env.ledger().with_mut(|l| l.sequence_number = end + 50);
+    assert_eq!(t.client.get_spot_price(&id), 100);
+}
+
+#[test]
+fn test_dutch_auction_rejects_buy_before_start() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence() + 10;
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &100i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    let res = t.client.try_buy(&t.buyer, &id);
+    assert_eq!(res, Err(Ok(MarketplaceError::AuctionNotStarted)));
+    assert!(t.client.get_listing(&id).unwrap().active);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+}
+
+#[test]
+fn test_dutch_auction_buy_refunds_excess_and_settles() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &200i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    // Quarter of the way through: price = 1000 - (800 * 25 / 100) = 800.
+    env.ledger().with_mut(|l| l.sequence_number = start + 25);
+    let spot = t.client.get_spot_price(&id);
+    assert_eq!(spot, 800);
+
+    let seller_before = tok(&env, &t.token).balance(&t.seller);
+    let royalty_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    let buyer_before = tok(&env, &t.token).balance(&t.buyer);
+
+    // Buyer sends more than the spot price; the excess must be refunded.
+    t.client.buy(&t.buyer, &id, &1_000i128);
+
+    let royalty = (spot * 250) / 10_000; // 20
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), seller_before + spot - royalty);
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.royalty_recipient),
+        royalty_before + royalty
+    );
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.buyer),
+        buyer_before - spot,
+        "buyer should only pay the decaying spot price"
+    );
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.buyer);
+    assert!(!t.client.get_listing(&id).unwrap().active);
+}
+
+#[test]
+fn test_dutch_auction_rejects_invalid_params() {
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    // start_price must exceed end_price.
+    let res = t.client.try_list_dutch(
+        &t.seller, &t.nft, &1u32, &100i128, &1_000i128, &start, &end, &t.token,
+    );
+    assert!(res.is_err());
+
+    // end_ledger must be after start_ledger.
+    let res = t.client.try_list_dutch(
+        &t.seller, &t.nft, &1u32, &1_000i128, &100i128, &start, &start, &t.token,
+    );
+    assert!(res.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// #1311 – bundle listings (atomic multi-NFT sales)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bundle_creation_and_purchase_is_atomic() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+    mint_and_approve(&t, 3);
+
+    let token_ids = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &token_ids, &3_000i128, &t.token);
+    let bundle = t.client.get_bundle(&bundle_id).unwrap();
+    assert!(bundle.active);
+    assert_eq!(bundle.total_price, 3_000);
+    assert_eq!(bundle.token_ids.len(), 3);
+
+    let seller_before = tok(&env, &t.token).balance(&t.seller);
+    let royalty_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    let buyer_before = tok(&env, &t.token).balance(&t.buyer);
+
+    t.client.buy_bundle(&t.buyer, &bundle_id);
+
+    let nft = MockNftClient::new(&env, &t.nft);
+    for token_id in 1u32..=3 {
+        assert_eq!(nft.owner_of(&token_id), t.buyer);
+    }
+
+    let royalty = (3_000 * 250) / 10_000; // 75
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), seller_before + 3_000 - royalty);
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.royalty_recipient),
+        royalty_before + royalty
+    );
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), buyer_before - 3_000);
+    assert!(!t.client.get_bundle(&bundle_id).unwrap().active);
+}
+
+#[test]
+fn test_bundle_creation_validation() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    // Empty bundle.
+    let res = t.client.try_create_bundle_listing(
+        &t.seller,
+        &t.nft,
+        &Vec::new(&env),
+        &1_000i128,
+        &t.token,
+    );
+    assert!(res.is_err());
+
+    // Duplicate token ids.
+    let dup = soroban_sdk::vec![&env, 1u32, 1u32];
+    let res = t.client.try_create_bundle_listing(&t.seller, &t.nft, &dup, &1_000i128, &t.token);
+    assert!(res.is_err());
+
+    // Non-positive price.
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let res = t.client.try_create_bundle_listing(&t.seller, &t.nft, &ids, &0i128, &t.token);
+    assert!(res.is_err());
+
+    // Seller does not own one of the tokens.
+    let other = Address::generate(&env);
+    let res = t.client.try_create_bundle_listing(&other, &t.nft, &ids, &1_000i128, &t.token);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_bundle_delist() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &ids, &2_000i128, &t.token);
+
+    let other = Address::generate(&env);
+    let res = t.client.try_cancel_bundle(&other, &bundle_id);
+    assert!(res.is_err());
+    assert!(t.client.get_bundle(&bundle_id).unwrap().active);
+
+    t.client.cancel_bundle(&t.seller, &bundle_id);
+    assert!(!t.client.get_bundle(&bundle_id).unwrap().active);
+
+    // Buying a delisted bundle fails and moves nothing.
+    let res = t.client.try_buy_bundle(&t.buyer, &bundle_id);
+    assert!(res.is_err());
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.seller);
+}
+
+#[test]
+fn test_bundle_purchase_rolls_back_on_partial_transfer_failure() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &ids, &2_000i128, &t.token);
+
+    // Seller moves one NFT out of the bundle after listing it.
+    let elsewhere = Address::generate(&env);
+    MockNftClient::new(&env, &t.nft).set_owner(&2u32, &elsewhere);
+
+    let res = t.client.try_buy_bundle(&t.buyer, &bundle_id);
+    assert!(res.is_err());
+
+    // Nothing moved: no funds, no partial NFT transfer.
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), 0);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.seller);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&2u32), elsewhere);
+    assert!(t.client.get_bundle(&bundle_id).unwrap().active);
+}
+
 // #1101 — buyer max-price (front-running / slippage) protection
 // ---------------------------------------------------------------------------
 
@@ -846,7 +1106,7 @@ fn test_multi_recipient_royalty_split_on_accept_offer_rounds_down() {
         .set_royalty_splits(&t.admin, &soroban_sdk::vec![&env, (a.clone(), 333u32), (b.clone(), 333u32)]);
 
     let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128);
-    t.client.make_offer(&t.buyer, &id, &999i128);
+    t.client.make_offer(&t.buyer, &id, &999i128, &(env.ledger().sequence() + 100));
     t.client.accept_offer(&t.seller, &id, &t.buyer);
 
     let share = (999 * 333) / 10_000; // 33 each, dust stays with the seller
@@ -940,13 +1200,15 @@ fn make_offer_increase_pulls_delta_only() {
     // List NFT at 1 000 so offers can be up to 999.
     let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
 
+    let expiry = env.ledger().sequence() + 100;
+
     // First offer: 300 → buyer pays 300, marketplace holds 300.
-    t.client.make_offer(&t.buyer, &listing_id, &300i128);
+    t.client.make_offer(&t.buyer, &listing_id, &300i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 300);
     assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 300);
 
     // Increase offer to 700 → only the delta of 400 should be pulled.
-    t.client.make_offer(&t.buyer, &listing_id, &700i128);
+    t.client.make_offer(&t.buyer, &listing_id, &700i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 700,
         "buyer should only have paid the delta (400), not a full re-pull of 700");
     assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 700,
@@ -962,11 +1224,12 @@ fn make_offer_decrease_refunds_delta_only() {
 
     let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
 
-    t.client.make_offer(&t.buyer, &listing_id, &800i128);
+    let expiry = env.ledger().sequence() + 100;
+    t.client.make_offer(&t.buyer, &listing_id, &800i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 800);
 
     // Decrease offer to 500 → only 300 refunded.
-    t.client.make_offer(&t.buyer, &listing_id, &500i128);
+    t.client.make_offer(&t.buyer, &listing_id, &500i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 500,
         "buyer should have received the delta refund of 300");
     assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 500);
@@ -981,11 +1244,12 @@ fn make_offer_identical_amount_no_transfer() {
 
     let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
 
-    t.client.make_offer(&t.buyer, &listing_id, &400i128);
+    let expiry = env.ledger().sequence() + 100;
+    t.client.make_offer(&t.buyer, &listing_id, &400i128, &expiry);
     let balance_after_first = tok(&env, &t.token).balance(&t.buyer);
 
     // Resubmit the same amount.
-    t.client.make_offer(&t.buyer, &listing_id, &400i128);
+    t.client.make_offer(&t.buyer, &listing_id, &400i128, &expiry);
     assert_eq!(
         tok(&env, &t.token).balance(&t.buyer),
         balance_after_first,
@@ -1011,15 +1275,224 @@ fn make_offer_increase_succeeds_with_only_delta_available() {
 
     let listing_id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
 
+    let expiry = env.ledger().sequence() + 100;
+
     // First offer of 300 — costs 300, leaving 400 in wallet.
-    t.client.make_offer(&tight_buyer, &listing_id, &300i128);
+    t.client.make_offer(&tight_buyer, &listing_id, &300i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&tight_buyer), 400);
 
     // Increase to 700 — needs only delta of 400, which is exactly what remains.
     // Under the old (buggy) code this would try to pull 700 and fail because the
     // buyer only holds 400.
-    t.client.make_offer(&tight_buyer, &listing_id, &700i128);
+    t.client.make_offer(&tight_buyer, &listing_id, &700i128, &expiry);
     assert_eq!(tok(&env, &t.token).balance(&tight_buyer), 0,
         "tight buyer should have spent their remaining 400 as the delta");
     assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 700);
+}
+
+// ---------------------------------------------------------------------------
+// #1312 – offer expiration and permissionless expiry refunds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_offer_expiry_refunds_bidder() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let t = setup(&env);
+    let expires_at = env.ledger().sequence() + 10;
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    t.client.make_offer(&t.buyer, &id, &500i128, &expires_at);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 500);
+
+    // Not yet expired: permissionless expiry must fail.
+    let res = t.client.try_expire_offer(&id, &t.buyer);
+    assert_eq!(res, Err(Ok(MarketplaceError::OfferNotExpired)));
+
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+
+    // Anyone can trigger the refund.
+    let keeper = Address::generate(&env);
+    t.client.expire_offer(&id, &t.buyer);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 0);
+    assert_eq!(t.client.get_offer(&id, &t.buyer), None);
+    assert_eq!(tok(&env, &t.token).balance(&keeper), 0);
+
+    // Cannot be expired twice.
+    let res = t.client.try_expire_offer(&id, &t.buyer);
+    assert_eq!(res, Err(Ok(MarketplaceError::OfferNotFound)));
+}
+
+#[test]
+fn test_accept_expired_offer_rejected() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let t = setup(&env);
+    let expires_at = env.ledger().sequence() + 5;
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    t.client.make_offer(&t.buyer, &id, &500i128, &expires_at);
+
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+    let res = t.client.try_accept_offer(&t.seller, &id, &t.buyer);
+    assert_eq!(res, Err(Ok(MarketplaceError::OfferExpired)));
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.seller);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 500);
+}
+
+#[test]
+fn test_accept_offer_before_expiry_succeeds() {
+    let env = Env::default();
+    let t = setup(&env);
+    let expires_at = env.ledger().sequence() + 100;
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    t.client.make_offer(&t.buyer, &id, &500i128, &expires_at);
+    t.client.accept_offer(&t.seller, &id, &t.buyer);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.buyer);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 0);
+}
+
+// ---------------------------------------------------------------------------
+// #1313 – batch offer creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_make_offers_batch_escrows_total_once() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+    mint_and_approve(&t, 3);
+
+    let a = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let b = t.client.list(&t.seller, &t.nft, &2u32, &1_000i128, &t.token);
+    let c = t.client.list(&t.seller, &t.nft, &3u32, &1_000i128, &t.token);
+
+    let expiry = env.ledger().sequence() + 100;
+    t.client.make_offers_batch(
+        &t.buyer,
+        &soroban_sdk::vec![&env, a, b, c],
+        &soroban_sdk::vec![&env, 100i128, 200i128, 300i128],
+        &expiry,
+    );
+
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000 - 600);
+    assert_eq!(tok(&env, &t.token).balance(&t.marketplace), 600);
+    assert_eq!(t.client.get_offer(&a, &t.buyer), Some(100));
+    assert_eq!(t.client.get_offer(&b, &t.buyer), Some(200));
+    assert_eq!(t.client.get_offer(&c, &t.buyer), Some(300));
+}
+
+#[test]
+fn test_make_offers_batch_rejects_mismatched_lengths() {
+    let env = Env::default();
+    let t = setup(&env);
+    let a = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let expiry = env.ledger().sequence() + 100;
+
+    let res = t.client.try_make_offers_batch(
+        &t.buyer,
+        &soroban_sdk::vec![&env, a],
+        &soroban_sdk::vec![&env, 100i128, 200i128],
+        &expiry,
+    );
+    assert_eq!(res, Err(Ok(MarketplaceError::BatchLengthMismatch)));
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// #1314 – fee discount tiers for native token stakers
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+enum StakeKey {
+    Balance(Address),
+}
+
+#[contract]
+pub struct MockStaking;
+
+#[contractimpl]
+impl MockStaking {
+    pub fn set_balance(env: Env, who: Address, amount: i128) {
+        env.storage()
+            .persistent()
+            .set(&StakeKey::Balance(who), &amount);
+    }
+
+    pub fn staked_balance(env: Env, who: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StakeKey::Balance(who))
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn test_fee_discount_for_stakers() {
+    let env = Env::default();
+    let t = setup(&env);
+    let staking = env.register_contract(None, MockStaking);
+    t.client.set_staking_contract(&t.admin, &Some(staking.clone()));
+
+    // No stake: full fee.
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let fee_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    t.client.buy(&t.buyer, &id);
+    let full_fee = tok(&env, &t.token).balance(&t.royalty_recipient) - fee_before;
+    assert_eq!(full_fee, 25);
+
+    // High stake: discounted fee.
+    mint_and_approve(&t, 2);
+    MockStakingClient::new(&env, &staking).set_balance(&t.buyer, &1_000_000i128);
+    let id2 = t.client.list(&t.seller, &t.nft, &2u32, &1_000i128, &t.token);
+    let fee_before2 = tok(&env, &t.token).balance(&t.royalty_recipient);
+    t.client.buy(&t.buyer, &id2);
+    let discounted = tok(&env, &t.token).balance(&t.royalty_recipient) - fee_before2;
+    assert!(discounted < full_fee, "staker should pay a discounted fee");
+}
+
+#[test]
+fn test_no_fee_discount_when_staking_unset() {
+    let env = Env::default();
+    let t = setup(&env);
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let fee_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    t.client.buy(&t.buyer, &id);
+    assert_eq!(tok(&env, &t.token).balance(&t.royalty_recipient) - fee_before, 25);
+}
+
+// ---------------------------------------------------------------------------
+// #1315 – minimum counter-offer increment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_min_counter_offer_increment_enforced() {
+    let env = Env::default();
+    let t = setup(&env);
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let expiry = env.ledger().sequence() + 100;
+
+    // First offer has no increment requirement.
+    t.client.make_offer(&t.buyer, &id, &500i128, &expiry);
+
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &t.token).mint(&bidder2, &10_000i128);
+
+    // Below the +5% threshold (525) is rejected.
+    let res = t.client.try_make_offer(&bidder2, &id, &510i128, &expiry);
+    assert_eq!(res, Err(Ok(MarketplaceError::CounterOfferTooLow)));
+
+    // Exactly at the threshold is accepted.
+    t.client.make_offer(&bidder2, &id, &525i128, &expiry);
+    assert_eq!(t.client.get_offer(&id, &bidder2), Some(525));
+}
+
+#[test]
+fn test_first_offer_bypasses_increment() {
+    let env = Env::default();
+    let t = setup(&env);
+    let id = t.client.list(&t.seller, &t.nft, &1u32, &1_000i128, &t.token);
+    let expiry = env.ledger().sequence() + 100;
+    // Any positive amount is fine for the first offer on a listing.
+    t.client.make_offer(&t.buyer, &id, &1i128, &expiry);
+    assert_eq!(t.client.get_offer(&id, &t.buyer), Some(1));
 }

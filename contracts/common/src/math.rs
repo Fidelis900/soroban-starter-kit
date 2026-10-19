@@ -240,6 +240,54 @@ pub fn fixed_sqrt(value: i128) -> Result<i128, FixedPointError> {
         }
     }
     Ok(low)
+/// Computes the fixed-point square root of `val`, returning a result in the
+/// same `scale` as the input.
+///
+/// The input `val` is interpreted as the scaled representation of a
+/// non-negative real number, i.e. the true value is `val / scale`. The result
+/// `r` satisfies `r / scale ≈ sqrt(val / scale)`, computed via the
+/// Babylonian/Newton-Raphson iteration
+/// `x_{n+1} = (x_n + (val * scale) / x_n) / 2`, which converges to
+/// `sqrt(val * scale)`.
+///
+/// The iteration starts from a power-of-two estimate derived from the bit
+/// length of `val * scale` and stops once the estimate is stable, so the
+/// result is the floor of the exact fixed-point square root.
+///
+/// # Errors
+///
+/// Returns [`FixedPointError::InvalidScale`] if `val` is negative or `scale`
+/// is not strictly positive, and [`FixedPointError::Overflow`] if the
+/// intermediate `val * scale` product does not fit in an `i128`.
+pub fn fixed_sqrt(val: i128, scale: i128) -> Result<i128, FixedPointError> {
+    if val < 0 || scale <= 0 {
+        return Err(FixedPointError::InvalidScale);
+    }
+    if val == 0 {
+        return Ok(0);
+    }
+    // We compute sqrt(val * scale), which is the scaled square root.
+    let radicand = val.checked_mul(scale).ok_or(FixedPointError::Overflow)?;
+
+    // Initial guess: the smallest power of two whose square is >= radicand.
+    // `bit_length` is at least 1 for radicand >= 1.
+    let bit_length = 128 - radicand.leading_zeros() as u32;
+    let shift = (bit_length + 1) / 2;
+    let mut x: i128 = 1i128 << shift;
+
+    // Newton-Raphson iteration. The sequence decreases monotonically once the
+    // initial guess is above the true root, so we stop when it no longer
+    // decreases.
+    loop {
+        let quotient = radicand.checked_div(x).ok_or(FixedPointError::Overflow)?;
+        let next = x.checked_add(quotient).ok_or(FixedPointError::Overflow)? / 2;
+        if next >= x {
+            break;
+        }
+        x = next;
+    }
+
+    Ok(x)
 }
 
 /// A fixed-point value represented as an `i128` mantissa together with an
@@ -464,6 +512,48 @@ mod tests {
             }
             // One above a perfect square still floors to the same root.
             assert_eq!(fixed_sqrt(square + 1), Ok(r));
+    fn fixed_sqrt_edge_cases() {
+        // Zero is always zero.
+        assert_eq!(fixed_sqrt(0, 1_000_000_000), Ok(0));
+        // One in scale 10^9 is 1e-9; its sqrt is 1e-4.5, so the floor is 0.
+        assert_eq!(fixed_sqrt(1, 1_000_000_000), Ok(0));
+        // A perfect square: 4.0 -> 2.0.
+        assert_eq!(fixed_sqrt(4_000_000_000, 1_000_000_000), Ok(2_000_000_000));
+        // 9.0 -> 3.0.
+        assert_eq!(fixed_sqrt(9_000_000_000, 1_000_000_000), Ok(3_000_000_000));
+        // 1.0 -> 1.0.
+        assert_eq!(fixed_sqrt(1_000_000_000, 1_000_000_000), Ok(1_000_000_000));
+        // 0.25 -> 0.5.
+        assert_eq!(fixed_sqrt(250_000_000, 1_000_000_000), Ok(500_000_000));
+        // Invalid inputs.
+        assert_eq!(fixed_sqrt(-1, 1_000_000_000), Err(FixedPointError::InvalidScale));
+        assert_eq!(fixed_sqrt(1, 0), Err(FixedPointError::InvalidScale));
+        assert_eq!(fixed_sqrt(1, -1), Err(FixedPointError::InvalidScale));
+        // Overflow of the radicand.
+        assert_eq!(fixed_sqrt(i128::MAX, 2), Err(FixedPointError::Overflow));
+    }
+
+    #[test]
+    fn fixed_sqrt_matches_float() {
+        let scales: [i128; 3] = [10_000_000, 1_000_000_000, 1_000_000_000_000_000_000];
+        let values: [i128; 8] = [1, 2, 3, 10, 100, 1_000, 123_456, 1_000_000];
+        for &scale in scales.iter() {
+            for &v in values.iter() {
+                let val = v * scale;
+                let result = fixed_sqrt(val, scale).unwrap();
+                let expected = (val as f64).sqrt();
+                let diff = (result as f64 - expected).abs();
+                // Allow a small tolerance for floating-point rounding; the
+                // integer result should be within a few units of the float.
+                assert!(
+                    diff <= 2.0,
+                    "scale={} val={} result={} expected={}",
+                    scale,
+                    val,
+                    result,
+                    expected
+                );
+            }
         }
     }
 
@@ -482,5 +572,11 @@ mod tests {
     fn fixed_sqrt_negative_input() {
         assert_eq!(fixed_sqrt(-1), Err(FixedPointError::NegativeInput));
         assert_eq!(fixed_sqrt(i128::MIN), Err(FixedPointError::NegativeInput));
+        // sqrt of a large perfect square in scale 10^9.
+        let scale = 1_000_000_000i128;
+        let val = 1_000_000_000_000_000_000i128; // 1e9 in scale 1e9
+        let result = fixed_sqrt(val, scale).unwrap();
+        let expected = (val as f64).sqrt();
+        assert!((result as f64 - expected).abs() <= 2.0);
     }
 }
