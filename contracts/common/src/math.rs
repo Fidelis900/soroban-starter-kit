@@ -32,6 +32,9 @@ pub enum FixedPointError {
     DivisionByZero = 2,
     /// A scale factor was zero or otherwise invalid.
     InvalidScale = 3,
+    /// A negative input was supplied to an operation that requires a
+    /// non-negative value (e.g. the integer square root).
+    NegativeInput = 4,
 }
 
 impl FixedPointError {
@@ -41,6 +44,7 @@ impl FixedPointError {
             FixedPointError::Overflow => "fixed-point arithmetic overflow",
             FixedPointError::DivisionByZero => "fixed-point division by zero",
             FixedPointError::InvalidScale => "invalid fixed-point scale",
+            FixedPointError::NegativeInput => "negative input not allowed",
         }
     }
 }
@@ -203,6 +207,39 @@ pub fn scale_div(a: i128, b: i128, scale: i128) -> Result<i128, FixedPointError>
     numerator.checked_div(b).ok_or(FixedPointError::Overflow)
 }
 
+/// Computes the integer square root of `value`, i.e. the floor of the exact
+/// square root, using a checked binary search over `i128`.
+///
+/// This is used to derive quadratic voting weights from token balances.
+///
+/// # Errors
+///
+/// Returns [`FixedPointError::NegativeInput`] if `value` is negative. The
+/// computation never overflows: the search range is bounded by `value` itself
+/// and the midpoint is squared with checked arithmetic.
+pub fn fixed_sqrt(value: i128) -> Result<i128, FixedPointError> {
+    if value < 0 {
+        return Err(FixedPointError::NegativeInput);
+    }
+    if value < 2 {
+        return Ok(value);
+    }
+
+    // Binary search for the largest `r` such that `r * r <= value`.
+    // Invariant: `low * low <= value` and `high * high > value`.
+    let mut low: i128 = 1;
+    let mut high: i128 = value;
+    while low < high {
+        // Round the midpoint up so the loop always makes progress.
+        let mid = low + (high - low + 1) / 2;
+        match mid.checked_mul(mid) {
+            Some(square) if square <= value => low = mid,
+            // Either the square exceeds `value` or it overflowed `i128`;
+            // in both cases the root is strictly below `mid`.
+            _ => high = mid - 1,
+        }
+    }
+    Ok(low)
 /// Computes the fixed-point square root of `val`, returning a result in the
 /// same `scale` as the input.
 ///
@@ -451,6 +488,30 @@ mod tests {
     }
 
     #[test]
+    fn fixed_sqrt_small_values() {
+        assert_eq!(fixed_sqrt(0), Ok(0));
+        assert_eq!(fixed_sqrt(1), Ok(1));
+        assert_eq!(fixed_sqrt(2), Ok(1));
+        assert_eq!(fixed_sqrt(3), Ok(1));
+        assert_eq!(fixed_sqrt(4), Ok(2));
+        assert_eq!(fixed_sqrt(5), Ok(2));
+        assert_eq!(fixed_sqrt(8), Ok(2));
+        assert_eq!(fixed_sqrt(9), Ok(3));
+        assert_eq!(fixed_sqrt(15), Ok(3));
+        assert_eq!(fixed_sqrt(16), Ok(4));
+    }
+
+    #[test]
+    fn fixed_sqrt_perfect_squares() {
+        for r in 0i128..=1_000 {
+            let square = r * r;
+            assert_eq!(fixed_sqrt(square), Ok(r));
+            if square > 0 {
+                // One below a perfect square floors to the previous root.
+                assert_eq!(fixed_sqrt(square - 1), Ok(r - 1));
+            }
+            // One above a perfect square still floors to the same root.
+            assert_eq!(fixed_sqrt(square + 1), Ok(r));
     fn fixed_sqrt_edge_cases() {
         // Zero is always zero.
         assert_eq!(fixed_sqrt(0, 1_000_000_000), Ok(0));
@@ -498,6 +559,19 @@ mod tests {
 
     #[test]
     fn fixed_sqrt_large_values() {
+        // Largest root whose square fits in i128.
+        let max_root = 13_043_817_825_332_782_212i128;
+        assert_eq!(fixed_sqrt(i128::MAX), Ok(max_root));
+        assert_eq!(fixed_sqrt(max_root * max_root), Ok(max_root));
+        assert_eq!(fixed_sqrt(max_root * max_root - 1), Ok(max_root - 1));
+        assert_eq!(fixed_sqrt((max_root + 1) * (max_root + 1) - 1), Ok(max_root));
+        assert_eq!(fixed_sqrt(1_000_000_000_000_000_000), Ok(1_000_000_000));
+    }
+
+    #[test]
+    fn fixed_sqrt_negative_input() {
+        assert_eq!(fixed_sqrt(-1), Err(FixedPointError::NegativeInput));
+        assert_eq!(fixed_sqrt(i128::MIN), Err(FixedPointError::NegativeInput));
         // sqrt of a large perfect square in scale 10^9.
         let scale = 1_000_000_000i128;
         let val = 1_000_000_000_000_000_000i128; // 1e9 in scale 1e9
