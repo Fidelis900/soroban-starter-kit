@@ -6,7 +6,10 @@
 use soroban_sdk::{Address, Env, MuxedAddress, String, panic_with_error};
 
 use crate::TokenContract;
-use crate::allowance::{get_allowance, set_allowance, validate_and_deduct_allowance};
+use crate::allowance::{
+    decrease_allowance_impl, get_allowance, increase_allowance_impl, set_allowance,
+    validate_and_deduct_allowance,
+};
 use crate::errors::TokenError;
 use crate::events;
 use crate::storage::{DataKey, MetadataKey};
@@ -17,6 +20,8 @@ use crate::require_not_paused;
 
 #[cfg(feature = "freeze")]
 use crate::{require_not_blacklisted, require_not_frozen};
+
+use crate::require_not_locked;
 
 pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
     get_allowance(&env, from, spender)
@@ -42,6 +47,36 @@ pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expirati
     }
 }
 
+pub fn increase_allowance(env: Env, from: Address, spender: Address, delta: i128) {
+    from.require_auth();
+    #[cfg(feature = "pausable")]
+    if let Err(e) = require_not_paused(&env) {
+        panic_with_error!(&env, e);
+    }
+    if let Err(e) = increase_allowance_impl(&env, from.clone(), spender.clone(), delta) {
+        panic_with_error!(&env, e);
+    }
+    let new_amount = get_allowance(&env, from.clone(), spender.clone());
+    events::approved(&env, &from, &spender, new_amount);
+}
+
+pub fn decrease_allowance(env: Env, from: Address, spender: Address, delta: i128) {
+    from.require_auth();
+    #[cfg(feature = "pausable")]
+    if let Err(e) = require_not_paused(&env) {
+        panic_with_error!(&env, e);
+    }
+    if let Err(e) = decrease_allowance_impl(&env, from.clone(), spender.clone(), delta) {
+        panic_with_error!(&env, e);
+    }
+    let new_amount = get_allowance(&env, from.clone(), spender.clone());
+    if new_amount == 0 {
+        events::revoked(&env, &from, &spender);
+    } else {
+        events::approved(&env, &from, &spender, new_amount);
+    }
+}
+
 pub fn balance(env: Env, id: Address) -> i128 {
     env.storage()
         .persistent()
@@ -63,6 +98,9 @@ pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
     if let Err(e) = require_not_blacklisted(&env, &from) {
         panic_with_error!(&env, e);
     }
+    if require_not_locked(&env, &from) {
+        panic_with_error!(&env, TokenError::AccountLocked);
+    }
     let to_address: Address = to.address();
     if let Err(e) = TokenContract::transfer_impl(&env, from, to_address, amount) {
         panic_with_error!(&env, e);
@@ -82,6 +120,9 @@ pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amo
     #[cfg(feature = "freeze")]
     if let Err(e) = require_not_blacklisted(&env, &from) {
         panic_with_error!(&env, e);
+    }
+    if require_not_locked(&env, &from) {
+        panic_with_error!(&env, TokenError::AccountLocked);
     }
     if let Err(e) = validate_and_deduct_allowance(&env, from.clone(), spender.clone(), amount) {
         panic_with_error!(&env, e);
