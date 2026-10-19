@@ -646,6 +646,124 @@ fn test_proposer_cancel_already_cancelled_fails() {
 }
 
 // ---------------------------------------------------------------------------
+// #1321 — Proposal cancellation by proposer before voting opens
+// ---------------------------------------------------------------------------
+
+/// Proposer can cancel their own proposal before voting starts, and the bond
+/// is refunded.
+#[test]
+fn test_cancel_proposal_by_proposer_pre_vote_refunds_bond() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let bond = 200_i128;
+    let (client, admin, token, _) = setup_with_bond(&env, bond);
+
+    mint_tokens(&env, &token, &admin, &admin, 2_000);
+
+    let before = soroban_sdk::token::Client::new(&env, &token).balance(&admin);
+    let id = create_plain_proposal(&client, &env, &admin);
+    let after_create = soroban_sdk::token::Client::new(&env, &token).balance(&admin);
+    assert_eq!(before - after_create, bond, "bond should be escrowed");
+
+    // Voting has not started yet — proposer cancels.
+    client.cancel_proposal(&admin, &id);
+
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Cancelled);
+    let after_cancel = soroban_sdk::token::Client::new(&env, &token).balance(&admin);
+    assert_eq!(after_cancel, before, "bond should be refunded on cancel");
+}
+
+/// cancel_proposal is rejected once voting has started.
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cancel_proposal_after_voting_started_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    // Advance to the voting start ledger.
+    let voting_start = client.get_proposal(&id).voting_start;
+    env.ledger().with_mut(|l| l.sequence_number = voting_start);
+
+    client.cancel_proposal(&admin, &id);
+}
+
+/// A non-proposer cannot cancel a proposal via cancel_proposal.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_cancel_proposal_wrong_caller_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let impostor = Address::generate(&env);
+    client.cancel_proposal(&impostor, &id);
+}
+
+// ---------------------------------------------------------------------------
+// #1320 — Emergency security council fast-track
+// ---------------------------------------------------------------------------
+
+/// The configured security council can fast-track a proposal, bypassing the
+/// standard voting duration and timelock.
+#[test]
+fn test_emergency_execute_proposal_by_council_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 500, 0, 50);
+
+    let council = Address::generate(&env);
+    client.set_security_council(&admin, &Some(council.clone()));
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    // No votes, no waiting — council executes immediately.
+    client.emergency_execute_proposal(&council, &id);
+
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Executed);
+}
+
+/// A caller that is not the configured security council cannot fast-track.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_emergency_execute_proposal_wrong_caller_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 500, 0, 50);
+
+    let council = Address::generate(&env);
+    client.set_security_council(&admin, &Some(council.clone()));
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let impostor = Address::generate(&env);
+    client.emergency_execute_proposal(&impostor, &id);
+}
+
+/// emergency_execute_proposal fails when no security council is configured.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_emergency_execute_proposal_no_council_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 500, 0, 50);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let caller = Address::generate(&env);
+    client.emergency_execute_proposal(&caller, &id);
+}
+
+// ---------------------------------------------------------------------------
 // #829 — quorum_bps (percentage-based quorum)
 // ---------------------------------------------------------------------------
 

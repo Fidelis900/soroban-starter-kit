@@ -1098,3 +1098,238 @@ fn set_spending_limit_requires_threshold() {
         Err(Ok(MultisigError::InsufficientApprovals))
     );
 }
+
+// ── #1322 threshold change proposals ─────────────────────────────────────────
+
+#[test]
+fn propose_threshold_change_applies_after_current_threshold_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    assert_eq!(client.get_threshold(), Some(2));
+
+    // First approval is not enough (current threshold is 2).
+    client.approve_threshold_change(&bob, &proposal_id);
+    assert_eq!(client.get_threshold(), Some(3));
+
+    let proposal = client.get_threshold_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.new_threshold, 3);
+    assert!(proposal.applied);
+    assert_eq!(proposal.approvals, vec![&env, alice, bob]);
+}
+
+#[test]
+fn propose_threshold_change_emits_event_on_apply() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    let proposal_id = client.propose_threshold_change(&alice, &1);
+    client.approve_threshold_change(&bob, &proposal_id);
+
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics == (Symbol::new(&env, "threshold_changed"),).into_val(&env)
+    });
+    assert!(found, "threshold_changed event not emitted");
+}
+
+#[test]
+fn propose_threshold_change_requires_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = create_multisig(&env);
+    let outsider = Address::generate(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&outsider, &1),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+#[test]
+fn propose_threshold_change_rejects_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &0),
+        Err(Ok(MultisigError::InvalidThreshold))
+    );
+}
+
+#[test]
+fn propose_threshold_change_rejects_above_signer_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &4),
+        Err(Ok(MultisigError::InvalidThreshold))
+    );
+}
+
+#[test]
+fn approve_threshold_change_rejects_non_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&Address::generate(&env), &proposal_id),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+#[test]
+fn approve_threshold_change_rejects_duplicate_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&alice, &proposal_id),
+        Err(Ok(MultisigError::AlreadySigned))
+    );
+}
+
+#[test]
+fn approve_threshold_change_rejects_unknown_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&alice, &999u64),
+        Err(Ok(MultisigError::TransactionNotFound))
+    );
+}
+
+#[test]
+fn approve_threshold_change_rejects_already_applied_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    client.approve_threshold_change(&bob, &proposal_id);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&carol, &proposal_id),
+        Err(Ok(MultisigError::ThresholdProposalClosed))
+    );
+}
+
+// ── #1323 dead-man's switch / dormant signer replacement ─────────────────────
+
+#[test]
+fn signer_activity_is_tracked_on_sign() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 1);
+
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+    client.sign_transaction(&bob, &0);
+
+    assert_eq!(client.get_last_activity(&bob), Some(env.ledger().sequence()));
+}
+
+#[test]
+fn dormant_signer_can_be_replaced_after_inactivity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    // Keep alice and bob active; carol never signs.
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    client.replace_dormant_signer(
+        &vec![&env, alice.clone(), bob.clone()],
+        &carol,
+        &dave,
+        &1,
+    );
+
+    assert!(!client.is_signer(&carol));
+    assert!(client.is_signer(&dave));
+    assert_eq!(client.get_threshold(), Some(1));
+}
+
+#[test]
+fn replace_dormant_signer_rejects_active_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    // bob is still active, so cannot be replaced.
+    assert_eq!(
+        client.try_replace_dormant_signer(
+            &vec![&env, alice.clone(), carol.clone()],
+            &bob,
+            &dave,
+            &1,
+        ),
+        Err(Ok(MultisigError::SignerNotDormant))
+    );
+}
+
+#[test]
+fn replace_dormant_signer_requires_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    assert_eq!(
+        client.try_replace_dormant_signer(&vec![&env, alice.clone()], &carol, &dave, &1),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+}
+
+#[test]
+fn replace_dormant_signer_rejects_unknown_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    assert_eq!(
+        client.try_replace_dormant_signer(
+            &vec![&env, alice.clone(), bob.clone()],
+            &outsider,
+            &dave,
+            &1,
+        ),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
