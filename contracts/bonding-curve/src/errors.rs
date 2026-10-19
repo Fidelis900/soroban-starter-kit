@@ -27,6 +27,12 @@ pub enum BondingCurveError {
     /// Returned when `migrate_to_amm` is called but the curve has not yet
     /// graduated.
     NotGraduated = 12,
+    /// Returned when a single purchase exceeds the configured maximum buy
+    /// limit (`max_buy_bps` of total supply).
+    PurchaseExceedsLimit = 13,
+    /// Returned when a buy is halted because the spot price surged beyond the
+    /// configured volatility threshold within the observation window.
+    PriceSurgeDetected = 14,
     /// Returned when sigmoid curve parameters (midpoint / steepness) are
     /// invalid, e.g. a non-positive midpoint or a steepness that would make
     /// the fixed-point integral overflow.
@@ -50,6 +56,8 @@ impl_display_error!(
     CooldownActive       => "buy cooldown active: wait before buying again",
     CurveGraduated       => "curve has graduated: minting is locked",
     NotGraduated         => "curve has not graduated yet",
+    PurchaseExceedsLimit => "purchase exceeds single-transaction limit",
+    PriceSurgeDetected   => "price surge detected: buys temporarily halted",
     InvalidSigmoidParameters => "invalid sigmoid curve parameters",
     ExitFeeOverflow      => "exit fee arithmetic overflow",
 );
@@ -78,6 +86,8 @@ BondingCurveError::RateLimitExceeded = {}\n\
 BondingCurveError::CooldownActive = {}\n\
 BondingCurveError::CurveGraduated = {}\n\
 BondingCurveError::NotGraduated = {}\n\
+BondingCurveError::PurchaseExceedsLimit = {}\n\
+BondingCurveError::PriceSurgeDetected = {}\n",
 BondingCurveError::InvalidSigmoidParameters = {}\n\
 BondingCurveError::ExitFeeOverflow = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
@@ -92,6 +102,8 @@ BondingCurveError::ExitFeeOverflow = {}\n",
             BondingCurveError::CooldownActive as u32,
             BondingCurveError::CurveGraduated as u32,
             BondingCurveError::NotGraduated as u32,
+            BondingCurveError::PurchaseExceedsLimit as u32,
+            BondingCurveError::PriceSurgeDetected as u32,
             BondingCurveError::InvalidSigmoidParameters as u32,
             BondingCurveError::ExitFeeOverflow as u32,
         )

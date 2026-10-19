@@ -26,6 +26,21 @@ pub enum DataKey {
     LastBuyLedger(Address),
     /// Number of buys `actor` has made in the current ledger sequence (persistent).
     BuysThisLedger(Address),
+    /// Maximum single-transaction purchase size in basis points of the total
+    /// max supply (instance). `None` disables the per-transaction cap.
+    MaxBuyBps,
+    /// Maximum allowed spot-price surge in percent within the surge window
+    /// before buys are halted by the circuit breaker (instance). `None`
+    /// disables the circuit breaker.
+    MaxSurgePct,
+    /// Number of ledgers forming the look-back window for the circuit breaker
+    /// (instance). Defaults to `DEFAULT_SURGE_WINDOW_LEDGERS`.
+    SurgeWindowLedgers,
+    /// Spot price recorded at the start of the current surge window (instance).
+    /// Used together with `RefLedger` to detect rapid price surges.
+    RefPrice,
+    /// Ledger sequence at which `RefPrice` was recorded (instance).
+    RefLedger,
     /// Sigmoid curve configuration: midpoint (in supply units) and steepness
     /// (fixed-point scale multiplier). Stored in instance storage.
     SigmoidConfig,
@@ -50,6 +65,9 @@ pub const MAX_BUYS_PER_LEDGER: u32 = 1;
 /// ledgers (approximately 5 s on Stellar).
 pub const BUY_COOLDOWN_LEDGERS: u32 = 1;
 
+/// Default look-back window (in ledgers) used by the price-surge circuit
+/// breaker when `SurgeWindowLedgers` has not been configured.
+pub const DEFAULT_SURGE_WINDOW_LEDGERS: u32 = 20;
 /// Selects the pricing model used by the bonding curve.
 ///
 /// * `Linear` — constant slope price curve.

@@ -600,6 +600,264 @@ fn test_ghost_listing_offers_can_be_refunded() {
     t.client.invalidate_listing(&id);
     assert_eq!(t.client.sweep_offers(&id, &soroban_sdk::vec![&env, t.buyer.clone()]), 1);
     assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// #1310 – Dutch auction listings with linear price decay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dutch_auction_price_decays_linearly() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &100i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    // At the start ledger the spot price is the start price.
+    assert_eq!(t.client.get_spot_price(&id), 1_000);
+
+    // Halfway through the auction the price is the midpoint.
+    env.ledger().with_mut(|l| l.sequence_number = start + 50);
+    assert_eq!(t.client.get_spot_price(&id), 550);
+
+    // At (and past) the end ledger the price floors at the end price.
+    env.ledger().with_mut(|l| l.sequence_number = end);
+    assert_eq!(t.client.get_spot_price(&id), 100);
+    env.ledger().with_mut(|l| l.sequence_number = end + 50);
+    assert_eq!(t.client.get_spot_price(&id), 100);
+}
+
+#[test]
+fn test_dutch_auction_rejects_buy_before_start() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence() + 10;
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &100i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    let res = t.client.try_buy(&t.buyer, &id);
+    assert_eq!(res, Err(Ok(MarketplaceError::AuctionNotStarted)));
+    assert!(t.client.get_listing(&id).unwrap().active);
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+}
+
+#[test]
+fn test_dutch_auction_buy_refunds_excess_and_settles() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    let id = t.client.list_dutch(
+        &t.seller,
+        &t.nft,
+        &1u32,
+        &1_000i128,
+        &200i128,
+        &start,
+        &end,
+        &t.token,
+    );
+
+    // Quarter of the way through: price = 1000 - (800 * 25 / 100) = 800.
+    env.ledger().with_mut(|l| l.sequence_number = start + 25);
+    let spot = t.client.get_spot_price(&id);
+    assert_eq!(spot, 800);
+
+    let seller_before = tok(&env, &t.token).balance(&t.seller);
+    let royalty_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    let buyer_before = tok(&env, &t.token).balance(&t.buyer);
+
+    // Buyer sends more than the spot price; the excess must be refunded.
+    t.client.buy(&t.buyer, &id, &1_000i128);
+
+    let royalty = (spot * 250) / 10_000; // 20
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), seller_before + spot - royalty);
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.royalty_recipient),
+        royalty_before + royalty
+    );
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.buyer),
+        buyer_before - spot,
+        "buyer should only pay the decaying spot price"
+    );
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.buyer);
+    assert!(!t.client.get_listing(&id).unwrap().active);
+}
+
+#[test]
+fn test_dutch_auction_rejects_invalid_params() {
+    let env = Env::default();
+    let t = setup(&env);
+    let start = env.ledger().sequence();
+    let end = start + 100;
+
+    // start_price must exceed end_price.
+    let res = t.client.try_list_dutch(
+        &t.seller, &t.nft, &1u32, &100i128, &1_000i128, &start, &end, &t.token,
+    );
+    assert!(res.is_err());
+
+    // end_ledger must be after start_ledger.
+    let res = t.client.try_list_dutch(
+        &t.seller, &t.nft, &1u32, &1_000i128, &100i128, &start, &start, &t.token,
+    );
+    assert!(res.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// #1311 – bundle listings (atomic multi-NFT sales)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bundle_creation_and_purchase_is_atomic() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+    mint_and_approve(&t, 3);
+
+    let token_ids = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &token_ids, &3_000i128, &t.token);
+    let bundle = t.client.get_bundle(&bundle_id).unwrap();
+    assert!(bundle.active);
+    assert_eq!(bundle.total_price, 3_000);
+    assert_eq!(bundle.token_ids.len(), 3);
+
+    let seller_before = tok(&env, &t.token).balance(&t.seller);
+    let royalty_before = tok(&env, &t.token).balance(&t.royalty_recipient);
+    let buyer_before = tok(&env, &t.token).balance(&t.buyer);
+
+    t.client.buy_bundle(&t.buyer, &bundle_id);
+
+    let nft = MockNftClient::new(&env, &t.nft);
+    for token_id in 1u32..=3 {
+        assert_eq!(nft.owner_of(&token_id), t.buyer);
+    }
+
+    let royalty = (3_000 * 250) / 10_000; // 75
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), seller_before + 3_000 - royalty);
+    assert_eq!(
+        tok(&env, &t.token).balance(&t.royalty_recipient),
+        royalty_before + royalty
+    );
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), buyer_before - 3_000);
+    assert!(!t.client.get_bundle(&bundle_id).unwrap().active);
+}
+
+#[test]
+fn test_bundle_creation_validation() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    // Empty bundle.
+    let res = t.client.try_create_bundle_listing(
+        &t.seller,
+        &t.nft,
+        &Vec::new(&env),
+        &1_000i128,
+        &t.token,
+    );
+    assert!(res.is_err());
+
+    // Duplicate token ids.
+    let dup = soroban_sdk::vec![&env, 1u32, 1u32];
+    let res = t.client.try_create_bundle_listing(&t.seller, &t.nft, &dup, &1_000i128, &t.token);
+    assert!(res.is_err());
+
+    // Non-positive price.
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let res = t.client.try_create_bundle_listing(&t.seller, &t.nft, &ids, &0i128, &t.token);
+    assert!(res.is_err());
+
+    // Seller does not own one of the tokens.
+    let other = Address::generate(&env);
+    let res = t.client.try_create_bundle_listing(&other, &t.nft, &ids, &1_000i128, &t.token);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_bundle_delist() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &ids, &2_000i128, &t.token);
+
+    let other = Address::generate(&env);
+    let res = t.client.try_cancel_bundle(&other, &bundle_id);
+    assert!(res.is_err());
+    assert!(t.client.get_bundle(&bundle_id).unwrap().active);
+
+    t.client.cancel_bundle(&t.seller, &bundle_id);
+    assert!(!t.client.get_bundle(&bundle_id).unwrap().active);
+
+    // Buying a delisted bundle fails and moves nothing.
+    let res = t.client.try_buy_bundle(&t.buyer, &bundle_id);
+    assert!(res.is_err());
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.seller);
+}
+
+#[test]
+fn test_bundle_purchase_rolls_back_on_partial_transfer_failure() {
+    let env = Env::default();
+    let t = setup(&env);
+    mint_and_approve(&t, 2);
+
+    let ids = soroban_sdk::vec![&env, 1u32, 2u32];
+    let bundle_id = t
+        .client
+        .create_bundle_listing(&t.seller, &t.nft, &ids, &2_000i128, &t.token);
+
+    // Seller moves one NFT out of the bundle after listing it.
+    let elsewhere = Address::generate(&env);
+    MockNftClient::new(&env, &t.nft).set_owner(&2u32, &elsewhere);
+
+    let res = t.client.try_buy_bundle(&t.buyer, &bundle_id);
+    assert!(res.is_err());
+
+    // Nothing moved: no funds, no partial NFT transfer.
+    assert_eq!(tok(&env, &t.token).balance(&t.buyer), 10_000);
+    assert_eq!(tok(&env, &t.token).balance(&t.seller), 0);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&1u32), t.seller);
+    assert_eq!(MockNftClient::new(&env, &t.nft).owner_of(&2u32), elsewhere);
+    assert!(t.client.get_bundle(&bundle_id).unwrap().active);
+}
+
 // #1101 — buyer max-price (front-running / slippage) protection
 // ---------------------------------------------------------------------------
 
