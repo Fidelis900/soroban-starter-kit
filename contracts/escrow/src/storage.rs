@@ -69,6 +69,14 @@ pub enum DataKey {
     /// Number of ledgers after the deadline before an abandoned funded escrow
     /// can be refunded by its buyer.
     AbandonmentBuffer,
+    /// Arbiter fee in basis points (0–2 000) deducted from the disputed amount
+    /// and paid to the arbiter(s) upon dispute resolution (`Option<u32>`).
+    /// `None` means no arbiter fee is charged.
+    ArbiterFeeBps,
+    /// Distinct arbiter approvals collected for the current dispute direction
+    /// (`Vec<Address>`).  Each arbiter may approve at most once per direction;
+    /// once the configured threshold is reached the dispute can be resolved.
+    DisputeApprovals,
 }
 
 /// Lifecycle states of an escrow.
@@ -199,6 +207,9 @@ mod tests {
             deadline: 500u32,
             state: EscrowState::Created,
             metadata_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+            arbiter_fee_bps: Some(250u32),
+            arbiters: soroban_sdk::Vec::new(&env),
+            threshold: 0u32,
         };
 
         // Round-trip: encode → decode must produce the same value.
@@ -212,7 +223,7 @@ mod tests {
             "EscrowInfo XDR round-trip produced a different value"
         );
 
-        // Structural snapshot: the XDR map must have exactly these 7 keys,
+        // Structural snapshot: the XDR map must have exactly these keys,
         // in alphabetical order.  Hard-coded here as the stored snapshot.
         // Changing this list is a breaking on-chain ABI change.
         let sc_val = ScVal::try_from_val(&env, &val).expect("Val → ScVal failed");
@@ -234,11 +245,14 @@ mod tests {
             [
                 "amount",
                 "arbiter",
+                "arbiter_fee_bps",
+                "arbiters",
                 "buyer",
                 "deadline",
                 "metadata_hash",
                 "seller",
                 "state",
+                "threshold",
                 "token_contract"
             ],
             "EscrowInfo XDR field names changed — breaking on-chain ABI"
@@ -312,6 +326,8 @@ mod discriminant_tests {
             DataKey::Locked => 22,
             DataKey::TokenContracts => 23,
             DataKey::TokenAmounts => 24,
+            DataKey::ArbiterFeeBps => 25,
+            DataKey::DisputeApprovals => 26,
         }
     }
 
@@ -346,6 +362,8 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::Locked), 22);
         assert_eq!(escrow_data_key_index(&DataKey::TokenContracts), 23);
         assert_eq!(escrow_data_key_index(&DataKey::TokenAmounts), 24);
+        assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 25);
+        assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 26);
     }
 }
 
@@ -373,7 +391,8 @@ pub struct Milestone {
 /// `EscrowInfo` is serialised on-chain as an XDR map whose entries are keyed by
 /// field name and sorted alphabetically.  The stable key order is:
 ///
-/// `amount`, `arbiter`, `buyer`, `deadline`, `metadata_hash`, `seller`, `state`, `token_contract`
+/// `amount`, `arbiter`, `arbiter_fee_bps`, `arbiters`, `buyer`, `deadline`,
+/// `metadata_hash`, `seller`, `state`, `threshold`, `token_contract`
 ///
 /// **Renaming, adding, or removing any field is a breaking on-chain ABI change.**
 /// Off-chain clients (SDKs, indexers, test harnesses) that decode this type from
@@ -406,4 +425,13 @@ pub struct EscrowInfo {
     /// ScVal`, not the infallible `From` the generated `Option<T>` glue
     /// requires).
     pub metadata_hash: soroban_sdk::BytesN<32>,
+    /// Arbiter fee in basis points (0–2 000) charged on dispute resolution.
+    /// `None` means no arbiter fee is charged.
+    pub arbiter_fee_bps: Option<u32>,
+    /// Arbiter committee configured for this escrow (`Vec<Address>`).
+    /// Empty when the escrow uses the single-arbiter model.
+    pub arbiters: soroban_sdk::Vec<Address>,
+    /// Number of distinct arbiter approvals required to resolve a dispute
+    /// (`u32`). Zero when the escrow uses the single-arbiter model.
+    pub threshold: u32,
 }

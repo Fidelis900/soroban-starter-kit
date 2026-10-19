@@ -148,3 +148,69 @@ pub fn fee_config_set(env: &Env, admin: &Address, fee_bps: u32, treasury: &Addre
         (fee_bps, treasury.clone()),
     );
 }
+
+/// Emitted when an arbiter fee is paid out of disputed funds (#1288).
+/// Topics: (Symbol, Address) — event name, arbiter
+/// Data: fee_amount — the amount transferred to the arbiter.
+pub fn arbiter_fee_paid(env: &Env, arbiter: &Address, fee_amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "arbiter_fee_paid"), arbiter.clone()),
+        fee_amount,
+    );
+}
+
+/// Emitted when buyer and seller mutually agree to cancel (#1289).
+/// Topics: (Symbol, Address, Address) — event name, buyer, seller
+/// Data: refund_amount — funds returned to the depositor.
+pub fn mutual_cancelled(env: &Env, buyer: &Address, seller: &Address, refund_amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "mutual_cancelled"),
+            buyer.clone(),
+            seller.clone(),
+        ),
+        refund_amount,
+    );
+}
+
+/// Emitted when a milestone is partially released and the remainder refunded (#1290).
+/// Topics: (Symbol, Address, Address, u32) — event name, seller, buyer, milestone_index
+/// Data: (released_amount, refunded_amount)
+pub fn milestone_partial_released(
+    env: &Env,
+    seller: &Address,
+    buyer: &Address,
+    index: u32,
+    released_amount: i128,
+    refunded_amount: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "milestone_partial"),
+            seller.clone(),
+            buyer.clone(),
+            index,
+        ),
+        (released_amount, refunded_amount),
+    );
+}
+
+/// Emitted when an arbiter approves a dispute resolution direction (#1291).
+/// Topics: (Symbol, Address) — event name, arbiter
+/// Data: direction — true releases to seller, false refunds to buyer.
+pub fn arbiter_approved(env: &Env, arbiter: &Address, direction: bool) {
+    env.events().publish(
+        (Symbol::new(env, "arbiter_approved"), arbiter.clone()),
+        direction,
+    );
+}
+
+/// Emitted when a dispute is resolved once the arbiter threshold is met (#1291).
+/// Topics: (Symbol, Address) — event name, arbiter
+/// Data: release_to_seller — true if funds released to seller, false if refunded to buyer.
+pub fn dispute_resolved(env: &Env, arbiter: &Address, release_to_seller: bool) {
+    env.events().publish(
+        (Symbol::new(env, "dispute_resolved"), arbiter.clone()),
+        release_to_seller,
+    );
+}
