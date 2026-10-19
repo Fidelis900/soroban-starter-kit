@@ -216,11 +216,16 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Sold | `sold` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, price | `buy()` called |
 | Cancelled | `cancel` | `(Symbol, u64)` → event name, listing ID | `Address` → seller | `cancel()` called by seller |
 | Swept | `swept` | `(Symbol, u64)` → event name, listing ID | `Address` → seller | `sweep_expired()` called after listing expiry |
-| Offer Made | `offered` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, offer amount | `make_offer()` called |
+| Offer Made | `offered` | `(Symbol, u64)` → event name, listing ID | `(Address, i128, u32)` → buyer, offer amount, expiration ledger | `make_offer()` called |
+| Offers Batch Made | `offers_batch_made` | `(Symbol, Address)` → event name, buyer | `(Vec<u32>, i128, u32)` → token IDs, total escrow transferred, expiration ledger | `make_offers_batch()` called |
 | Offer Accepted | `offracc` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, accepted amount | `accept_offer()` called by seller |
 | Offer Cancelled | `offrcncl` | `(Symbol, u64)` → event name, listing ID | `Address` → buyer | `cancel_offer()` called by buyer |
+| Offer Expired | `offrexp` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, refunded amount | `expire_offer()` called by anyone after the offer's expiration ledger |
+| Staking Contract Set | `stakecfg` | `(Symbol, Address)` → event name, admin | `Option<Address>` → staking contract (`None` to disable) | `set_staking_contract()` called |
+| Min Counter Offer BPS Set | `mincferbps` | `(Symbol, Address)` → event name, admin | `u32` → minimum counter-offer increment in basis points | `set_min_counter_offer_bps()` called |
+| Fee Discount Applied | `feedisc` | `(Symbol, Address)` → event name, fee payer | `(u32, u32)` → original fee bps, discounted fee bps | Fee charged on `buy()` / `accept_offer()` for a staker |
 
-> **Note:** The `cancel`, `offracc`, and `offrcncl` symbols are abbreviated to fit Soroban's 9-byte `symbol_short!` limit.
+> **Note:** The `cancel`, `offracc`, `offrcncl`, `offrexp`, `stakecfg`, `mincferbps`, and `feedisc` symbols are abbreviated to fit Soroban's 9-byte `symbol_short!` limit.
 
 ---
 

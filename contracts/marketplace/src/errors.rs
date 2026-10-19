@@ -34,6 +34,9 @@ pub enum MarketplaceError {
     DuplicateTokenId = 22,
     BundleNotFound = 23,
     BundleInactive = 24,
+    OfferExpired = 16,
+    CounterOfferTooLow = 17,
+    InvalidMinCounterOfferBps = 18,
 }
 
 impl_display_error!(
@@ -65,6 +68,9 @@ impl_display_error!(
     DuplicateTokenId    => "duplicate token id in bundle",
     BundleNotFound      => "bundle not found",
     BundleInactive      => "bundle inactive",
+    OfferExpired        => "offer expired",
+    CounterOfferTooLow  => "counter offer below minimum increment",
+    InvalidMinCounterOfferBps => "invalid minimum counter offer bps",
 );
 
 #[cfg(test)]
@@ -106,6 +112,9 @@ MarketplaceError::EmptyBundle = {}\n\
 MarketplaceError::DuplicateTokenId = {}\n\
 MarketplaceError::BundleNotFound = {}\n\
 MarketplaceError::BundleInactive = {}\n",
+MarketplaceError::OfferExpired = {}\n\
+MarketplaceError::CounterOfferTooLow = {}\n\
+MarketplaceError::InvalidMinCounterOfferBps = {}\n",
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
             MarketplaceError::NotAuthorized as u32,
@@ -133,6 +142,9 @@ MarketplaceError::BundleInactive = {}\n",
             MarketplaceError::DuplicateTokenId as u32,
             MarketplaceError::BundleNotFound as u32,
             MarketplaceError::BundleInactive as u32,
+            MarketplaceError::OfferExpired as u32,
+            MarketplaceError::CounterOfferTooLow as u32,
+            MarketplaceError::InvalidMinCounterOfferBps as u32,
         )
     }
 

@@ -47,6 +47,7 @@ fn setup_escrow<'a>(
         &deadline,
         &0,
         &None,
+        &None,
     );
 
     (client, buyer, seller, arbiter, token_addr)
@@ -148,6 +149,7 @@ proptest! {
 
         let result = client.try_initialize(
             &admin, &buyer, &seller, &arbiter, &token_addr, &1000i128, &bad_deadline, &0, &None,
+            &None,
         );
         prop_assert!(result.is_err());
     }
@@ -291,6 +293,65 @@ fn setup_milestone_escrow<'a>(
         &deadline,
         &0,
         &None,
+        &None,
+    );
+
+    (client, buyer, seller, arbiter, token_addr)
+}
+
+/// Helper: register a milestone escrow with an arbiter fee (in bps).
+fn setup_milestone_escrow_with_fee<'a>(
+    env: &'a Env,
+    total: i128,
+    n_milestones: u32,
+    arbiter_fee_bps: u32,
+) -> (
+    EscrowContractClient<'a>,
+    Address, // buyer
+    Address, // seller
+    Address, // arbiter
+    Address, // token
+) {
+    use soroban_sdk::Vec as SdkVec;
+    use crate::Milestone;
+
+    let admin = Address::generate(env);
+    let buyer = Address::generate(env);
+    let seller = Address::generate(env);
+    let arbiter = Address::generate(env);
+
+    let token_admin = Address::generate(env);
+    let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_addr = sac.address();
+    StellarAssetClient::new(env, &token_addr).mint(&buyer, &total);
+
+    let base = total / n_milestones as i128;
+    let mut milestones = SdkVec::new(env);
+    let mut running = 0i128;
+    for i in 0..n_milestones {
+        let amt = if i == n_milestones - 1 {
+            total - running
+        } else {
+            base
+        };
+        milestones.push_back(Milestone { amount: amt, released: false });
+        running += amt;
+    }
+
+    let escrow_addr = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(env, &escrow_addr);
+    let deadline = env.ledger().sequence() + soroban_common::MIN_DEADLINE_BUFFER + 10;
+    client.initialize_with_milestones(
+        &admin,
+        &buyer,
+        &seller,
+        &arbiter,
+        &token_addr,
+        &milestones,
+        &deadline,
+        &0,
+        &None,
+        &Some(arbiter_fee_bps),
     );
 
     (client, buyer, seller, arbiter, token_addr)
@@ -567,5 +628,159 @@ proptest! {
                 _ => {}
             }
         }
+    }
+
+    // ── Invariant 5: arbiter fee + disbursements never exceed disputed amount ─
+
+    /// When a dispute is resolved with an arbiter fee configured, the fee paid
+    /// to the arbiter plus the amounts disbursed to buyer and seller must never
+    /// exceed the disputed (unreleased) amount, and the contract must end with
+    /// a zero balance.
+    #[test]
+    fn prop_arbiter_fee_conserves_disputed_amount(
+        total in 2i128..=1_000_000i128,
+        n in 1u32..=5u32,
+        fee_bps in 0u32..=2_000u32,
+        favour_seller in any::<bool>(),
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, buyer, seller, arbiter, token_addr) =
+            setup_milestone_escrow_with_fee(&env, total, n, fee_bps);
+
+        client.fund();
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+        let disputed_amount = token_client.balance(&client.address);
+
+        let _ = client.try_raise_dispute(&buyer);
+        if client.get_state() != Some(EscrowState::Disputed) {
+            return Ok(());
+        }
+
+        let arbiter_before = token_client.balance(&arbiter);
+        let buyer_before = token_client.balance(&buyer);
+        let seller_before = token_client.balance(&seller);
+
+        client.resolve_dispute(&arbiter, &favour_seller);
+
+        let arbiter_paid = token_client.balance(&arbiter) - arbiter_before;
+        let buyer_paid = token_client.balance(&buyer) - buyer_before;
+        let seller_paid = token_client.balance(&seller) - seller_before;
+
+        // Fee is exactly fee_bps of the disputed amount.
+        let expected_fee = disputed_amount * fee_bps as i128 / 10_000;
+        prop_assert_eq!(
+            arbiter_paid,
+            expected_fee,
+            "arbiter fee ({arbiter_paid}) must equal {fee_bps} bps of disputed amount ({disputed_amount})"
+        );
+
+        // Conservation: fee + disbursements == disputed amount.
+        prop_assert_eq!(
+            arbiter_paid + buyer_paid + seller_paid,
+            disputed_amount,
+            "fee + disbursements must equal the disputed amount"
+        );
+
+        // Contract balance must be zero after resolution.
+        prop_assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    // ── Invariant 6: mutual_cancel refunds exactly the unreleased balance ────
+
+    /// After funding, a mutual cancellation between buyer and seller refunds
+    /// exactly the unreleased escrowed balance to the depositor and leaves the
+    /// contract with a zero balance in the Cancelled state.
+    #[test]
+    fn prop_mutual_cancel_refunds_unreleased(
+        total in 2i128..=1_000_000i128,
+        n in 1u32..=5u32,
+        release_count in 0u32..=5u32,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, buyer, seller, _arbiter, token_addr) =
+            setup_milestone_escrow(&env, total, n);
+
+        client.fund();
+
+        // Optionally release a few milestones first.
+        for idx in 0..release_count.min(n) {
+            if client.get_state() == Some(EscrowState::Completed) {
+                break;
+            }
+            let _ = client.try_release_milestone(&buyer, &idx);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+        let unreleased = token_client.balance(&client.address);
+        let buyer_before = token_client.balance(&buyer);
+
+        let result = client.try_mutual_cancel(&buyer, &seller);
+        if result.is_err() {
+            // Only valid while funds remain and escrow is not terminal.
+            return Ok(());
+        }
+
+        prop_assert_eq!(client.get_state(), Some(EscrowState::Cancelled));
+        prop_assert_eq!(
+            token_client.balance(&buyer) - buyer_before,
+            unreleased,
+            "mutual_cancel must refund exactly the unreleased balance to the depositor"
+        );
+        prop_assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    // ── Invariant 7: partial milestone approval conserves total balance ──────
+
+    /// Approving a partial milestone release disburses exactly `release_amount`
+    /// to the seller and refunds the remainder of that milestone to the buyer,
+    /// conserving the total contract balance.
+    #[test]
+    fn prop_partial_milestone_conserves_balance(
+        total in 2i128..=1_000_000i128,
+        n in 1u32..=5u32,
+        release_frac_bps in 0u32..=10_000u32,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, buyer, seller, _arbiter, token_addr) =
+            setup_milestone_escrow(&env, total, n);
+
+        client.fund();
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+        let milestones = client.get_milestones();
+        let milestone_amount = milestones.get(0).map(|m| m.amount).unwrap_or(0);
+        let release_amount = milestone_amount * release_frac_bps as i128 / 10_000;
+
+        let contract_before = token_client.balance(&client.address);
+        let seller_before = token_client.balance(&seller);
+        let buyer_before = token_client.balance(&buyer);
+
+        let result = client.try_approve_milestone_partial(&0u32, &release_amount);
+        if result.is_err() {
+            return Ok(());
+        }
+
+        let seller_paid = token_client.balance(&seller) - seller_before;
+        let buyer_refund = token_client.balance(&buyer) - buyer_before;
+
+        prop_assert_eq!(
+            seller_paid,
+            release_amount,
+            "seller must receive exactly the approved release amount"
+        );
+        prop_assert_eq!(
+            seller_paid + buyer_refund,
+            milestone_amount,
+            "approved portion + remainder must equal the milestone allocation"
+        );
+        prop_assert_eq!(
+            token_client.balance(&client.address),
+            contract_before - milestone_amount,
+            "contract balance must decrease by exactly the milestone allocation"
+        );
     }
 }

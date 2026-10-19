@@ -268,10 +268,14 @@ Uses per-address persistent storage (`TicketCount`) for the ticket cap, while th
 | `RoyaltyBps` | Instance | `u32` | Extended on init | Royalty in basis points (e.g. `250` = 2.5%) |
 | `RoyaltyRecipient` | Instance | `Address` | Extended on init | Royalty recipient address |
 | `NextListingId` | Instance | `u64` | Extended on `list` | Auto-incrementing listing ID counter |
+| `StakingContract` | Instance | `Option<Address>` | Extended on init / `set_staking_contract` | Optional staking contract queried for fee-discount tiers; `None` disables discounts |
+| `MinCounterOfferBps` | Instance | `u32` | Extended on init / `set_min_counter_offer_bps` | Minimum percentage increment (basis points) required for a counter-offer over the current highest offer on a listing |
 | `Listing(u64)` | Persistent | `Listing` | Extended on list/buy/cancel | Per-listing seller, price, and active state |
-| `Offer(u64, Address)` | Persistent | `i128` | Extended on offer activity | Escrowed offer amount for a `(listing_id, buyer)` pair |
+| `Offer(u64, Address)` | Persistent | `Offer` | Extended on offer activity | Escrowed offer for a `(listing_id, buyer)` pair |
 
-Per-listing (`Listing(u64)`) and per-`(listing, buyer)` (`Offer`) persistent keys let each listing/offer expire independently of the shared instance config. See `contract-api.md` and `error-reference.md` for a note on `contracts/marketplace/src/lib.rs` currently containing corrupted/duplicated code — this storage layout reflects the authoritative `storage.rs` definitions.
+**`Offer` fields:** `amount`, `expiration_ledger`
+
+Per-listing (`Listing(u64)`) and per-`(listing, buyer)` (`Offer`) persistent keys let each listing/offer expire independently of the shared instance config. Each `Offer` records an `expiration_ledger` set at `make_offer` time; `accept_offer` rejects offers past that ledger, and anyone may call `expire_offer` to refund the escrowed funds to the bidder once expired. When `StakingContract` is configured, the marketplace queries the buyer's/seller's staked balance there to apply a tiered fee discount (20–50% off) before charging the trading fee. See `contract-api.md` and `error-reference.md` for a note on `contracts/marketplace/src/lib.rs` currently containing corrupted/duplicated code — this storage layout reflects the authoritative `storage.rs` definitions.
 
 ---
 

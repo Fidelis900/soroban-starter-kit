@@ -7,6 +7,65 @@ use crate::storage::{DataKey, EscrowState};
 
 use DataKey::*;
 
+const MAX_ARBITER_FEE_BPS: u32 = 2_000;
+const BPS_DENOMINATOR: u32 = 10_000;
+
+/// Compute the arbiter fee owed on `amount` given the configured fee (in bps).
+fn compute_arbiter_fee(env: &Env, amount: i128) -> i128 {
+    let fee_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::ArbiterFeeBps)
+        .unwrap_or(0);
+    if fee_bps == 0 || amount <= 0 {
+        return 0;
+    }
+    let fee = amount
+        .saturating_mul(i128::from(fee_bps))
+        / i128::from(BPS_DENOMINATOR);
+    fee.min(amount)
+}
+
+/// Deduct the arbiter fee from the disputed funds and pay the arbiter.
+/// Returns the remaining amount to be split between buyer and seller.
+fn pay_arbiter_fee(env: &Env, arbiter: &Address, disputed: i128) -> i128 {
+    let fee = compute_arbiter_fee(env, disputed);
+    if fee > 0 {
+        crate::lifecycle::transfer_funds(env, arbiter, fee);
+        events::arbiter_fee_paid(env, arbiter, fee);
+    }
+    disputed.saturating_sub(fee)
+}
+
+/// Resolve the dispute by releasing the remaining (post-fee) funds to the
+/// seller or refunding them to the buyer.
+fn settle(
+    env: Env,
+    arbiter: &Address,
+    release_to_seller_flag: bool,
+) -> Result<(), EscrowError> {
+    let disputed: i128 = get_required(&env, &Amount)?;
+    let remaining = pay_arbiter_fee(&env, arbiter, disputed);
+
+    if release_to_seller_flag {
+        env.storage()
+            .instance()
+            .set(&State, &EscrowState::Delivered);
+        release_to_seller_amount(env, remaining)
+    } else {
+        env.storage().instance().set(&State, &EscrowState::Funded);
+        refund_to_buyer_amount(env, remaining)
+    }
+}
+
+fn release_to_seller_amount(env: Env, amount: i128) -> Result<(), EscrowError> {
+    crate::lifecycle::release_to_seller_amount(env, amount)
+}
+
+fn refund_to_buyer_amount(env: Env, amount: i128) -> Result<(), EscrowError> {
+    crate::lifecycle::refund_to_buyer_amount(env, amount)
+}
+
 pub fn raise_dispute(env: Env, caller: Address) -> Result<(), EscrowError> {
     #[cfg(feature = "pausable")]
     crate::EscrowContract::require_not_paused(&env)?;
@@ -90,27 +149,112 @@ pub fn resolve_dispute(
             .unwrap_or(1);
         resolve_multisig(env, caller, arbiters, required_sigs, release_to_seller_flag)
     } else {
-        resolve_single(env, release_to_seller_flag)
+        resolve_single(env, caller, release_to_seller_flag)
     }
 }
 
-fn resolve_single(env: Env, release_to_seller_flag: bool) -> Result<(), EscrowError> {
+/// Record an arbiter's approval for a dispute outcome. Once the number of
+/// distinct approvals reaches the configured threshold, the dispute is
+/// resolved (including arbiter fee deduction).
+pub fn approve_dispute(
+    env: Env,
+    arbiter: Address,
+    release_to_seller: bool,
+) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let state: EscrowState = get_required(&env, &State)?;
+    if state != EscrowState::Disputed {
+        return Err(EscrowError::InvalidState);
+    }
+
+    let arbiters: soroban_sdk::Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Arbiters)
+        .ok_or(EscrowError::NotInitialized)?;
+
+    if !arbiters.iter().any(|a| a == arbiter) {
+        return Err(EscrowError::NotAuthorized);
+    }
+
+    arbiter.require_auth();
+
+    let required_sigs: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::RequiredSignatures)
+        .unwrap_or(1);
+
+    let mut approvals: soroban_sdk::Vec<(Address, bool)> = env
+        .storage()
+        .instance()
+        .get(&DataKey::DisputeApprovals)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+    // Reject duplicate or conflicting approvals from the same arbiter.
+    for (existing, direction) in approvals.iter() {
+        if existing == arbiter {
+            if direction == release_to_seller {
+                // Duplicate approval for the same direction: no-op.
+                return Ok(());
+            }
+            return Err(EscrowError::NotAuthorized);
+        }
+    }
+
+    approvals.push_back((arbiter.clone(), release_to_seller));
+    env.storage()
+        .instance()
+        .set(&DataKey::DisputeApprovals, &approvals);
+    extend_ttl(&env);
+
+    #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+    let approval_count = approvals.len() as u32;
+    if approval_count < required_sigs {
+        return Ok(());
+    }
+
+    // Threshold reached: verify all approvals agree on a direction.
+    let mut direction: Option<bool> = None;
+    for (_, d) in approvals.iter() {
+        match direction {
+            None => direction = Some(d),
+            Some(prev) if prev != d => return Err(EscrowError::NotAuthorized),
+            _ => {}
+        }
+    }
+    let release = direction.unwrap_or(false);
+
+    env.storage().instance().remove(&DataKey::DisputeApprovals);
+    env.storage()
+        .instance()
+        .remove(&DataKey::ArbiterVotesRelease);
+    env.storage()
+        .instance()
+        .remove(&DataKey::ArbiterVotesRefund);
+
+    settle(env, &arbiter, release)
+}
+
+fn resolve_single(
+    env: Env,
+    caller: Address,
+    release_to_seller_flag: bool,
+) -> Result<(), EscrowError> {
     let arbiter: Address = env
         .storage()
         .instance()
         .get(&Arbiter)
         .ok_or(EscrowError::NotInitialized)?;
+
+    if caller != arbiter {
+        return Err(EscrowError::NotAuthorized);
+    }
     arbiter.require_auth();
 
-    if release_to_seller_flag {
-        env.storage()
-            .instance()
-            .set(&State, &EscrowState::Delivered);
-        release_to_seller(env)
-    } else {
-        env.storage().instance().set(&State, &EscrowState::Funded);
-        refund_to_buyer(env)
-    }
+    settle(env, &arbiter, release_to_seller_flag)
 }
 
 fn resolve_multisig(
@@ -120,82 +264,37 @@ fn resolve_multisig(
     required_sigs: u32,
     release_to_seller_flag: bool,
 ) -> Result<(), EscrowError> {
-    let mut is_valid_arbiter = false;
-    for arbiter in arbiters.iter() {
-        if arbiter == caller {
-            is_valid_arbiter = true;
-            break;
-        }
-    }
-
-    if !is_valid_arbiter {
+    if !arbiters.iter().any(|a| a == caller) {
         return Err(EscrowError::NotAuthorized);
     }
-
     caller.require_auth();
 
-    // Separate vote tracking by direction
-    let votes_key = if release_to_seller_flag {
-        DataKey::ArbiterVotesRelease
-    } else {
-        DataKey::ArbiterVotesRefund
-    };
-
-    let mut votes: soroban_sdk::Vec<Address> = env
+    // Resolution is gated on threshold approvals collected via approve_dispute.
+    let approvals: soroban_sdk::Vec<(Address, bool)> = env
         .storage()
         .instance()
-        .get(&votes_key)
+        .get(&DataKey::DisputeApprovals)
         .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
 
-    // Check if arbiter already voted for this direction
-    if votes.iter().any(|v| v == caller) {
-        // Already voted for this direction, no-op
-        return Ok(());
-    }
-
-    // Check if arbiter already voted for the opposite direction
-    let opposite_key = if release_to_seller_flag {
-        DataKey::ArbiterVotesRefund
-    } else {
-        DataKey::ArbiterVotesRelease
-    };
-
-    let opposite_votes: soroban_sdk::Vec<Address> = env
-        .storage()
-        .instance()
-        .get(&opposite_key)
-        .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-
-    if opposite_votes.iter().any(|v| v == caller) {
-        // Arbiter already voted for the opposite direction - reject conflicting vote
+    #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+    let approval_count = approvals.len() as u32;
+    if approval_count < required_sigs {
         return Err(EscrowError::NotAuthorized);
     }
 
-    // Record the vote for this direction
-    votes.push_back(caller.clone());
-    env.storage().instance().set(&votes_key, &votes);
-
-    #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
-    if votes.len() as u32 >= required_sigs {
-        // Threshold reached for this direction - resolve the dispute
-        env.storage()
-            .instance()
-            .remove(&DataKey::ArbiterVotesRelease);
-        env.storage()
-            .instance()
-            .remove(&DataKey::ArbiterVotesRefund);
-        extend_ttl(&env);
-        if release_to_seller_flag {
-            env.storage()
-                .instance()
-                .set(&State, &EscrowState::Delivered);
-            release_to_seller(env)
-        } else {
-            env.storage().instance().set(&State, &EscrowState::Funded);
-            refund_to_buyer(env)
+    for (_, direction) in approvals.iter() {
+        if direction != release_to_seller_flag {
+            return Err(EscrowError::NotAuthorized);
         }
-    } else {
-        extend_ttl(&env);
-        Ok(())
     }
+
+    env.storage().instance().remove(&DataKey::DisputeApprovals);
+    env.storage()
+        .instance()
+        .remove(&DataKey::ArbiterVotesRelease);
+    env.storage()
+        .instance()
+        .remove(&DataKey::ArbiterVotesRefund);
+
+    settle(env, &caller, release_to_seller_flag)
 }

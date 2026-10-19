@@ -115,6 +115,75 @@ fn bench_buy(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_make_offers_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("marketplace_make_offers_batch");
+
+    group.bench_function("make_offers_batch", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let (token_address, token_client) = setup_token(&env, &admin);
+
+            let seller = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            token_client.mint(&seller, &1_000_000);
+            token_client.mint(&buyer, &1_000_000);
+
+            let mut token_ids = soroban_sdk::Vec::new(&env);
+            let mut prices = soroban_sdk::Vec::new(&env);
+            for i in 0..10u32 {
+                let listing_id = client.list(
+                    &seller,
+                    &token_address,
+                    &100_000,
+                    &String::from_str(&env, "Test Listing"),
+                );
+                token_ids.push_back(listing_id);
+                prices.push_back(50_000i128 + i as i128);
+            }
+
+            let expiration = env.ledger().sequence() + 1_000;
+            client.make_offers_batch(&buyer, &token_ids, &prices, &expiration);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_expire_offer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("marketplace_expire_offer");
+
+    group.bench_function("expire_offer", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let (token_address, token_client) = setup_token(&env, &admin);
+
+            let seller = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            token_client.mint(&seller, &1_000_000);
+            token_client.mint(&buyer, &1_000_000);
+
+            let listing_id = client.list(
+                &seller,
+                &token_address,
+                &100_000,
+                &String::from_str(&env, "Test Listing"),
+            );
+
+            let expiration = env.ledger().sequence() + 10;
+            let offer_id = client.make_offer(&buyer, &listing_id, &50_000, &expiration);
+
+            env.ledger().set_sequence_number(expiration + 1);
+            client.expire_offer(&offer_id);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_cancel_listing(c: &mut Criterion) {
     let mut group = c.benchmark_group("marketplace_cancel_listing");
 
@@ -147,6 +216,8 @@ criterion_group!(
     bench_initialize,
     bench_list,
     bench_buy,
+    bench_make_offers_batch,
+    bench_expire_offer,
     bench_cancel_listing
 );
 criterion_main!(benches);

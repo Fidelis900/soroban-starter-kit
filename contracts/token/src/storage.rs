@@ -45,6 +45,10 @@ pub enum DataKey {
     /// entries for a given account, used for O(log N) binary-search lookups
     /// by `balance_at` (issue #1175).
     SnapshotHistory(Address),
+    /// Persistent storage – transfer lockup deadline (`u32` ledger sequence)
+    /// for a given [`Address`]. Transfers from the account are rejected until
+    /// `env.ledger().sequence() > lock_ledger` (issue #1281).
+    TransferLock(Address),
 }
 
 #[contracttype]
@@ -115,6 +119,7 @@ mod discriminant_tests {
             DataKey::Blacklisted(_) => 16,
             DataKey::ComplianceTreasury => 17,
             DataKey::SnapshotHistory(_) => 18,
+            DataKey::TransferLock(_) => 19,
         }
     }
 
@@ -168,6 +173,10 @@ mod discriminant_tests {
         assert_eq!(
             token_data_key_index(&DataKey::SnapshotHistory(Address::generate(&env))),
             18
+        );
+        assert_eq!(
+            token_data_key_index(&DataKey::TransferLock(Address::generate(&env))),
+            19
         );
     }
 

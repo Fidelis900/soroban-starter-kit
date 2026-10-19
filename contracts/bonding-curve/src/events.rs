@@ -74,5 +74,39 @@ pub fn price_surge_detected(
     env.events().publish(
         (Symbol::new(env, "price_surge_detected"),),
         (reference_price, current_price, ledger),
+/// Detailed sale telemetry including the dynamic exit-fee breakdown:
+/// (trader, tokens_in, tokens_out, new_spot_price, base_fee, exit_fee, reserve_routed).
+/// `base_fee` is the standard fee, `exit_fee` is the additional duration-based
+/// penalty, and `reserve_routed` is the portion of the exit fee credited to the
+/// curve reserve backing.
+pub fn sold_with_exit_fee(
+    env: &Env,
+    seller: &Address,
+    tokens_in: i128,
+    tokens_out: i128,
+    new_spot_price: i128,
+    base_fee: i128,
+    exit_fee: i128,
+    reserve_routed: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "sold_exit_fee"), seller.clone()),
+        (
+            tokens_in,
+            tokens_out,
+            new_spot_price,
+            base_fee,
+            exit_fee,
+            reserve_routed,
+        ),
+    );
+}
+
+/// Emitted when the curve is configured with the sigmoid model.
+/// `midpoint` is the supply inflection point and `steepness` controls curvature.
+pub fn sigmoid_configured(env: &Env, midpoint: i128, steepness: u32) {
+    env.events().publish(
+        (Symbol::new(env, "sigmoid_cfg"),),
+        (midpoint, steepness),
     );
 }

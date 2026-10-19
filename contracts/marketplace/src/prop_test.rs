@@ -586,7 +586,12 @@ mod stateful {
                     res.is_ok()
                 }
                 Op::MakeOffer { buyer, listing, amount } => {
-                    let _ = self.client.try_make_offer(&self.buyers[buyer], &listing, &amount);
+                    let _ = self.client.try_make_offer(
+                        &self.buyers[buyer],
+                        &listing,
+                        &amount,
+                        &(seq + 20),
+                    );
                     false
                 }
                 Op::AcceptOffer { listing, buyer } => {
@@ -744,8 +749,9 @@ mod stateful {
         let mut h = Harness::new(&env);
         h.apply(&Op::List { token: 1, price: 1_000 });
         let b = h.buyers[0].clone();
-        h.client.make_offer(&b, &0, &300);
-        h.client.make_offer(&b, &0, &700);
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b, &0, &300, &expiry);
+        h.client.make_offer(&b, &0, &700, &expiry);
         assert_eq!(h.client.get_offer(&0, &b), Some(700));
         assert_eq!(h.token.balance(&h.marketplace), 700);
         assert_eq!(h.token.balance(&b), MINT - 700);
@@ -761,8 +767,9 @@ mod stateful {
         h.apply(&Op::ListWithExpiry { token: 1, price: 1_000, ttl: 5 });
         h.apply(&Op::List { token: 2, price: 1_000 });
         let (b0, b1) = (h.buyers[0].clone(), h.buyers[1].clone());
-        h.client.make_offer(&b0, &0, &400);
-        h.client.make_offer(&b0, &1, &500);
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b0, &0, &400, &expiry);
+        h.client.make_offer(&b0, &1, &500, &expiry);
 
         h.apply(&Op::AdvanceLedger { by: 10 });
         assert_eq!(
@@ -789,5 +796,81 @@ mod stateful {
         assert_eq!(h.nft.owner_of(&1), h.seller);
         h.drain().unwrap();
         assert_eq!(h.token.balance(&h.buyers[2]), MINT);
+    }
+
+    /// Edge case: an expired listing offer cannot be accepted, but anyone can
+    /// call `expire_offer` to refund the bidder's escrowed funds.
+    #[test]
+    fn expired_offer_refunded_by_anyone() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        h.apply(&Op::List { token: 1, price: 1_000 });
+        let bidder = h.buyers[0].clone();
+        let stranger = h.buyers[1].clone();
+        let expiry = h.env.ledger().sequence() + 5;
+        h.client.make_offer(&bidder, &0, &400, &expiry);
+        assert_eq!(h.token.balance(&h.marketplace), 400);
+
+        // Not yet expired: acceptance is allowed, expiry is rejected.
+        assert!(h.client.try_expire_offer(&stranger, &0, &bidder).is_err());
+
+        h.apply(&Op::AdvanceLedger { by: 10 });
+        // Acceptance of an expired offer must fail.
+        assert!(h.client.try_accept_offer(&h.seller, &0, &bidder).is_err());
+        // Permissionless expiry refunds the bidder.
+        h.client.expire_offer(&stranger, &0, &bidder);
+        assert_eq!(h.client.get_offer(&0, &bidder), None);
+        assert_eq!(h.token.balance(&bidder), MINT);
+        assert_eq!(h.token.balance(&h.marketplace), 0);
+        h.drain().unwrap();
+    }
+
+    /// Edge case: batch offer creation escrows the aggregate sum in one transfer
+    /// and each individual offer is recorded.
+    #[test]
+    fn batch_offers_escrow_aggregate() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        for token in 1..=3u32 {
+            h.apply(&Op::List { token, price: 1_000 });
+        }
+        let buyer = h.buyers[0].clone();
+        let expiry = h.env.ledger().sequence() + 50;
+        let token_ids = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+        let prices = soroban_sdk::vec![&env, 100i128, 200i128, 300i128];
+        h.client
+            .make_offers_batch(&buyer, &token_ids, &prices, &expiry);
+
+        assert_eq!(h.token.balance(&buyer), MINT - 600);
+        assert_eq!(h.token.balance(&h.marketplace), 600);
+        assert_eq!(h.client.get_offer(&0, &buyer), Some(100));
+        assert_eq!(h.client.get_offer(&1, &buyer), Some(200));
+        assert_eq!(h.client.get_offer(&2, &buyer), Some(300));
+        h.drain().unwrap();
+        assert_eq!(h.token.balance(&buyer), MINT);
+    }
+
+    /// Edge case: a counter-offer must improve on the current highest offer by
+    /// at least the configured minimum increment.
+    #[test]
+    fn counter_offer_min_increment_enforced() {
+        let env = Env::default();
+        let mut h = Harness::new(&env);
+        h.apply(&Op::List { token: 1, price: 10_000 });
+        let (b0, b1) = (h.buyers[0].clone(), h.buyers[1].clone());
+        let expiry = h.env.ledger().sequence() + 100;
+        h.client.make_offer(&b0, &0, &1_000, &expiry);
+
+        // +1 stroop is below the minimum increment and must be rejected.
+        assert!(h.client.try_make_offer(&b1, &0, &1_001, &expiry).is_err());
+        assert_eq!(h.client.get_offer(&0, &b0), Some(1_000));
+        assert_eq!(h.token.balance(&h.marketplace), 1_000);
+
+        // A genuine improvement is accepted.
+        h.client.make_offer(&b1, &0, &1_100, &expiry);
+        assert_eq!(h.client.get_offer(&0, &b1), Some(1_100));
+        // The superseded bidder is refunded.
+        assert_eq!(h.token.balance(&b0), MINT);
+        h.drain().unwrap();
     }
 }

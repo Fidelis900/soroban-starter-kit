@@ -611,9 +611,15 @@ passed to `initialize` is always whitelisted). Batch entry points accept at most
 | `cancel_batch` | `env: Env, seller: Address, listing_ids: Vec<u64>` | `Result<(), MarketplaceError>` | `EmptyBatch`, `BatchTooLarge`, + `cancel` errors |
 | `sweep_expired` | `env: Env, seller: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `ListingNotFound`, `ListingInactive`, `ListingNotExpired` |
 | `invalidate_listing` | `env: Env, listing_id: u64` (permissionless) | `Result<bool, MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive` |
-| `make_offer` | `env: Env, buyer: Address, listing_id: u64, amount: i128` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `InvalidOfferAmount` |
-| `accept_offer` | `env: Env, seller: Address, listing_id: u64, buyer: Address` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `NotAuthorized`, `OfferNotFound`, `SellerNotOwner` |
+| `make_offer` | `env: Env, buyer: Address, listing_id: u64, amount: i128, expiration_ledger: u32` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `InvalidOfferAmount`, `InvalidExpiry`, `OfferIncrementTooLow` |
+| `make_offers_batch` | `env: Env, buyer: Address, token_ids: Vec<u32>, prices: Vec<i128>, expiration: u32` | `Result<(), MarketplaceError>` | `NotInitialized`, `EmptyBatch`, `BatchTooLarge`, `InvalidOfferAmount`, `InvalidExpiry`, `OfferIncrementTooLow` |
+| `accept_offer` | `env: Env, seller: Address, listing_id: u64, buyer: Address` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `NotAuthorized`, `OfferNotFound`, `OfferExpired`, `SellerNotOwner` |
 | `cancel_offer` | `env: Env, buyer: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `OfferNotFound` |
+| `expire_offer` | `env: Env, listing_id: u64, buyer: Address` (permissionless) | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `OfferNotFound`, `OfferNotExpired` |
+| `set_staking_contract` | `env: Env, staking_contract: Option<Address>` (admin) | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized` |
+| `get_staking_contract` | `env: Env` | `Option<Address>` | None |
+| `set_min_counter_offer_bps` | `env: Env, min_counter_offer_bps: u32` (admin) | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `InvalidRoyalty` |
+| `get_min_counter_offer_bps` | `env: Env` | `u32` | None |
 | `sweep_offers` | `env: Env, listing_id: u64, buyers: Vec<Address>` (permissionless) | `Result<u32, MarketplaceError>` | `NotInitialized`, `EmptyBatch`, `BatchTooLarge`, `ListingNotFound`, `ListingStillActive` |
 | `get_listing` | `env: Env, listing_id: u64` | `Option<Listing>` | None |
 | `get_offer` | `env: Env, listing_id: u64, buyer: Address` | `Option<i128>` | None |
@@ -633,6 +639,14 @@ passed to `initialize` is always whitelisted). Batch entry points accept at most
 | `get_royalty_splits` | `env: Env` | `Vec<(Address, u32)>` | None |
 
 `buy` takes a `max_price` slippage bound: pass the price you observed; the call fails with `PriceExceedsMax` if the listing price is higher when it executes.
+
+**Offer expiry (#1312):** `make_offer` escrows `amount` from the buyer and records an `expiration_ledger` on the offer. `accept_offer` rejects an offer whose `expiration_ledger` has been reached with `OfferExpired`. Once expired, anyone may call `expire_offer(listing_id, buyer)` to refund the escrowed funds to the buyer and remove the offer; calling it before expiry fails with `OfferNotExpired`.
+
+**Batch offers (#1313):** `make_offers_batch` creates one offer per `(token_id, price)` pair against the corresponding active listing, all with the same `expiration` ledger. The total escrow (`sum(prices)`) is transferred from the buyer in a single token `transfer` call, and the batch is all-or-nothing: any invalid entry (missing/inactive listing, bad amount, expired `expiration`, or an increment below the minimum) aborts the whole call.
+
+**Minimum counter-offer increment (#1315):** when `min_counter_offer_bps` is non-zero, a new offer on a listing that already has a higher offer must exceed that highest offer by at least `min_counter_offer_bps` basis points (e.g. `500` = +5%). Offers that fail the threshold are rejected with `OfferIncrementTooLow`. The admin configures the threshold with `set_min_counter_offer_bps` (`0` disables the check).
+
+**Staker fee discounts (#1314):** when a staking contract is configured via `set_staking_contract(Some(address))`, the marketplace queries the buyer's (and, where applicable, the seller's) staked balance from that contract before computing the trading fee and applies a tiered discount — roughly 20% off at the lower stake tiers up to 50% off at the highest. With no staking contract configured (`None`, the default) the full fee applies. The staking contract must expose `get_stake(staker: Address) -> i128`.
 
 `set_royalty_splits` splits the marketplace royalty across up to 10 `(recipient, bps)` entries whose basis points sum to the total royalty (≤ 10 000). A royalty returned by the NFT contract's `royalty_info` still takes priority.
 
@@ -657,6 +671,9 @@ passed to `initialize` is always whitelisted). Batch entry points accept at most
 - `EmptyBatch` (16) — Batch contains no items
 - `ListingStillActive` (17) — `sweep_offers` called on an open listing
 - `Reentrant` (18) — Reentrancy guard already held
+- `OfferExpired` (19) — `accept_offer` called on an offer past its `expiration_ledger`
+- `OfferNotExpired` (20) — `expire_offer` called before the offer's `expiration_ledger`
+- `OfferIncrementTooLow` (21) — Offer does not exceed the current highest offer by `min_counter_offer_bps`
 
 ---
 

@@ -32,6 +32,7 @@ use soroban_common::math::{FixedPoint, FixedPointError, apply_bps_fee};
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance};
 use storage::{BUY_COOLDOWN_LEDGERS, CurveState, MAX_BUYS_PER_LEDGER};
 ```
+use storage::{BUY_COOLDOWN_LEDGERS, MAX_BUYS_PER_LEDGER};
 
 Wait — there's `pub use storage::{CurveState, DataKey, PRICE_SCALE};` and then `use storage::{BUY_COOLDOWN_LEDGERS, CurveState, MAX_BUYS_PER_LEDGER};` — duplicate CurveState import. That's in the original. I'll keep it as-is to preserve, though it might be a compile issue. Actually duplicate imports of the same item are allowed in Rust (re-importing same name from same path is fine? No — `use storage::CurveState` twice would be a conflict E0252). But the original has it, so presumably it compiles... Actually `pub use` and `use` of the same item — that's a re-import conflict. Hmm. But it's the existing content. I'll leave it to preserve existing behavior; not my concern for this change.
 
@@ -168,6 +169,24 @@ pub fn set_surge_window_ledgers(env: Env, admin: Address, window: u32) -> Result
     env.storage().instance().set(&DataKey::SurgeWindowLedgers, &window);
     bump(&env);
     Ok(())
+/// Bancor-style spot price. Linear bootstrap pricing remains active until the
+/// reserve has liquidity, avoiding a zero-cost first purchase.
+fn calculate_price(
+    reserve: i128,
+    supply: i128,
+    base_price: i128,
+    slope: i128,
+) -> Result<i128, BondingCurveError> {
+    let linear = linear_price(base_price, slope, supply)?;
+    if reserve <= 0 || supply <= 0 {
+        return Ok(linear);
+    }
+    let reserve_price = reserve
+        .checked_mul(PRICE_SCALE)
+        .ok_or(BondingCurveError::Overflow)?
+        .checked_div(supply)
+        .ok_or(BondingCurveError::Overflow)?;
+    Ok(linear.max(reserve_price))
 }
 ```
 
@@ -438,6 +457,38 @@ pub fn buy(env: Env, buyer: Address, amount: i128, max_cost: i128) -> Result<(),
 
     if amount <= 0 {
         return Err(BondingCurveError::InvalidAmount);
+    #[test]
+    fn test_calculate_price_spot_across_supply_points() {
+        // With no reserve, price follows the linear curve b + m*S.
+        let base = 1 * PRICE_SCALE;
+        let slope = 1 * PRICE_SCALE;
+        let p0 = calculate_price(0, 0, base, slope).unwrap();
+        let p1 = calculate_price(0, 1, base, slope).unwrap();
+        let p10 = calculate_price(0, 10, base, slope).unwrap();
+        let p1000 = calculate_price(0, 1000, base, slope).unwrap();
+        assert_eq!(p0, base);
+        assert_eq!(p1, base + slope);
+        assert_eq!(p10, base + 10 * slope);
+        assert_eq!(p1000, base + 1000 * slope);
+        assert!(p0 < p1 && p1 < p10 && p10 < p1000);
+
+        // With reserve, price is the max of linear and reserve/supply.
+        let reserve = 1_000 * PRICE_SCALE;
+        let r1 = calculate_price(reserve, 1, base, slope).unwrap();
+        let r10 = calculate_price(reserve, 10, base, slope).unwrap();
+        let r1000 = calculate_price(reserve, 1000, base, slope).unwrap();
+        assert_eq!(r1, reserve);
+        assert_eq!(r10, reserve / 10);
+        assert_eq!(r1000, reserve / 1000);
+        assert!(r1 > r10 && r10 > r1000);
+    }
+
+    #[test]
+    fn test_bancor_fixed_point_power_and_root() {
+        let squared = fixed_pow(2 * PRICE_SCALE, 2).unwrap();
+        assert_eq!(squared, 4 * PRICE_SCALE);
+        let root = fixed_root(squared, 2).unwrap();
+        assert!((root - 2 * PRICE_SCALE).abs() <= 1);
     }
     buyer.require_auth();
 

@@ -72,6 +72,20 @@ pub(crate) fn require_not_blacklisted(env: &Env, account: &Address) -> Result<()
     Ok(())
 }
 
+/// Reject transfers from `account` while its transfer lockup is still active.
+pub(crate) fn require_not_locked(env: &Env, account: &Address) -> Result<(), TokenError> {
+    if let Some(lock_ledger) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::TransferLock(account.clone()))
+    {
+        if env.ledger().sequence() <= lock_ledger {
+            return Err(TokenError::Unauthorized);
+        }
+    }
+    Ok(())
+}
+
 pub use contract::*;
 
 // The `#[contract]` / `#[contractimpl]` macros generate an undocumented public
@@ -498,6 +512,76 @@ mod contract {
             permit::is_permit_nonce_cancelled(env, owner, nonce)
         }
 
+        /// Atomically increase `spender`'s allowance over `from`'s tokens by `delta`.
+        ///
+        /// Unlike `approve`, this avoids the front-running window where a spender
+        /// can spend both the old and new allowance before the update settles.
+        /// `from` must authorize the call.
+        ///
+        /// # Errors
+        /// - [`TokenError::InvalidAmount`] if `delta` is negative.
+        /// - [`TokenError::Overflow`] if the resulting allowance overflows.
+        pub fn increase_allowance(
+            env: Env,
+            from: Address,
+            spender: Address,
+            delta: i128,
+        ) -> Result<(), TokenError> {
+            allowance::increase_allowance(env, from, spender, delta)
+        }
+
+        /// Atomically decrease `spender`'s allowance over `from`'s tokens by `delta`.
+        ///
+        /// Unlike `approve`, this avoids the front-running window where a spender
+        /// can spend both the old and new allowance before the update settles.
+        /// `from` must authorize the call.
+        ///
+        /// # Errors
+        /// - [`TokenError::InvalidAmount`] if `delta` is negative.
+        /// - [`TokenError::InsufficientAllowance`] if `delta` exceeds the current allowance.
+        pub fn decrease_allowance(
+            env: Env,
+            from: Address,
+            spender: Address,
+            delta: i128,
+        ) -> Result<(), TokenError> {
+            allowance::decrease_allowance(env, from, spender, delta)
+        }
+
+        /// Set the ledger sequence after which `account` may transfer tokens.
+        ///
+        /// Transfers from `account` are rejected until
+        /// `env.ledger().sequence() > lock_ledger`. Admin only. Useful for
+        /// team, advisor, and private-sale lockups without a separate vesting
+        /// contract.
+        pub fn set_transfer_lock(
+            env: Env,
+            account: Address,
+            lock_ledger: u32,
+        ) -> Result<(), TokenError> {
+            let admin = require_admin(&env)?;
+            admin.require_auth();
+            env.storage()
+                .persistent()
+                .set(&DataKey::TransferLock(account.clone()), &lock_ledger);
+            extend_ttl_persistent(
+                &env,
+                &DataKey::TransferLock(account.clone()),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+            events::transfer_lock_set(&env, &account, lock_ledger);
+            Ok(())
+        }
+
+        /// Return the transfer lockup deadline for `account`, if any.
+        #[must_use]
+        pub fn transfer_lock(env: Env, account: Address) -> Option<u32> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::TransferLock(account))
+        }
+
         /// Grant `spender` an allowance over `owner`'s tokens using a pre-signed,
         /// owner-authorized message instead of the owner submitting the transaction
         /// themselves. Analogous to ERC-2612 `permit`.
@@ -806,6 +890,7 @@ mod contract {
             if amount <= 0 {
                 return Err(TokenError::InvalidAmount);
             }
+            require_not_locked(env, &from)?;
             Self::update_balance(env, &from, -amount)?;
             Self::update_balance(env, &to, amount)?;
             events::transferred(env, &from, &to, amount);
@@ -856,6 +941,7 @@ mod contract {
             require_not_frozen(env, &from)?;
             #[cfg(feature = "freeze")]
             require_not_blacklisted(env, &from)?;
+            require_not_locked(env, &from)?;
 
             if recipients.is_empty() {
                 return Err(TokenError::InvalidAmount);
@@ -975,6 +1061,7 @@ mod contract {
             if let Err(e) = require_not_blacklisted(env, &from) {
                 return Err(e);
             }
+            require_not_locked(env, &from)?;
 
             if transfers.is_empty() {
                 return Err(TokenError::InvalidAmount);

@@ -41,6 +41,9 @@ pub enum DataKey {
     RefPrice,
     /// Ledger sequence at which `RefPrice` was recorded (instance).
     RefLedger,
+    /// Sigmoid curve configuration: midpoint (in supply units) and steepness
+    /// (fixed-point scale multiplier). Stored in instance storage.
+    SigmoidConfig,
 }
 
 /// Fixed-point scale used for prices, slopes, and ratios.
@@ -65,6 +68,28 @@ pub const BUY_COOLDOWN_LEDGERS: u32 = 1;
 /// Default look-back window (in ledgers) used by the price-surge circuit
 /// breaker when `SurgeWindowLedgers` has not been configured.
 pub const DEFAULT_SURGE_WINDOW_LEDGERS: u32 = 20;
+/// Selects the pricing model used by the bonding curve.
+///
+/// * `Linear` — constant slope price curve.
+/// * `Power` — power-law curve driven by the connector weight.
+/// * `Sigmoid` — S-curve dynamics: cheap early tokens, rapid price growth
+///   during adoption, and a plateau as supply matures.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CurveModel {
+    /// Linear price curve.
+    Linear,
+    /// Power curve (connector-weight driven).
+    Power,
+    /// Sigmoid (S-curve) price model.
+    ///
+    /// * `midpoint` — supply value (in token base units) at which the curve's
+    ///   inflection point sits; the price grows fastest around this supply.
+    /// * `steepness` — fixed-point scale multiplier controlling how sharply
+    ///   the curve transitions through the midpoint. Larger values yield a
+    ///   steeper S-shape.
+    Sigmoid { midpoint: i128, steepness: u32 },
+}
 
 /// Represents the lifecycle state of the bonding curve.
 #[contracttype]

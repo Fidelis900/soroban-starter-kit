@@ -10,7 +10,7 @@ extern crate std;
 //! Party A escrows tokens when proposing a swap. Party B supplies the matching
 //! tokens on acceptance; cancellation returns the escrow to Party A.
 
-use soroban_sdk::{Address, Env, Vec, contract, contractimpl, token};
+use soroban_sdk::{Address, BytesN, Env, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
@@ -68,8 +68,24 @@ fn map_state_err(state: SwapState) -> SwapError {
     match state {
         SwapState::Executed => SwapError::AlreadyCompleted,
         SwapState::Cancelled => SwapError::AlreadyCancelled,
+        SwapState::Expired => SwapError::AlreadyCancelled,
         SwapState::Pending => SwapError::InvalidState,
     }
+}
+
+/// Return the contract's current balance of `token`.
+fn token_balance(env: &Env, token: &Address) -> i128 {
+    token::Client::new(env, token).balance(&env.current_contract_address())
+}
+
+/// Transfer `amount` of `token` from `from` into the contract and return the
+/// actual amount received (post-balance minus pre-balance). This accounts for
+/// fee-on-transfer tokens where the contract receives less than `amount`.
+fn transfer_in_measured(env: &Env, token: &Address, from: &Address, amount: i128) -> i128 {
+    let before = token_balance(env, token);
+    token::Client::new(env, token).transfer(from, &env.current_contract_address(), amount);
+    let after = token_balance(env, token);
+    after.saturating_sub(before)
 }
 
 fn require_pending(state: SwapState) -> Result<(), SwapError> {
@@ -293,6 +309,13 @@ mod contract {
         /// - [`SwapError::NotInitialized`]
         /// - [`SwapError::InvalidAmount`] if amounts <= 0.
         /// - [`SwapError::InvalidDeadline`] if `expires_at` <= current ledger.
+        /// Propose a new swap. Party A proposes a swap of `amount_a` of `token_a`
+        /// for `amount_b` of `token_b`. Returns the swap ID.
+        ///
+        /// # Errors
+        /// - [`SwapError::NotInitialized`]
+        /// - [`SwapError::InvalidAmount`] if amounts <= 0.
+        /// - [`SwapError::InvalidDeadline`] if `expires_at` <= current ledger.
         #[allow(clippy::too_many_arguments)]
         pub fn propose_swap(
             env: Env,
@@ -306,10 +329,25 @@ mod contract {
             max_execution_delay: Option<u32>,
         ) -> Result<u32, SwapError> {
             Self::propose_swap_with_options(
-                env, party_a, token_a, amount_a, token_b, amount_b, expires_at, false, false,
+                env,
+                party_a,
+                token_a,
+                amount_a,
+                token_b,
+                amount_b,
+                expires_at,
+                allowed_counterparty,
+                max_execution_delay,
+                false,
+                false,
+                None,
             )
         }
 
+        /// Propose a swap with explicit partial-fill, escrow and HTLC options.
+        ///
+        /// When `hash_lock` is set the swap can only be executed by revealing a
+        /// `secret_preimage` whose SHA-256 digest matches the lock.
         #[allow(clippy::too_many_arguments)]
         pub fn propose_swap_with_options(
             env: Env,
@@ -319,28 +357,16 @@ mod contract {
             token_b: Address,
             amount_b: i128,
             expires_at: u32,
-            allow_partial: bool,
+            allowed_counterparty: Option<Address>,
+            max_execution_delay: Option<u32>,
+            allow_partial_fills: bool,
             escrowed: bool,
+            hash_lock: Option<BytesN<32>>,
         ) -> Result<u32, SwapError> {
             get_required::<bool>(&env, &DataKey::Initialized)?;
             party_a.require_auth();
             ensure_valid_leg_amount(amount_a)?;
             ensure_valid_leg_amount(amount_b)?;
-            let _admin: Address = get_instance(&env, &DataKey::Admin)?;
-            party_a.require_auth();
-            if amount_a <= 0 || amount_b <= 0 {
-                return Err(SwapError::InvalidAmount);
-            }
-            if expires_at <= env.ledger().sequence() {
-            if !env.storage().instance().has(&DataKey::Admin) {
-                return Err(SwapError::NotInitialized);
-            }
-
-            party_a.require_auth();
-
-            if amount_a <= 0 || amount_b <= 0 {
-                return Err(SwapError::InvalidAmount);
-            }
 
             let current_ledger = env.ledger().sequence();
             if expires_at <= current_ledger {
@@ -349,32 +375,22 @@ mod contract {
             let id: u32 = get_instance(&env, &DataKey::SwapCount)?;
             let next_id = id.checked_add(1).ok_or(SwapError::InvalidAmount)?;
 
-            // Escrow token_a from party_a to this contract
-            token::Client::new(&env, &token_a).transfer(
-                &party_a,
-                &env.current_contract_address(),
-                &amount_a,
-            );
+            // Escrow token_a from party_a to this contract, measuring the actual
+            // amount received to remain resilient to fee-on-transfer tokens.
+            let received_a = transfer_in_measured(&env, &token_a, &party_a, amount_a);
             let swap = SwapInfo {
                 id,
 
-            let swap_id: u32 = env.storage().instance().get(&SwapCount).unwrap_or(0);
-            let next_id = swap_id.checked_add(1).ok_or(SwapError::StorageError)?;
-
-            if escrowed {
-                token::Client::new(&env, &token_a).transfer(
-                    &party_a,
-                    &env.current_contract_address(),
-                    &amount_a,
-                );
-            }
             let swap_id: u32 = env
                 .storage()
                 .instance()
                 .get(&DataKey::SwapCount)
                 .unwrap_or(0);
             let next_id = swap_id.checked_add(1).ok_or(SwapError::InvalidAmount)?;
-            env.storage().instance().set(&DataKey::SwapCount, &next_id);
+
+            if escrowed {
+                transfer_in_measured(&env, &token_a, &party_a, amount_a);
+            }
 
             let swap = SwapInfo {
                 id: swap_id,
@@ -384,43 +400,23 @@ mod contract {
                 token_b: token_b.clone(),
                 amount_b,
                 expires_at,
-                state: SwapState::Open,
-            };
-            env.storage().persistent().set(&DataKey::Swap(id), &swap);
-            env.storage().instance().set(&DataKey::SwapCount, &next_id);
-            bump_swap(&env, id);
-            bump_instance(&env);
-            events::swap_proposed(
-                &env, &party_a, id, &token_a, amount_a, &token_b, amount_b, expires_at,
-            );
-            Ok(id)
-        }
-
-        /// Accept an open swap and atomically exchange both parties' assets.
-        pub fn accept_swap(env: Env, swap_id: u32, party_b: Address) -> Result<u32, SwapError> {
-            let treasury: Address = get_instance(&env, &DataKey::Treasury)?;
-            let fee_bps: u32 = get_instance(&env, &DataKey::FeeBps)?;
                 state: SwapState::Pending,
                 filled_amount: 0,
-                allow_partial,
+                remaining_amount: amount_a,
+                allow_partial_fills,
                 escrowed,
-            };
                 allowed_counterparty: allowed_counterparty.clone(),
                 max_execution_delay,
                 created_at: current_ledger,
+                hash_lock,
             };
             env.storage()
                 .persistent()
                 .set(&SwapKey::Swap(swap_id), &swap);
-
-            env.storage().persistent().set(&SwapKey::Swap(swap_id), &swap);
-            env.storage().instance().set(&SwapCount, &next_id);
+            env.storage().instance().set(&DataKey::SwapCount, &next_id);
             extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
             bump_persistent(&env, &SwapKey::Swap(swap_id));
             bump_instance(&env);
-            events::swap_proposed(
-                &env, &party_a, swap_id, &token_a, amount_a, &token_b, amount_b, expires_at,
-
             events::swap_proposed(
                 &env,
                 &party_a,
@@ -435,25 +431,6 @@ mod contract {
             Ok(swap_id)
         }
 
-        pub fn accept_swap(env: Env, swap_id: u32, party_b: Address) -> Result<u32, SwapError> {
-            let swap: SwapInfo = env
-                .storage()
-                .persistent()
-                .get(&SwapKey::Swap(swap_id))
-                .ok_or(SwapError::SwapNotFound)?;
-            require_pending(swap.state)?;
-            if env.ledger().sequence() > swap.expires_at {
-                return Err(SwapError::DeadlineExpired);
-            }
-
-            let remaining = swap
-                .amount_a
-                .checked_sub(swap.filled_amount)
-                .ok_or(SwapError::MathOverflow)?;
-            Self::accept_swap_partial(env, party_b, swap_id, remaining)
-        }
-
-        pub fn accept_swap_partial(
         /// Accept a proposed swap. Party B accepts and the swap executes atomically.
         ///
         /// # Errors
@@ -463,66 +440,38 @@ mod contract {
         /// - [`SwapError::DeadlineExpired`]
         /// - [`SwapError::NotAuthorized`] if restricted taker does not match
         /// - [`SwapError::ExecutionDelayExceeded`] if max delay window is exceeded
+        /// - [`SwapError::HashLockMismatch`] if the revealed preimage does not match
         pub fn accept_swap(
             env: Env,
             taker: Address,
             swap_id: u32,
             fill_amount_a: i128,
         ) -> Result<u32, SwapError> {
+            Self::execute_swap(env, taker, swap_id, fill_amount_a, None, None)
+        }
+
+        /// Execute a swap, optionally revealing an HTLC preimage and crediting a referrer.
+        #[allow(clippy::too_many_arguments)]
+        pub fn execute_swap(
+            env: Env,
+            taker: Address,
+            swap_id: u32,
+            fill_amount_a: i128,
+            secret_preimage: Option<BytesN<32>>,
+            referrer: Option<Address>,
+        ) -> Result<u32, SwapError> {
             taker.require_auth();
             ensure_valid_leg_amount(fill_amount_a)?;
 
             let fee_bps: u32 = get_required(&env, &FeeBps)?;
             let treasury: Address = get_required(&env, &Treasury)?;
-            party_b.require_auth();
+
             let mut swap: SwapInfo = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Swap(swap_id))
+                .get(&SwapKey::Swap(swap_id))
                 .ok_or(SwapError::SwapNotFound)?;
             require_pending(swap.state)?;
-            if env.ledger().sequence() > swap.expires_at {
-                return Err(SwapError::DeadlineExpired);
-            }
-
-            let remaining_a = swap
-                .amount_a
-                .checked_sub(swap.filled_amount)
-                .ok_or(SwapError::MathOverflow)?;
-            if fill_amount_a > remaining_a {
-                return Err(SwapError::InvalidAmount);
-            }
-            if !swap.allow_partial && fill_amount_a != remaining_a {
-                return Err(SwapError::InvalidState);
-            }
-
-            let fill_amount_b = mul_div(fill_amount_a, swap.amount_b, swap.amount_a)
-                .map_err(|_| SwapError::MathOverflow)?;
-            ensure_valid_leg_amount(fill_amount_b)?;
-
-            let fee = FixedPoint::apply_bps_fee(fill_amount_b, fee_bps)
-                .map_err(|_| SwapError::MathOverflow)?;
-            let party_a_amount = fill_amount_b
-                .checked_sub(fee)
-                .ok_or(SwapError::MathOverflow)?;
-
-            match swap.state {
-                SwapState::Completed => return Err(SwapError::AlreadyCompleted),
-                SwapState::Cancelled => return Err(SwapError::AlreadyCancelled),
-                SwapState::Open => {}
-            }
-            if env.ledger().sequence() > swap.expires_at {
-                return Err(SwapError::DeadlineExpired);
-
-            if swap.state == SwapState::Accepted {
-                return Err(SwapError::AlreadyCompleted);
-            }
-            if swap.state == SwapState::Cancelled {
-                return Err(SwapError::AlreadyCancelled);
-            }
-            if swap.state != SwapState::Pending {
-                return Err(SwapError::InvalidState);
-            }
 
             let current_ledger = env.ledger().sequence();
             if current_ledger > swap.expires_at {
@@ -531,7 +480,7 @@ mod contract {
 
             // Verify allowed counterparty restriction if configured
             if let Some(ref allowed) = swap.allowed_counterparty {
-                if party_b != *allowed {
+                if taker != *allowed {
                     return Err(SwapError::NotAuthorized);
                 }
             }
@@ -543,49 +492,94 @@ mod contract {
                     return Err(SwapError::ExecutionDelayExceeded);
                 }
             }
-            let fee = FixedPoint::apply_bps_fee(swap.amount_b, fee_bps).unwrap_or(0);
-            let party_a_amount = swap
-                .amount_b
+
+            // HTLC: verify the revealed preimage against the stored hash lock.
+            if let Some(ref hash_lock) = swap.hash_lock {
+                let preimage = secret_preimage.ok_or(SwapError::HashLockMismatch)?;
+                let digest = env.crypto().sha256(&preimage);
+                if digest.to_bytes() != hash_lock.clone() {
+                    return Err(SwapError::HashLockMismatch);
+                }
+            }
+
+            let remaining_a = swap.remaining_amount;
+            if fill_amount_a > remaining_a {
+                return Err(SwapError::InvalidAmount);
+            }
+            if !swap.allow_partial_fills && fill_amount_a != remaining_a {
+                return Err(SwapError::InvalidState);
+            }
+
+            let fill_amount_b = mul_div(fill_amount_a, swap.amount_b, swap.amount_a)
+                .map_err(|_| SwapError::MathOverflow)?;
+            ensure_valid_leg_amount(fill_amount_b)?;
+
+            let fee = calculate_and_validate_fee(fill_amount_b, fee_bps)?;
+            let party_a_amount = fill_amount_b
                 .checked_sub(fee)
-                .ok_or(SwapError::InvalidAmount)?;
+                .ok_or(SwapError::MathOverflow)?;
 
-            // Effects are recorded before interactions; Soroban transactions revert
-            // all writes if a token transfer fails.
-            swap.state = SwapState::Completed;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Swap(swap_id), &swap);
-            bump_swap(&env, swap_id);
-                .set(&SwapKey::Swap(swap_id), &swap);
-            extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
-            bump_persistent(&env, &SwapKey::Swap(swap_id));
-            bump_instance(&env);
+            // Party B sends token_b to this contract. Measure the actual amount
+            // received so fee-on-transfer tokens are handled correctly.
+            let received_b = transfer_in_measured(&env, &swap.token_b, &taker, fill_amount_b);
 
-            // Calculate fee with anti-evasion minimum fee enforcement
-            let fee = calculate_and_validate_fee(swap.amount_b, fee_bps)?;
-            #[allow(clippy::arithmetic_side_effects)]
-            let party_a_amount = swap.amount_b - fee;
-
-            // Party B sends token_b to this contract
-            token::Client::new(&env, &swap.token_b).transfer(
-                &taker,
-                &env.current_contract_address(),
-                &fill_amount_b,
-            );
+            // Base fulfillment on the actual received delta rather than the
+            // requested amount. The fee is recomputed against the received
+            // amount so the contract never forwards more than it holds.
+            let actual_fee = calculate_and_validate_fee(received_b, fee_bps)?;
+            let actual_party_a_amount = received_b
+                .checked_sub(actual_fee)
+                .ok_or(SwapError::MathOverflow)?;
 
             // Contract forwards token_b minus fee to party A
-            token::Client::new(&env, &swap.token_b).transfer(
-                &env.current_contract_address(),
-                &swap.party_a,
-                &party_a_amount,
-            );
+            if actual_party_a_amount > 0 {
+                token::Client::new(&env, &swap.token_b).transfer(
+                    &env.current_contract_address(),
+                    &swap.party_a,
+                    &actual_party_a_amount,
+                );
+            }
 
-            // Forward fee to treasury if fee > 0
+            // Forward fee, splitting a referral share when a referrer is provided.
             if fee > 0 {
+                let token_b = token::Client::new(&env, &swap.token_b);
+                match referrer {
+                    Some(ref referrer_addr) => {
+                        let referral_fee = fee / 2;
+                        let treasury_fee = fee
+                            .checked_sub(referral_fee)
+                            .ok_or(SwapError::MathOverflow)?;
+                        if referral_fee > 0 {
+                            token_b.transfer(
+                                &env.current_contract_address(),
+                                referrer_addr,
+                                &referral_fee,
+                            );
+                        }
+                        if treasury_fee > 0 {
+                            token_b.transfer(
+                                &env.current_contract_address(),
+                                &treasury,
+                                &treasury_fee,
+                            );
+                        }
+                        events::referral_fee_paid(
+                            &env,
+                            swap_id,
+                            referrer_addr,
+                            referral_fee,
+                        );
+                    }
+                    None => {
+                        token_b.transfer(&env.current_contract_address(), &treasury, &fee);
+                    }
+                }
+            // Forward fee to treasury if fee > 0
+            if actual_fee > 0 {
                 token::Client::new(&env, &swap.token_b).transfer(
                     &env.current_contract_address(),
                     &treasury,
-                    &fee,
+                    &actual_fee,
                 );
             }
 
@@ -608,11 +602,17 @@ mod contract {
                 .filled_amount
                 .checked_add(fill_amount_a)
                 .ok_or(SwapError::MathOverflow)?;
-            if swap.filled_amount == swap.amount_a {
+            swap.remaining_amount = swap
+                .remaining_amount
+                .checked_sub(fill_amount_a)
+                .ok_or(SwapError::MathOverflow)?;
+            if swap.remaining_amount == 0 {
                 swap.state = SwapState::Executed;
             }
 
-            env.storage().persistent().set(&SwapKey::Swap(swap_id), &swap);
+            env.storage()
+                .persistent()
+                .set(&SwapKey::Swap(swap_id), &swap);
             extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
             bump_persistent(&env, &SwapKey::Swap(swap_id));
             bump_instance(&env);
@@ -620,15 +620,80 @@ mod contract {
             Ok(swap_id)
         }
 
-            // Contract forwards escrowed token_a to party B
+        /// Fill part of a swap that allows partial fills, delivering a proportional
+        /// amount of the counterparty token.
+        ///
+        /// # Errors
+        /// - [`SwapError::SwapNotFound`]
+        /// - [`SwapError::InvalidState`] if the swap does not allow partial fills
+        /// - [`SwapError::InvalidAmount`] if `fill_amount` is non-positive or exceeds the remainder
+        /// - [`SwapError::DeadlineExpired`]
+        pub fn fill_swap_partial(
+            env: Env,
+            swap_id: u32,
+            fill_amount: i128,
+        ) -> Result<(), SwapError> {
+            ensure_valid_leg_amount(fill_amount)?;
+
+            let mut swap: SwapInfo = env
+                .storage()
+                .persistent()
+                .get(&SwapKey::Swap(swap_id))
+                .ok_or(SwapError::SwapNotFound)?;
+            require_pending(swap.state)?;
+            if !swap.allow_partial_fills {
+                return Err(SwapError::InvalidState);
+            }
+            if env.ledger().sequence() > swap.expires_at {
+                return Err(SwapError::DeadlineExpired);
+            }
+            if fill_amount > swap.remaining_amount {
+                return Err(SwapError::InvalidAmount);
+            }
+
+            let taker = swap.party_a.clone();
+            taker.require_auth();
+
+            let fill_amount_b = mul_div(fill_amount, swap.amount_b, swap.amount_a)
+                .map_err(|_| SwapError::MathOverflow)?;
+            ensure_valid_leg_amount(fill_amount_b)?;
+
+            token::Client::new(&env, &swap.token_b).transfer(
+                &taker,
+                &env.current_contract_address(),
+                &fill_amount_b,
+            );
+            token::Client::new(&env, &swap.token_b).transfer(
+                &env.current_contract_address(),
+                &swap.party_a,
+                &fill_amount_b,
+            );
             token::Client::new(&env, &swap.token_a).transfer(
                 &env.current_contract_address(),
-                &party_b,
-                &swap.amount_a,
+                &taker,
+                &fill_amount,
             );
+
+            swap.filled_amount = swap
+                .filled_amount
+                .checked_add(fill_amount)
+                .ok_or(SwapError::MathOverflow)?;
+            swap.remaining_amount = swap
+                .remaining_amount
+                .checked_sub(fill_amount)
+                .ok_or(SwapError::MathOverflow)?;
+            if swap.remaining_amount == 0 {
+                swap.state = SwapState::Executed;
+            }
+
+            env.storage()
+                .persistent()
+                .set(&SwapKey::Swap(swap_id), &swap);
+            extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
+            bump_persistent(&env, &SwapKey::Swap(swap_id));
             bump_instance(&env);
-            events::swap_accepted(&env, &party_b, swap_id);
-            Ok(swap_id)
+            events::swap_partially_filled(&env, &taker, swap_id, fill_amount, swap.remaining_amount);
+            Ok(())
         }
 
         /// Cancel an open swap and return Party A's escrowed asset.
@@ -679,9 +744,127 @@ mod contract {
             Ok(())
         }
 
+        /// Refund a hash-locked swap to its creator after the deadline when the
+        /// secret preimage was never revealed.
+        ///
+        /// # Errors
+        /// - [`SwapError::SwapNotFound`]
+        /// - [`SwapError::InvalidState`] if the swap is not hash-locked or not pending
+        /// - [`SwapError::DeadlineExpired`] if the deadline has not yet passed
+        pub fn refund_hashlocked_swap(env: Env, swap_id: u32) -> Result<(), SwapError> {
+        /// Permissionlessly expire a swap whose deadline has passed.
+        ///
+        /// Anyone (e.g. an automated keeper) may call this once
+        /// `env.ledger().sequence() > swap.expires_at`. Any escrowed tokens are
+        /// returned to the original creator and the swap is marked `Expired`.
+        ///
+        /// # Errors
+        /// - [`SwapError::SwapNotFound`]
+        /// - [`SwapError::InvalidState`] if the swap is not pending.
+        /// - [`SwapError::DeadlineExpired`] if the deadline has not yet passed.
+        pub fn expire_swap(env: Env, swap_id: u32) -> Result<(), SwapError> {
+            let mut swap: SwapInfo = env
+                .storage()
+                .persistent()
+                .get(&SwapKey::Swap(swap_id))
+                .ok_or(SwapError::SwapNotFound)?;
+            require_pending(swap.state)?;
+            if swap.hash_lock.is_none() {
+                return Err(SwapError::InvalidState);
+            }
+
+            if env.ledger().sequence() <= swap.expires_at {
+                return Err(SwapError::DeadlineExpired);
+            }
+
+            swap.party_a.require_auth();
+
+            if swap.escrowed {
+                let remaining_a = swap.remaining_amount;
+            if swap.escrowed {
+                let remaining_a = swap
+                    .amount_a
+                    .checked_sub(swap.filled_amount)
+                    .ok_or(SwapError::MathOverflow)?;
+                if remaining_a > 0 {
+                    token::Client::new(&env, &swap.token_a).transfer(
+                        &env.current_contract_address(),
+                        &swap.party_a,
+                        &remaining_a,
+                    );
+                }
+            }
+
+            swap.state = SwapState::Cancelled;
+            swap.state = SwapState::Expired;
+            env.storage()
+                .persistent()
+                .set(&SwapKey::Swap(swap_id), &swap);
+            extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
+            bump_persistent(&env, &SwapKey::Swap(swap_id));
+            bump_instance(&env);
+            events::swap_cancelled(&env, &swap.party_a, swap_id);
+            Ok(())
+        }
+
+        /// Cancel multiple pending swaps owned by `creator` in a single invocation,
+        /// refunding all escrowed balances.
+        ///
+        /// # Errors
+        /// - [`SwapError::InvalidAmount`] if `swap_ids` is empty
+        /// - [`SwapError::SwapNotFound`] if any swap does not exist
+        /// - [`SwapError::NotCreator`] if any swap is not owned by `creator`
+        /// - [`SwapError::InvalidState`] if any swap is not pending
+        pub fn cancel_swaps_batch(
+            env: Env,
+            creator: Address,
+            swap_ids: Vec<u32>,
+        ) -> Result<(), SwapError> {
+            creator.require_auth();
+            if swap_ids.is_empty() {
+                return Err(SwapError::InvalidAmount);
+            }
+
+            for swap_id in swap_ids.iter() {
+                let mut swap: SwapInfo = env
+                    .storage()
+                    .persistent()
+                    .get(&SwapKey::Swap(swap_id))
+                    .ok_or(SwapError::SwapNotFound)?;
+                require_pending(swap.state)?;
+                if swap.party_a != creator {
+                    return Err(SwapError::NotCreator);
+                }
+
+                if swap.escrowed {
+                    let remaining_a = swap.remaining_amount;
+                    if remaining_a > 0 {
+                        token::Client::new(&env, &swap.token_a).transfer(
+                            &env.current_contract_address(),
+                            &swap.party_a,
+                            &remaining_a,
+                        );
+                    }
+                }
+
+                swap.state = SwapState::Cancelled;
+                env.storage()
+                    .persistent()
+                    .set(&SwapKey::Swap(swap_id), &swap);
+                extend_ttl_persistent(&env, &SwapKey::Swap(swap_id));
+                bump_persistent(&env, &SwapKey::Swap(swap_id));
+                events::swap_cancelled(&env, &swap.party_a, swap_id);
+            }
+
+            bump_instance(&env);
+            events::swap_expired(&env, swap_id, &swap.party_a);
+            Ok(())
+        }
+
             match swap.state {
                 SwapState::Completed => return Err(SwapError::AlreadyCompleted),
                 SwapState::Cancelled => return Err(SwapError::AlreadyCancelled),
+                SwapState::Expired => return Err(SwapError::AlreadyCancelled),
                 SwapState::Open => {}
             }
             swap.party_a.require_auth();
@@ -690,6 +873,9 @@ mod contract {
                 return Err(SwapError::AlreadyCompleted);
             }
             if swap.state == SwapState::Cancelled {
+                return Err(SwapError::AlreadyCancelled);
+            }
+            if swap.state == SwapState::Expired {
                 return Err(SwapError::AlreadyCancelled);
             }
             if swap.state != SwapState::Pending {

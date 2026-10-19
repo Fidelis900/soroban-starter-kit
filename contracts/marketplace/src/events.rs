@@ -48,6 +48,39 @@ pub fn offer_refunded(env: &Env, listing_id: u64, buyer: &Address, amount: i128)
     );
 }
 
+pub fn offer_expired(env: &Env, listing_id: u64, buyer: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "offer_expired"), listing_id),
+        (buyer.clone(), amount),
+    );
+}
+
+pub fn offers_batch_made(env: &Env, buyer: &Address, count: u32, total: i128) {
+    env.events().publish(
+        (Symbol::new(env, "offers_batch"),),
+        (buyer.clone(), count, total),
+    );
+}
+
+pub fn staking_contract_set(env: &Env, staking_contract: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "staking_set"),),
+        staking_contract.clone(),
+    );
+}
+
+pub fn min_counter_offer_bps_set(env: &Env, bps: u32) {
+    env.events()
+        .publish((Symbol::new(env, "min_counter_bps"),), bps);
+}
+
+pub fn fee_discount_applied(env: &Env, account: &Address, discount_bps: u32, fee: i128) {
+    env.events().publish(
+        (Symbol::new(env, "fee_discount"),),
+        (account.clone(), discount_bps, fee),
+    );
+}
+
 pub fn listing_invalidated(env: &Env, listing_id: u64, seller: &Address) {
     env.events().publish(
         (Symbol::new(env, "listing_invalidated"), listing_id),

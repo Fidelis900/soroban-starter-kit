@@ -14,6 +14,7 @@ pub enum TokenError {
     InvalidNonce = 8,
     PermitExpired = 9,
     PermitSignerNotSet = 10,
+    AccountLocked = 11,
 }
 
 impl_display_error!(
@@ -28,6 +29,7 @@ impl_display_error!(
     InvalidNonce         => "invalid permit nonce",
     PermitExpired        => "permit expired",
     PermitSignerNotSet   => "permit signer not set",
+    AccountLocked        => "account locked",
 );
 
 #[cfg(test)]
@@ -51,7 +53,8 @@ TokenError::InvalidAmount = {}\n\
 TokenError::Overflow = {}\n\
 TokenError::InvalidNonce = {}\n\
 TokenError::PermitExpired = {}\n\
-TokenError::PermitSignerNotSet = {}\n",
+TokenError::PermitSignerNotSet = {}\n\
+TokenError::AccountLocked = {}\n",
             TokenError::InsufficientBalance as u32,
             TokenError::InsufficientAllowance as u32,
             TokenError::Unauthorized as u32,
@@ -62,6 +65,7 @@ TokenError::PermitSignerNotSet = {}\n",
             TokenError::InvalidNonce as u32,
             TokenError::PermitExpired as u32,
             TokenError::PermitSignerNotSet as u32,
+            TokenError::AccountLocked as u32,
         )
     }
 
