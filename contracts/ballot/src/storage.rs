@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, BytesN, String, Vec, contracttype};
+use soroban_sdk::{contracttype, Address, BytesN};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -22,52 +22,30 @@ pub enum DataKey {
     TotalVotes,
     /// Minimum voter turnout required before results can be certified (#1126).
     Quorum,
-    // ── multi-choice additions (#788) ──────────────────────────────────────
     /// Ordered list of choice labels set at `initialize`.
     Choices,
     /// Vote tally for choice at the given index.
     ChoiceVotes(u32),
-    // ── quadratic voting additions (#1123) ─────────────────────────────────
-    /// Whether quadratic voting mode is enabled for this ballot.
-    Quadratic,
-    // ── ranked-choice additions (#1124) ────────────────────────────────────
-    /// Ordered preference ranking submitted by a voter (most preferred first).
-    RankedVote(Address),
-    /// Number of ranked-choice ballots cast; used to size elimination rounds.
-    RankedVoteCount,
-    // ── commit-reveal additions (#1125) ────────────────────────────────────
-    /// Whether commit-reveal secret voting mode is enabled for this ballot.
-    CommitReveal,
-    /// Commitment hash `hash(voter ++ choice ++ salt)` submitted during the
-    /// commit phase, keyed by voter.  The choice stays secret until reveal.
+    /// Whether a voter has already cast a vote.
+    HasVoted(Address),
+    /// Whether the commit phase of a commit-reveal ballot is active (#1125).
+    CommitPhase,
+    /// Whether the reveal phase of a commit-reveal ballot is active (#1125).
+    RevealPhase,
+    /// Commitment hash submitted during the commit phase, keyed by voter.
     Commitment(Address),
     /// Whether a voter has revealed their committed ballot.
     Revealed(Address),
     /// Number of commitments submitted; used to gate the reveal phase.
     CommitCount,
-}
-
-/// A single instant-runoff elimination round result.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct RoundResult {
-    /// Per-choice tallies for this round, indexed by choice index.
-    pub tallies: Vec<u32>,
-    /// Choice eliminated at the end of this round, or `None` for the final
-    /// round in which a majority winner was found.
-    pub eliminated: Option<u32>,
-    /// Choice that reached a majority in this round, if any.
-    pub winner: Option<u32>,
-}
-
-/// A stored commit-reveal commitment for a single voter.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Commitment {
-    /// `hash(voter ++ choice ++ salt)` submitted during the commit phase.
-    pub hash: BytesN<32>,
-    /// Ledger sequence at which the commitment was recorded.
-    pub committed_at: u32,
+    /// Blinded commitment hash that may be revealed by any relayer (#1331).
+    CommitmentHash(BytesN<32>),
+    /// Whether a blinded commitment hash has already been revealed (#1331).
+    RevealedCommitment(BytesN<32>),
+    /// Ordered preference ranking submitted by a voter (most preferred first).
+    RankedVote(Address),
+    /// Number of ranked-choice ballots cast.
+    RankedVoteCount,
     // ── multi-ballot additions (#1127) ─────────────────────────────────────
     /// Number of ballots created so far; also the next ballot id to assign.
     BallotCount,
@@ -89,6 +67,19 @@ pub struct Commitment {
     BallotChoiceVotes(u32, u32),
     /// Whether the given voter has already voted in the given ballot.
     BallotVoter(u32, Address),
+}
+
+/// A single instant-runoff elimination round result.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoundResult {
+    /// Per-choice tallies for this round, indexed by choice index.
+    pub tallies: soroban_sdk::Vec<u32>,
+    /// Choice eliminated at the end of this round, or `None` for the final
+    /// round in which a majority winner was found.
+    pub eliminated: Option<u32>,
+    /// Choice that reached a majority in this round, if any.
+    pub winner: Option<u32>,
 }
 
 impl DataKey {
