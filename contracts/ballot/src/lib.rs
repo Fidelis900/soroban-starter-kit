@@ -74,6 +74,17 @@ const LEDGER_BUMP_AMOUNT: u32 = 518_400;
 pub const MIN_DEADLINE_BUFFER: u32 = 10;
 
 
+/// Target TTL (in ledgers) applied when instance storage is extended.
+const LEDGER_BUMP_AMOUNT: u32 = 518_400;
+
+/// Minimum number of ledgers between the current ledger and `voting_start`.
+///
+/// Initialization rejects windows that open sooner, giving voters a planned
+/// preparation period before the ballot becomes active.  Matches
+/// `soroban_common::MIN_DEADLINE_BUFFER`.
+pub const MIN_DEADLINE_BUFFER: u32 = 10;
+
+
 /// Threshold (in ledgers) below which instance storage is extended.
 const LEDGER_LIFETIME_THRESHOLD: u32 = 120_960;
 
@@ -96,6 +107,25 @@ fn bump(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+}
+
+pub use ballot_result::BallotResult;
+
+// `#[contracttype]` generates an undocumented public associated item; confine
+// the missing_docs allowance to this module and re-export the result above.
+mod ballot_result {
+    #![allow(missing_docs)]
+    use soroban_sdk::{contracttype, Vec};
+
+    /// Outcome of a tally.
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum BallotResult {
+        /// Turnout met the configured quorum; carries the per-choice counts.
+        Certified(Vec<i128>),
+        /// Turnout was below the configured quorum; results are not certified.
+        QuorumNotMet,
+    }
 }
 
 pub use ballot_result::BallotResult;
@@ -231,6 +261,16 @@ mod contract {
                 return Err(BallotError::InvalidWindow);
             }
 
+                return Err(BallotError::InvalidWindow);
+            }
+
+            let earliest_end = voting_start
+                .checked_add(MIN_VOTING_DURATION)
+                .ok_or(BallotError::InvalidWindow)?;
+            if voting_end < earliest_end || voting_start >= voting_end {
+                return Err(BallotError::InvalidWindow);
+            }
+
             admin.require_auth();
 
             env.storage().instance().set(&DataKey::Admin, &admin);
@@ -272,6 +312,24 @@ mod contract {
         /// # Errors
         /// - [`BallotError::NotInitialized`] if the contract has not been initialized.
         pub fn register_voter(env: Env, voter: Address) -> Result<(), BallotError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(BallotError::NotInitialized)?;
+            admin.require_auth();
+
+            let voter_key = DataKey::RegisteredVoter(voter.clone());
+            env.storage().persistent().set(&voter_key, &true);
+            env.storage().persistent().extend_ttl(
+                &voter_key,
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+
+            bump(&env);
+            events::voter_registered(&env, &voter);
+            Ok(())
             Self::register_with_weight(env, voter, 1)
         }
 
@@ -333,6 +391,23 @@ mod contract {
             env.storage()
                 .persistent()
                 .remove(&DataKey::RegisteredVoter(voter.clone()));
+
+            bump(&env);
+            events::voter_deregistered(&env, &voter);
+            Ok(())
+        }
+
+        /// Admin revokes a voter registration before voting opens (#1330).
+        ///
+        /// This is stricter than [`BallotContract::deregister_voter`]: it is
+        /// only callable while `current_ledger < voting_start`, before the
+        /// ballot enters its voting phase.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`] if the contract has not been initialized.
+        /// - [`BallotError::VotingAlreadyStarted`] if the voting window has opened.
+        /// - [`BallotError::NotRegistered`] if the voter is not currently registered.
+        pub fn unregister_voter(env: Env, voter: Address) -> Result<(), BallotError> {
             env.storage()
                 .persistent()
                 .remove(&DataKey::VoterWeight(voter.clone()));
@@ -373,6 +448,12 @@ mod contract {
                 .ok_or(BallotError::NotInitialized)?;
             admin.require_auth();
 
+            let voting_start: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingStart)
+                .ok_or(BallotError::NotInitialized)?;
+            if env.ledger().sequence() >= voting_start {
             let total_votes: i128 = env
                 .storage()
                 .instance()
@@ -398,6 +479,14 @@ mod contract {
             bump(&env);
             events::voter_deregistered(&env, &voter);
             Ok(())
+        }
+
+        /// Returns whether `voter` is currently registered.
+        pub fn is_registered(env: Env, voter: Address) -> bool {
+            env.storage()
+                .persistent()
+                .get(&DataKey::RegisteredVoter(voter))
+                .unwrap_or(false)
         }
 
         /// Voter casts their vote.
@@ -629,6 +718,146 @@ mod contract {
                 .persistent()
                 .set(&DataKey::Revealed(voter.clone()), &true);
 
+            Self::record_vote(&env, choice);
+            events::vote_revealed(&env, &voter, choice);
+        }
+
+        /// Submit a ranked-choice ballot.
+        ///
+        /// `preferences` is an ordered list of choice indices, most preferred
+        /// first.  Each index must be unique and within the range of configured
+        /// choices.  A voter may only submit one ranked ballot.
+        pub fn vote_ranked(env: Env, voter: Address, preferences: Vec<u32>) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_voting_active(&env);
+
+            let choices: Vec<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Choices)
+                .unwrap_or_else(|| Vec::new(&env));
+            let num_choices = choices.len();
+
+            if preferences.is_empty() {
+                panic!("ranked ballot must contain at least one preference");
+            }
+
+            let mut seen: Vec<u32> = Vec::new(&env);
+            for pref in preferences.iter() {
+                if pref >= num_choices {
+                    panic!("ranked choice index out of range");
+                }
+                if seen.contains(pref) {
+                    panic!("ranked ballot contains duplicate choice index");
+                }
+                seen.push_back(pref);
+            }
+
+            let vote_key = DataKey::RankedVote(voter.clone());
+            if env.storage().persistent().has(&vote_key) {
+                panic!("voter has already submitted a ranked ballot");
+            }
+            env.storage().persistent().set(&vote_key, &preferences);
+
+            let count: u32 = env
+                .storage()
+                .instance()
+
+        /// Backward-compatible two-choice tally helper.
+        ///
+        /// Returns `(choice[1] votes, choice[0] votes)` i.e. `(yes, no)` and
+        /// closes the ballot.  Permissionless once `voting_end` has passed.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::Unauthorized`] if called before `voting_end` by a
+        ///   non-admin.
+        pub fn tally(env: Env) -> Result<(i128, i128), BallotError> {
+            Self::require_closing_auth(&env)?;
+
+            let yes: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::YesVotes)
+                .unwrap_or(0i128);
+            let no: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NoVotes)
+                .unwrap_or(0i128);
+
+            env.storage().instance().set(&DataKey::VotingActive, &false);
+            bump(&env);
+            events::tally_result(&env, yes, no);
+            Ok((yes, no))
+        }
+
+        /// Open the commit phase of the commit-reveal ballot.
+        pub fn start_commit_phase(env: Env) {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .unwrap_or_else(|| panic!("not initialized"));
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::CommitPhase, &true);
+            env.storage().instance().set(&DataKey::RevealPhase, &false);
+            env.storage().instance().set(&DataKey::VotingActive, &true);
+        }
+
+        /// Close the commit phase and open the reveal phase.
+        pub fn start_reveal_phase(env: Env) {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .unwrap_or_else(|| panic!("not initialized"));
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::CommitPhase, &false);
+            env.storage().instance().set(&DataKey::RevealPhase, &true);
+        }
+
+        /// Phase 1: commit `hash(voter ++ choice ++ salt)` without revealing the choice.
+        pub fn commit_vote(env: Env, voter: Address, commitment: BytesN<32>) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_commit_phase(&env);
+            let key = DataKey::Commitment(voter.clone());
+            if env.storage().persistent().has(&key) {
+                panic!("voter has already committed a ballot");
+            }
+            env.storage().persistent().set(&key, &commitment);
+            events::vote_committed(&env, &voter, &commitment);
+        }
+
+        /// Phase 2: reveal `(choice, salt)` and validate against the commitment.
+        pub fn reveal_vote(env: Env, voter: Address, choice: u32, salt: Bytes) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_reveal_phase(&env);
+
+            let key = DataKey::Commitment(voter.clone());
+            let commitment: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| panic!("no commitment found for voter"));
+
+            let mut preimage = Bytes::new(&env);
+            preimage.append(&voter.clone().to_string().to_bytes());
+            preimage.extend_from_array(&choice.to_be_bytes());
+            preimage.append(&salt);
+            let computed = env.crypto().sha256(&preimage);
+            if computed.to_bytes() != commitment {
+                panic!("revealed ballot does not match commitment");
+            }
+
+            env.storage().persistent().remove(&key);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Revealed(voter.clone()), &true);
+
             let weight = Self::voter_weight(&env, &voter);
             Self::record_vote(&env, choice, weight);
             events::vote_revealed(&env, &voter, choice);
@@ -681,6 +910,18 @@ mod contract {
                 .instance()
                 .set(&DataKey::RankedVoteCount, &(count + 1));
 
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalVotes, &(total + 1));
+
+            if let Some(first) = preferences.get(0) {
+                events::voted(&env, &voter, first);
+            }
             let weight = Self::voter_weight(&env, &voter);
             let total: i128 = env
                 .storage()
@@ -1082,6 +1323,28 @@ mod contract {
             let mut results: Vec<i128> = Vec::new(env);
             for i in 0..choices.len() {
                 let count: i128 = env
+
+        /// Total number of votes cast.
+        pub fn total_votes(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0i128)
+        }
+
+        fn read_counts(env: &Env) -> Result<Vec<i128>, BallotError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(BallotError::NotInitialized);
+            }
+            let choices: Vec<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Choices)
+                .ok_or(BallotError::NotInitialized)?;
+
+            let mut results: Vec<i128> = Vec::new(env);
+            for i in 0..choices.len() {
+                let count: i128 = env
                     .storage()
                     .instance()
                     .get(&DataKey::ChoiceVotes(i))
@@ -1411,6 +1674,101 @@ mod contract {
                     tied.push_back(i);
                 }
             }
+            Ok(results)
+        }
+
+        fn record_vote(env: &Env, choice: u32) {
+            let choice_key = DataKey::ChoiceVotes(choice);
+            let current: i128 = env.storage().instance().get(&choice_key).unwrap_or(0i128);
+            env.storage().instance().set(&choice_key, &(current + 1));
+
+            if choice == 0 {
+                let no: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::NoVotes)
+                    .unwrap_or(0i128);
+                env.storage().instance().set(&DataKey::NoVotes, &(no + 1));
+            } else if choice == 1 {
+                let yes: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::YesVotes)
+                    .unwrap_or(0i128);
+                env.storage().instance().set(&DataKey::YesVotes, &(yes + 1));
+            }
+
+            let total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0i128);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalVotes, &(total + 1));
+        }
+
+        fn require_closing_auth(env: &Env) -> Result<(), BallotError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(BallotError::NotInitialized)?;
+            let voting_end: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingEnd)
+                .unwrap_or(0);
+
+            if env.ledger().sequence() <= voting_end {
+                admin.require_auth();
+            }
+            Ok(())
+        }
+
+        fn require_registered(env: &Env, voter: &Address) {
+            let registered: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RegisteredVoter(voter.clone()))
+                .unwrap_or(false);
+            if !registered {
+                panic!("voter is not registered");
+            }
+        }
+
+        fn require_voting_active(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingActive)
+                .unwrap_or(false);
+            if !active {
+                panic!("voting is not active");
+            }
+        }
+
+        fn require_commit_phase(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommitPhase)
+                .unwrap_or(false);
+            if !active {
+                panic!("commit phase is not active");
+            }
+        }
+
+        fn require_reveal_phase(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::RevealPhase)
+                .unwrap_or(false);
+            if !active {
+                panic!("reveal phase is not active");
+            }
+        }
         }
         Ok(tied)
     }
@@ -1439,6 +1797,11 @@ mod test {
         testutils::{Address as _, Ledger as _},
         Env, String, Vec,
     };
+
+    const START_LEDGER: u32 = 10;
+    const VOTING_START: u32 = 100;
+    const VOTING_END: u32 = 200;
+
 
     const START_LEDGER: u32 = 10;
     const VOTING_START: u32 = 100;
@@ -1615,6 +1978,80 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #1330 — voter revocation before the ballot opens
+    // -----------------------------------------------------------------------
+
+    /// The admin can unregister a voter while the ballot is pending.
+    #[test]
+    fn unregister_voter_before_opening_removes_registration() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+
+        client.register_voter(&voter);
+        assert!(client.is_registered(&voter));
+
+        client.unregister_voter(&voter);
+        assert!(!client.is_registered(&voter));
+    }
+
+    /// An unregistered voter can no longer vote once the window opens.
+    #[test]
+    fn unregistered_voter_cannot_vote() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+
+        client.register_voter(&voter);
+        client.unregister_voter(&voter);
+
+        env.ledger()
+            .with_mut(|le| le.sequence_number = VOTING_START);
+        let result = client.try_vote(&voter, &1u32);
+        assert!(matches!(result, Err(Ok(BallotError::NotRegistered))));
+    }
+
+    /// Revocation is rejected exactly at the opening ledger.
+    #[test]
+    fn unregister_voter_rejected_at_opening() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+
+        client.register_voter(&voter);
+        env.ledger()
+            .with_mut(|le| le.sequence_number = VOTING_START);
+
+        let result = client.try_unregister_voter(&voter);
+        assert!(matches!(result, Err(Ok(BallotError::VotingAlreadyStarted))));
+        assert!(client.is_registered(&voter));
+    }
+
+    /// Revocation is rejected after the ballot has opened.
+    #[test]
+    fn unregister_voter_rejected_after_opening() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+
+        client.register_voter(&voter);
+        env.ledger()
+            .with_mut(|le| le.sequence_number = VOTING_START + 1);
+
+        let result = client.try_unregister_voter(&voter);
+        assert!(matches!(result, Err(Ok(BallotError::VotingAlreadyStarted))));
+        assert!(client.is_registered(&voter));
+    }
+
+    /// Unknown voters cannot be revoked.
+    #[test]
+    fn unregister_unknown_voter_rejected() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let unknown = Address::generate(&env);
+
+        let result = client.try_unregister_voter(&unknown);
+        assert!(matches!(result, Err(Ok(BallotError::NotRegistered))));
     // Issue #1329 — weighted voting
     // -----------------------------------------------------------------------
 
