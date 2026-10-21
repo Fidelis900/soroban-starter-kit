@@ -34,66 +34,27 @@ pub enum MultisigError {
     InvalidWeight = 12,
     /// `cleanup_expired` was called before the proposal's expiry ledger was reached.
     NotYetExpired = 13,
-    /// A reentrant call was made while an external invocation was in progress.
-    Reentrant = 14,
-    /// The proposal is queued but its timelock delay has not yet elapsed.
-    TimelockNotElapsed = 15,
-    /// A timelock is configured and the proposal has not been queued yet.
-    NotQueued = 16,
-    /// The proposal has been cancelled.
-    TransactionCancelled = 17,
-    /// No daily spending allowance has been configured.
-    SpendingNotConfigured = 18,
-    /// The caller is not the configured spending operator.
-    NotSpendingOperator = 19,
-    /// The spend would exceed the daily allowance.
-    DailyLimitExceeded = 20,
-    /// Too many allowance spends in the current window.
-    RateLimited = 21,
-    /// Amounts must be positive (limits must be non-negative).
-    InvalidAmount = 22,
-    /// Only the original proposer may cancel a proposal.
-    NotProposer = 14,
-    /// The signer has not signed the proposal, so there is nothing to revoke.
-    NotSigned = 15,
-    /// The proposed threshold change is invalid (e.g. zero or exceeds total weight).
-    InvalidThresholdChange = 23,
-    /// No pending threshold-change proposal exists.
-    ThresholdChangeNotFound = 24,
-    /// The signer has not been inactive long enough to be considered dormant.
-    SignerNotDormant = 25,
-    /// No pending dormant-signer replacement proposal exists.
-    DormantReplacementNotFound = 26,
+    /// Spending limit exceeded for the token.
+    SpendingLimitExceeded = 14,
+    /// Invalid spending limit configuration.
+    InvalidSpendingLimit = 15,
 }
 
 impl_display_error!(
     MultisigError,
-    AlreadyInitialized  => "already initialized",
-    NotInitialized      => "not initialized",
-    InvalidThreshold    => "invalid threshold",
-    InvalidSigners      => "invalid signers",
-    NotSigner           => "not signer",
-    TransactionNotFound => "transaction not found",
-    AlreadyExecuted     => "already executed",
-    AlreadySigned       => "already signed",
-    ThresholdNotMet     => "threshold not met",
+    AlreadyInitialized   => "already initialized",
+    NotInitialized       => "not initialized",
+    InvalidThreshold     => "invalid threshold",
+    InvalidSigners       => "invalid signers",
+    NotSigner            => "not signer",
+    TransactionNotFound  => "transaction not found",
+    AlreadyExecuted      => "already executed",
+    AlreadySigned        => "already signed",
+    ThresholdNotMet      => "threshold not met",
     InsufficientApprovals => "insufficient approvals",
-    ProposalExpired     => "proposal expired",
-    InvalidWeight       => "invalid weight",
-    NotYetExpired       => "not yet expired",
-    Reentrant           => "reentrant call",
-    TimelockNotElapsed  => "timelock not elapsed",
-    NotQueued           => "not queued",
-    TransactionCancelled => "transaction cancelled",
-    SpendingNotConfigured => "spending not configured",
-    NotSpendingOperator => "not spending operator",
-    DailyLimitExceeded  => "daily limit exceeded",
-    RateLimited         => "rate limited",
-    InvalidAmount       => "invalid amount",
-    NotProposer         => "not proposer",
-    NotSigned           => "not signed",
-    InvalidThresholdChange => "invalid threshold change",
-    ThresholdChangeNotFound => "threshold change not found",
-    SignerNotDormant    => "signer not dormant",
-    DormantReplacementNotFound => "dormant replacement not found",
+    ProposalExpired      => "proposal expired",
+    InvalidWeight        => "invalid weight",
+    NotYetExpired        => "not yet expired",
+    SpendingLimitExceeded => "spending limit exceeded",
+    InvalidSpendingLimit  => "invalid spending limit",
 );
