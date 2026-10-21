@@ -1,28 +1,15 @@
+#![allow(deprecated)]
+
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 pub fn initialized(env: &Env, admin: &Address) {
-    env.events().publish((Symbol::new(env, "initialized"),), admin.clone());
-}
-
-/// Emitted by `initialize` (#1123).
-/// `quadratic` indicates whether quadratic voting mode is enabled.
-pub fn initialized_with_mode(env: &Env, admin: &Address, quadratic: bool) {
-    env.events().publish(
-        (Symbol::new(env, "initialized"),),
-        (admin.clone(), quadratic),
-    );
+    env.events()
+        .publish((Symbol::new(env, "initialized"),), admin.clone());
 }
 
 pub fn voter_registered(env: &Env, voter: &Address) {
     env.events()
         .publish((Symbol::new(env, "voter_registered"),), voter.clone());
-}
-
-/// Emitted by `register_voters_batch` (#1122).
-/// `voters` contains the addresses newly registered in the batch.
-pub fn voters_registered_batch(env: &Env, voters: &Vec<Address>) {
-    env.events()
-        .publish((Symbol::new(env, "voters_registered_batch"),), voters.clone());
 }
 
 pub fn voter_deregistered(env: &Env, voter: &Address) {
@@ -61,6 +48,7 @@ pub fn tally_result(env: &Env, yes: i128, no: i128) {
         .publish((Symbol::new(env, "tally_result"),), (yes, no));
 }
 
+/// Emitted when a ballot is closed by a tally (#1121).
 /// Emitted by `tally_all` (multi-choice ballot, #788).
 /// `counts` contains per-choice vote tallies in declaration order.
 pub fn tally_all_result(env: &Env, counts: &Vec<i128>) {
