@@ -9,6 +9,8 @@ pub enum DataKey {
     Admin,
     VotingActive,
     RegisteredVoter(Address),
+    /// Voting weight assigned to a registered voter (#1329).
+    VoterWeight(Address),
     Voter(Address),
     /// Binary yes-vote counter (choice index 1).  Kept for backward compat.
     YesVotes,
