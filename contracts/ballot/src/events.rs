@@ -57,6 +57,12 @@ pub fn vote_revealed_blinded(env: &Env, commitment: &BytesN<32>, choice: u32) {
         (Symbol::new(env, "vote_revealed_blinded"),),
         (commitment.clone(), choice),
     );
+/// Emitted when a ballot is closed by a tally (#1121).
+/// Emitted by `tally_all` (multi-choice ballot, #788).
+/// `counts` contains per-choice vote tallies in declaration order.
+pub fn tally_all_result(env: &Env, counts: &Vec<i128>) {
+    env.events()
+        .publish((Symbol::new(env, "tally_all_result"),), counts.clone());
 }
 
 /// Emitted by `tally` (binary ballot, backward compat).
@@ -66,7 +72,24 @@ pub fn tally_result(env: &Env, yes: i128, no: i128) {
 }
 
 /// Emitted when a ballot is closed by a tally (#1121).
+        .publish((Symbol::new(env, "tally_quadratic_result"),), counts.clone());
+}
+
+/// Emitted when the ballot is closed via `tally_all` after the voting window
+/// has ended (#1121). Signals that official tally results are final.
 pub fn tally_completed(env: &Env, counts: &Vec<i128>) {
     env.events()
         .publish((Symbol::new(env, "TallyCompleted"),), counts.clone());
+}
+
+/// Emitted by `certify_results` (#1333).
+///
+/// `hash` is the immutable snapshot of the winning choice and per-choice tally;
+/// `winner` is the certified winning choice index; `counts` is the final tally
+/// in declaration order.
+pub fn ballot_certified(env: &Env, hash: &BytesN<32>, winner: u32, counts: &Vec<i128>) {
+    env.events().publish(
+        (Symbol::new(env, "BallotCertified"),),
+        (hash.clone(), winner, counts.clone()),
+    );
 }
