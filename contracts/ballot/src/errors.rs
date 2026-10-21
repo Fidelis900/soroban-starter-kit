@@ -90,6 +90,29 @@ impl core::fmt::Display for BallotError {
         })
     }
 }
+}
+
+impl core::fmt::Display for BallotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BallotError::AlreadyInitialized => "already initialized",
+            BallotError::NotInitialized => "not initialized",
+            BallotError::Unauthorized => "not authorized",
+            BallotError::NotRegistered => "voter not registered",
+            BallotError::AlreadyVoted => "voter has already voted",
+            BallotError::InvalidChoice => "invalid vote choice",
+            BallotError::VotingClosed => "voting is closed",
+            BallotError::VotingAlreadyStarted => "voting already started",
+            BallotError::InvalidWindow => "invalid voting window",
+            BallotError::VotingNotStarted => "voting not started",
+            BallotError::NoChoices => "no choices provided",
+            BallotError::InvalidRanking => "invalid preference ranking",
+            BallotError::DuplicateRanking => "duplicate choice in ranking",
+            BallotError::VotingNotClosed => "voting window has not closed",
+            BallotError::TallyNotAvailable => "tally not available",
+        })
+    }
+}
     Tied = 16,
     AlreadyCertified = 17,
     QuorumNotMet = 18,

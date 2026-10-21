@@ -1,6 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
+use soroban_sdk::{contracttype, Address, BytesN};
 use soroban_sdk::{contracttype, Address};
 
 #[contracttype]
@@ -40,6 +41,10 @@ pub enum DataKey {
     Revealed(Address),
     /// Number of commitments submitted; used to gate the reveal phase.
     CommitCount,
+    /// Blinded commitment hash that may be revealed by any relayer (#1331).
+    CommitmentHash(BytesN<32>),
+    /// Whether a blinded commitment hash has already been revealed (#1331).
+    RevealedCommitment(BytesN<32>),
     /// Ordered preference ranking submitted by a voter (most preferred first).
     RankedVote(Address),
     /// Number of ranked-choice ballots cast.

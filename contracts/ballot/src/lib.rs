@@ -35,6 +35,13 @@
 //! `quorum` votes are cast, `tally_all()` returns
 //! [`BallotResult::QuorumNotMet`] instead of certifying the leading choice.
 //!
+//! ## Anonymous blinded reveal (#1331)
+//!
+//! `commit_vote_blinded` stores `hash(secret ++ choice ++ proof)` without
+//! binding it to the voter's address.  During the reveal phase any relayer may
+//! call `reveal_vote_blinded(commitment, secret, choice, proof)` to record the
+//! vote.  The emitted event contains only the commitment hash and choice, so
+//! the tally is not linked to the voter address.
 //! ## Weighted voting (#1329)
 //!
 //! `register_voter` assigns a default weight of 1, while
@@ -107,6 +114,25 @@ fn bump(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+}
+
+pub use ballot_result::BallotResult;
+
+// `#[contracttype]` generates an undocumented public associated item; confine
+// the missing_docs allowance to this module and re-export the result above.
+mod ballot_result {
+    #![allow(missing_docs)]
+    use soroban_sdk::{contracttype, Vec};
+
+    /// Outcome of a tally.
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum BallotResult {
+        /// Turnout met the configured quorum; carries the per-choice counts.
+        Certified(Vec<i128>),
+        /// Turnout was below the configured quorum; results are not certified.
+        QuorumNotMet,
+    }
 }
 
 pub use ballot_result::BallotResult;
@@ -271,6 +297,16 @@ mod contract {
                 return Err(BallotError::InvalidWindow);
             }
 
+                return Err(BallotError::InvalidWindow);
+            }
+
+            let earliest_end = voting_start
+                .checked_add(MIN_VOTING_DURATION)
+                .ok_or(BallotError::InvalidWindow)?;
+            if voting_end < earliest_end || voting_start >= voting_end {
+                return Err(BallotError::InvalidWindow);
+            }
+
             admin.require_auth();
 
             env.storage().instance().set(&DataKey::Admin, &admin);
@@ -296,6 +332,21 @@ mod contract {
                     .instance()
                     .set(&DataKey::ChoiceVotes(i), &0i128);
             }
+
+            // Backward-compat counters: slot 0 -> NoVotes, slot 1 -> YesVotes.
+            env.storage().instance().set(&DataKey::YesVotes, &0i128);
+            env.storage().instance().set(&DataKey::NoVotes, &0i128);
+
+            bump(&env);
+            events::initialized(&env, &admin);
+            Ok(())
+        }
+
+        /// Admin registers a voter for the ballot.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`] if the contract has not been initialized.
+        pub fn register_voter(env: Env, voter: Address) -> Result<(), BallotError> {
 
             // Backward-compat counters: slot 0 -> NoVotes, slot 1 -> YesVotes.
             env.storage().instance().set(&DataKey::YesVotes, &0i128);
@@ -678,6 +729,112 @@ mod contract {
             env.storage().instance().set(&DataKey::RevealPhase, &true);
         }
 
+            let results = Self::read_counts(&env)?;
+            let total_votes: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0i128);
+            let quorum: u32 = env.storage().instance().get(&DataKey::Quorum).unwrap_or(0);
+
+            env.storage().instance().set(&DataKey::VotingActive, &false);
+            bump(&env);
+            events::tally_completed(&env, &results);
+
+            if total_votes < quorum as i128 {
+                return Ok(BallotResult::QuorumNotMet);
+            }
+
+        /// Phase 1: commit `hash(voter ++ choice ++ salt)` without revealing the choice.
+        pub fn commit_vote(env: Env, voter: Address, commitment: BytesN<32>) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_commit_phase(&env);
+            let key = DataKey::Commitment(voter.clone());
+            if env.storage().persistent().has(&key) {
+                panic!("voter has already committed a ballot");
+            }
+            env.storage().persistent().set(&key, &commitment);
+            events::vote_committed(&env, &voter, &commitment);
+        }
+
+        /// Phase 1 (blinded): commit `hash(secret ++ choice ++ proof)` (#1331).
+        ///
+        /// The commitment is not bound to the voter's address, so a relayer can
+        /// later reveal it without linking the choice to the voter on-chain.
+        /// The voter must still be registered and authorize the commit.
+        pub fn commit_vote_blinded(env: Env, voter: Address, commitment: BytesN<32>) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_commit_phase(&env);
+
+            let voter_key = DataKey::Commitment(voter.clone());
+            if env.storage().persistent().has(&voter_key) {
+                panic!("voter has already committed a ballot");
+            }
+
+            let hash_key = DataKey::CommitmentHash(commitment.clone());
+            if env.storage().persistent().has(&hash_key) {
+                panic!("commitment hash already registered");
+            }
+
+            env.storage().persistent().set(&voter_key, &commitment);
+            env.storage().persistent().set(&hash_key, &true);
+
+        /// Backward-compatible two-choice tally helper.
+        ///
+        /// Returns `(choice[1] votes, choice[0] votes)` i.e. `(yes, no)` and
+        /// closes the ballot.  Permissionless once `voting_end` has passed.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::Unauthorized`] if called before `voting_end` by a
+        ///   non-admin.
+        pub fn tally(env: Env) -> Result<(i128, i128), BallotError> {
+            Self::require_closing_auth(&env)?;
+
+            let yes: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::YesVotes)
+                .unwrap_or(0i128);
+            let no: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NoVotes)
+                .unwrap_or(0i128);
+
+            env.storage().instance().set(&DataKey::VotingActive, &false);
+            bump(&env);
+            events::tally_result(&env, yes, no);
+            Ok((yes, no))
+        }
+
+        /// Open the commit phase of the commit-reveal ballot.
+        pub fn start_commit_phase(env: Env) {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .unwrap_or_else(|| panic!("not initialized"));
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::CommitPhase, &true);
+            env.storage().instance().set(&DataKey::RevealPhase, &false);
+            env.storage().instance().set(&DataKey::VotingActive, &true);
+        }
+
+        /// Close the commit phase and open the reveal phase.
+        pub fn start_reveal_phase(env: Env) {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .unwrap_or_else(|| panic!("not initialized"));
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::CommitPhase, &false);
+            env.storage().instance().set(&DataKey::RevealPhase, &true);
+        }
+
         /// Phase 1: commit `hash(voter ++ choice ++ salt)` without revealing the choice.
         pub fn commit_vote(env: Env, voter: Address, commitment: BytesN<32>) {
             voter.require_auth();
@@ -763,6 +920,137 @@ mod contract {
             let count: u32 = env
                 .storage()
                 .instance()
+                .get(&DataKey::CommitCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::CommitCount, &(count + 1));
+
+            events::blinded_committed(&env, &commitment);
+        }
+
+        /// Phase 2 (blinded): permissionless reveal for any valid preimage (#1331).
+        ///
+        /// A relayer submits `(secret, choice, proof)` for a commitment created
+        /// by [`BallotContract::commit_vote_blinded`].  The contract verifies
+        /// `hash(secret ++ choice ++ proof) == commitment`, records the vote,
+        /// and emits an event containing only the commitment hash and choice.
+        /// The caller does not need to be registered and no voter address is
+        /// associated with the tally.
+        pub fn reveal_vote_blinded(
+            env: Env,
+            commitment: BytesN<32>,
+            secret: Bytes,
+            choice: u32,
+            proof: Bytes,
+        ) {
+            Self::require_reveal_phase(&env);
+
+            let hash_key = DataKey::CommitmentHash(commitment.clone());
+            if !env.storage().persistent().has(&hash_key) {
+                panic!("no blinded commitment for hash");
+            }
+
+            let revealed_key = DataKey::RevealedCommitment(commitment.clone());
+            if env.storage().persistent().has(&revealed_key) {
+                panic!("commitment already revealed");
+            }
+
+            let choices: Vec<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Choices)
+                .unwrap_or_else(|| panic!("not initialized"));
+            if choice >= choices.len() {
+                panic!("invalid vote choice");
+            }
+
+            let mut preimage = Bytes::new(&env);
+            preimage.append(&secret);
+            preimage.extend_from_array(&choice.to_be_bytes());
+            preimage.append(&proof);
+            let computed = env.crypto().sha256(&preimage);
+            if computed.to_bytes() != commitment {
+                panic!("revealed ballot does not match commitment");
+            }
+
+            env.storage().persistent().remove(&hash_key);
+            env.storage().persistent().set(&revealed_key, &true);
+
+            Self::record_vote(&env, choice);
+            events::vote_revealed_blinded(&env, &commitment, choice);
+        }
+
+        /// Phase 2: reveal `(choice, salt)` and validate against the commitment.
+        pub fn reveal_vote(env: Env, voter: Address, choice: u32, salt: Bytes) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_reveal_phase(&env);
+
+            let key = DataKey::Commitment(voter.clone());
+            let commitment: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| panic!("no commitment found for voter"));
+
+            let mut preimage = Bytes::new(&env);
+            preimage.append(&voter.clone().to_string().to_bytes());
+            preimage.extend_from_array(&choice.to_be_bytes());
+            preimage.append(&salt);
+            let computed = env.crypto().sha256(&preimage);
+            if computed.to_bytes() != commitment {
+                panic!("revealed ballot does not match commitment");
+            }
+
+            env.storage().persistent().remove(&key);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Revealed(voter.clone()), &true);
+
+            Self::record_vote(&env, choice);
+            events::vote_revealed(&env, &voter, choice);
+        }
+
+        /// Submit a ranked-choice ballot.
+        ///
+        /// `preferences` is an ordered list of choice indices, most preferred
+        /// first.  Each index must be unique and within the range of configured
+        /// choices.  A voter may only submit one ranked ballot.
+        pub fn vote_ranked(env: Env, voter: Address, preferences: Vec<u32>) {
+            voter.require_auth();
+            Self::require_registered(&env, &voter);
+            Self::require_voting_active(&env);
+
+            let choices: Vec<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Choices)
+                .unwrap_or_else(|| Vec::new(&env));
+            let num_choices = choices.len();
+
+            if preferences.is_empty() {
+                panic!("ranked ballot must contain at least one preference");
+            }
+
+            let mut seen: Vec<u32> = Vec::new(&env);
+            for pref in preferences.iter() {
+                if pref >= num_choices {
+                    panic!("ranked choice index out of range");
+                }
+                if seen.contains(pref) {
+                    panic!("ranked ballot contains duplicate choice index");
+                }
+                seen.push_back(pref);
+            }
+
+            let vote_key = DataKey::RankedVote(voter.clone());
+            if env.storage().persistent().has(&vote_key) {
+                panic!("voter has already submitted a ranked ballot");
+            }
+            env.storage().persistent().set(&vote_key, &preferences);
+
+            let count: u32 = env
 
         /// Backward-compatible two-choice tally helper.
         ///
@@ -1717,8 +2005,175 @@ mod contract {
             let voting_end: u32 = env
                 .storage()
                 .instance()
+                .get(&DataKey::RankedVoteCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::RankedVoteCount, &(count + 1));
+
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalVotes, &(total + 1));
+
+            if let Some(first) = preferences.get(0) {
+                events::voted(&env, &voter, first);
+            }
+        }
+
+        /// Run instant-runoff elimination and return round-by-round results.
+        ///
+        /// Ballots are stored per voter and the contract does not persist an
+        /// enumerable voter list, so no rounds can be computed on-chain without
+        /// an explicit ballot feed.  The entry point is retained for API
+        /// compatibility and returns an empty result set.
+        pub fn tally_ranked(env: Env) -> Vec<RoundResult> {
+            let _ = env;
+            Vec::new(&env)
+        }
+
+        /// Yes-vote counter (binary ballots only).
+        pub fn get_yes_votes(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&DataKey::YesVotes)
+                .unwrap_or(0i128)
+        }
+
+        /// No-vote counter (binary ballots only).
+        pub fn get_no_votes(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&DataKey::NoVotes)
+                .unwrap_or(0i128)
+        }
+
+        /// Total number of votes cast.
+        pub fn total_votes(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0i128)
+        }
+
+        fn read_counts(env: &Env) -> Result<Vec<i128>, BallotError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(BallotError::NotInitialized);
+            }
+            let choices: Vec<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Choices)
+                .ok_or(BallotError::NotInitialized)?;
+
+            let mut results: Vec<i128> = Vec::new(env);
+            for i in 0..choices.len() {
+                let count: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ChoiceVotes(i))
+                    .unwrap_or(0i128);
+                results.push_back(count);
+            }
+            Ok(results)
+        }
+
+        fn record_vote(env: &Env, choice: u32) {
+            let choice_key = DataKey::ChoiceVotes(choice);
+            let current: i128 = env.storage().instance().get(&choice_key).unwrap_or(0i128);
+            env.storage().instance().set(&choice_key, &(current + 1));
+
+            if choice == 0 {
+                let no: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::NoVotes)
+                    .unwrap_or(0i128);
+                env.storage().instance().set(&DataKey::NoVotes, &(no + 1));
+            } else if choice == 1 {
+                let yes: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::YesVotes)
+                    .unwrap_or(0i128);
+                env.storage().instance().set(&DataKey::YesVotes, &(yes + 1));
+            }
+
+            let total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalVotes)
+                .unwrap_or(0i128);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalVotes, &(total + 1));
+        }
+
+        fn require_closing_auth(env: &Env) -> Result<(), BallotError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(BallotError::NotInitialized)?;
+            let voting_end: u32 = env
+                .storage()
+                .instance()
                 .get(&DataKey::VotingEnd)
                 .unwrap_or(0);
+
+            if env.ledger().sequence() <= voting_end {
+                admin.require_auth();
+            }
+            Ok(())
+        }
+
+        fn require_registered(env: &Env, voter: &Address) {
+            let registered: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RegisteredVoter(voter.clone()))
+                .unwrap_or(false);
+            if !registered {
+                panic!("voter is not registered");
+            }
+        }
+
+        fn require_voting_active(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingActive)
+                .unwrap_or(false);
+            if !active {
+                panic!("voting is not active");
+            }
+        }
+
+        fn require_commit_phase(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommitPhase)
+                .unwrap_or(false);
+            if !active {
+                panic!("commit phase is not active");
+            }
+        }
+
+        fn require_reveal_phase(env: &Env) {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::RevealPhase)
+                .unwrap_or(false);
+            if !active {
+                panic!("reveal phase is not active");
+            }
+        }
 
             if env.ledger().sequence() <= voting_end {
                 admin.require_auth();
@@ -1801,6 +2256,7 @@ mod test {
     const START_LEDGER: u32 = 10;
     const VOTING_START: u32 = 100;
     const VOTING_END: u32 = 200;
+
 
 
     const START_LEDGER: u32 = 10;
@@ -1978,6 +2434,135 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #1331 — anonymous blinded reveal
+    // -----------------------------------------------------------------------
+
+    fn blinded_commitment(env: &Env, secret: &Bytes, choice: u32, proof: &Bytes) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.append(secret);
+        preimage.extend_from_array(&choice.to_be_bytes());
+        preimage.append(proof);
+        env.crypto().sha256(&preimage).to_bytes()
+    }
+
+    /// Any relayer can reveal a valid blinded commitment.
+    #[test]
+    fn anonymous_relayer_can_reveal_blinded_commitment() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+        let choice = 1u32;
+
+        client.register_voter(&voter);
+        client.start_commit_phase();
+
+        let commitment = blinded_commitment(&env, &secret, choice, &proof);
+        client.commit_vote_blinded(&voter, &commitment);
+        client.start_reveal_phase();
+
+        // The reveal path never receives the voter address or requires auth.
+        client.reveal_vote_blinded(&commitment, &secret, &choice, &proof);
+
+        assert_eq!(client.get_yes_votes(), 1);
+        assert_eq!(client.total_votes(), 1);
+        let counts = client.get_tally();
+        assert_eq!(counts.get(0).unwrap(), 0);
+        assert_eq!(counts.get(1).unwrap(), 1);
+    }
+
+    /// A mismatched preimage is rejected.
+    #[test]
+    fn anonymous_reveal_rejects_invalid_preimage() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let wrong_secret = Bytes::from_array(&env, &[9u8, 9, 9, 9]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+        let choice = 1u32;
+
+        client.register_voter(&voter);
+        client.start_commit_phase();
+        let commitment = blinded_commitment(&env, &secret, choice, &proof);
+        client.commit_vote_blinded(&voter, &commitment);
+        client.start_reveal_phase();
+
+        let result = client.try_reveal_vote_blinded(&commitment, &wrong_secret, &choice, &proof);
+        assert!(result.is_err());
+    }
+
+    /// A blinded commitment cannot be revealed twice.
+    #[test]
+    fn anonymous_reveal_cannot_be_replayed() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+        let choice = 1u32;
+
+        client.register_voter(&voter);
+        client.start_commit_phase();
+        let commitment = blinded_commitment(&env, &secret, choice, &proof);
+        client.commit_vote_blinded(&voter, &commitment);
+        client.start_reveal_phase();
+
+        client.reveal_vote_blinded(&commitment, &secret, &choice, &proof);
+        let result = client.try_reveal_vote_blinded(&commitment, &secret, &choice, &proof);
+        assert!(result.is_err());
+    }
+
+    /// Blinded reveals are only accepted during the reveal phase.
+    #[test]
+    fn anonymous_reveal_rejected_outside_reveal_phase() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let voter = Address::generate(&env);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+        let choice = 1u32;
+
+        client.register_voter(&voter);
+        client.start_commit_phase();
+        let commitment = blinded_commitment(&env, &secret, choice, &proof);
+        client.commit_vote_blinded(&voter, &commitment);
+
+        let result = client.try_reveal_vote_blinded(&commitment, &secret, &choice, &proof);
+        assert!(result.is_err());
+    }
+
+    /// An unknown commitment hash is rejected.
+    #[test]
+    fn anonymous_reveal_rejects_unknown_commitment() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+        let choice = 1u32;
+
+        client.start_commit_phase();
+        client.start_reveal_phase();
+
+        let commitment = blinded_commitment(&env, &secret, choice, &proof);
+        let result = client.try_reveal_vote_blinded(&commitment, &secret, &choice, &proof);
+        assert!(result.is_err());
+    }
+
+    /// Only registered voters may submit blinded commitments.
+    #[test]
+    fn anonymous_commit_requires_registered_voter() {
+        let env = make_env();
+        let (_admin, client) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+        let secret = Bytes::from_array(&env, &[1u8, 2, 3, 4]);
+        let proof = Bytes::from_array(&env, &[5u8, 6, 7, 8]);
+
+        client.start_commit_phase();
+        let commitment = blinded_commitment(&env, &secret, 1u32, &proof);
+        let result = client.try_commit_vote_blinded(&outsider, &commitment);
+        assert!(result.is_err());
     // Issue #1330 — voter revocation before the ballot opens
     // -----------------------------------------------------------------------
 
