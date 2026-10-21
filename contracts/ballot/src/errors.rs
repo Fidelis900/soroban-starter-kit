@@ -44,3 +44,33 @@ impl core::fmt::Display for BallotError {
         })
     }
 }
+    Tied = 16,
+    AlreadyCertified = 17,
+    QuorumNotMet = 18,
+    ResultsNotReady = 19,
+    InvalidTieResolution = 20,
+}
+
+impl_display_error!(
+    BallotError,
+    AlreadyInitialized   => "already initialized",
+    NotInitialized       => "not initialized",
+    Unauthorized         => "not authorized",
+    NotRegistered        => "voter not registered",
+    AlreadyVoted         => "voter has already voted",
+    InvalidChoice        => "invalid vote choice",
+    VotingClosed         => "voting is closed",
+    VotingAlreadyStarted => "voting already started",
+    InvalidWindow        => "invalid voting window",
+    VotingNotStarted     => "voting not started",
+    NoChoices            => "no choices provided",
+    InvalidRanking       => "invalid preference ranking",
+    DuplicateRanking     => "duplicate choice in ranking",
+    VotingNotClosed      => "voting window has not closed",
+    TallyNotAvailable    => "tally not available",
+    Tied                 => "leading choices are tied",
+    AlreadyCertified     => "results already certified",
+    QuorumNotMet         => "quorum not met",
+    ResultsNotReady      => "no votes to certify",
+    InvalidTieResolution => "choice is not among the tied choices",
+);

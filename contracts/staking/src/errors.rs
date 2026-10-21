@@ -19,7 +19,9 @@ pub enum StakingError {
     NoUnbondRequest = 10,
     UnbondRequestPending = 11,
     InvalidTranche = 12,
-    InvalidPenalty = 12,
+    InvalidPenalty = 13,
+    InvalidRewardRate = 14,
+    InvalidPeriodEnd = 15,
 }
 
 impl_display_error!(

@@ -68,12 +68,15 @@ fn last_update_ledger(env: &Env) -> u32 {
         .unwrap_or(0u32)
 }
 
-/// Advances the reward-per-token accumulator for the elapsed ledgers.
+/// Projects the reward-per-token accumulator forward to the current ledger
+/// **without mutating storage**.
 ///
-/// `ΔRPT = Δledgers * rate * REWARD_SCALE / total_staked`.  Only the ledgers
-/// within the active emission window `[last_update, period_end]` count, so
-/// emission stops exactly at `period_end` and never over-distributes.
-fn accrue(env: &Env, total_staked: i128) -> Result<(), StakingError> {
+/// This is the pure, in-memory counterpart to [`accrue`].  It applies the
+/// exact same clamping (`[last_update, period_end]`) and fixed-point scaling
+/// so that read-only queries such as [`pending_rewards`] observe the same
+/// value that a subsequent state-changing call would persist, while leaving
+/// storage untouched for Soroban RPC simulation (#1335).
+fn projected_reward_per_token(env: &Env, total_staked: i128) -> Result<i128, StakingError> {
     let now = env.ledger().sequence();
     let last = last_update_ledger(env);
     let end = period_end(env);
@@ -83,20 +86,32 @@ fn accrue(env: &Env, total_staked: i128) -> Result<(), StakingError> {
     let effective_last = if last < end { last } else { end };
     let elapsed = effective_now.saturating_sub(effective_last);
 
-    if elapsed > 0 && rate > 0 && total_staked > 0 {
-        let rpt = reward_per_token(env);
-        // `elapsed * rate` may overflow; surface it as an error rather than
-        // silently wrapping, then scale by `REWARD_SCALE / total_staked`.
-        let numerator = (elapsed as i128)
-            .checked_mul(rate)
-            .ok_or(StakingError::Overflow)?;
-        let delta = mul_div(numerator, REWARD_SCALE, total_staked)
-            .ok_or(StakingError::Overflow)?;
-        let new_rpt = rpt.checked_add(delta).ok_or(StakingError::Overflow)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::RewardPerTokenStored, &new_rpt);
+    let rpt = reward_per_token(env);
+    if elapsed == 0 || rate <= 0 || total_staked <= 0 {
+        return Ok(rpt);
     }
+
+    // `elapsed * rate` may overflow; surface it as an error rather than
+    // silently wrapping, then scale by `REWARD_SCALE / total_staked`.
+    let numerator = (elapsed as i128)
+        .checked_mul(rate)
+        .ok_or(StakingError::Overflow)?;
+    let delta = mul_div(numerator, REWARD_SCALE, total_staked).ok_or(StakingError::Overflow)?;
+    rpt.checked_add(delta).ok_or(StakingError::Overflow)
+}
+
+/// Advances and persists the reward-per-token accumulator for the elapsed
+/// ledgers.
+///
+/// `ΔRPT = Δledgers * rate * REWARD_SCALE / total_staked`.  Only the ledgers
+/// within the active emission window `[last_update, period_end]` count, so
+/// emission stops exactly at `period_end` and never over-distributes.
+fn accrue(env: &Env, total_staked: i128) -> Result<(), StakingError> {
+    let now = env.ledger().sequence();
+    let projected = projected_reward_per_token(env, total_staked)?;
+    env.storage()
+        .instance()
+        .set(&DataKey::RewardPerTokenStored, &projected);
     env.storage()
         .instance()
         .set(&DataKey::LastUpdateLedger, &now);
@@ -158,14 +173,16 @@ pub(crate) fn calculate_earned(
     accrued.checked_add(earned)
 }
 
-/// Computes how many reward tokens `staker` has earned since their last update.
-fn earned(env: &Env, staker: &Address) -> i128 {
+/// Computes `staker`'s earned rewards against an explicit accumulator value.
+///
+/// Kept separate from [`earned`] so that read-only callers can evaluate the
+/// formula against a *projected* accumulator without persisting it (#1335).
+fn earned_at_reward_per_token(env: &Env, staker: &Address, rpt: i128) -> i128 {
     let stake: i128 = env
         .storage()
         .persistent()
         .get(&DataKey::Stake(staker.clone()))
         .unwrap_or(0i128);
-    let rpt = reward_per_token(env);
     let paid: i128 = env
         .storage()
         .persistent()
@@ -177,6 +194,11 @@ fn earned(env: &Env, staker: &Address) -> i128 {
         .get(&DataKey::Rewards(staker.clone()))
         .unwrap_or(0i128);
     calculate_earned(stake, rpt, paid, accrued).unwrap_or(0i128)
+}
+
+/// Computes how many reward tokens `staker` has earned since their last update.
+fn earned(env: &Env, staker: &Address) -> i128 {
+    earned_at_reward_per_token(env, staker, reward_per_token(env))
 }
 
 /// Snapshots the staker's earned rewards and updates their paid-up-to pointer.
@@ -278,6 +300,9 @@ mod contract {
         ///
         /// # Errors
         /// - [`StakingError::NotInitialized`] if the contract is not set up.
+        /// - [`StakingError::InvalidRewardRate`] if `reward_rate` is negative.
+        /// - [`StakingError::InvalidPeriodEnd`] if `period_end` is not strictly
+        ///   greater than the current ledger sequence.
         pub fn set_reward_rate(
             env: Env,
             reward_rate: i128,
@@ -285,6 +310,17 @@ mod contract {
         ) -> Result<(), StakingError> {
             let admin = get_admin(&env)?;
             admin.require_auth();
+            // A negative rate would decrement the accumulator and permanently
+            // corrupt staker rewards (#1334).
+            if reward_rate < 0 {
+                return Err(StakingError::InvalidRewardRate);
+            }
+            // A `period_end` at or before the current ledger would make the
+            // emission window empty or inverted and corrupt `LastUpdateLedger`
+            // bookkeeping (#1334).
+            if period_end <= env.ledger().sequence() {
+                return Err(StakingError::InvalidPeriodEnd);
+            }
             let total_staked = get_total_staked_internal(&env)?;
             accrue(&env, total_staked)?;
             env.storage()
@@ -298,10 +334,15 @@ mod contract {
         }
 
         /// Returns the pending rewards for `staker` including linear accrual.
+        ///
+        /// This is a read-only view: the projected accumulator is computed in
+        /// memory and never written to storage, so the call is safe under
+        /// Soroban RPC simulation and does not perturb on-chain state (#1335).
         pub fn pending_rewards(env: Env, staker: Address) -> i128 {
             let total_staked = get_total_staked_internal(&env).unwrap_or(0i128);
-            let _ = accrue(&env, total_staked);
-            earned(&env, &staker)
+            let projected = projected_reward_per_token(&env, total_staked)
+                .unwrap_or_else(|_| reward_per_token(&env));
+            earned_at_reward_per_token(&env, &staker, projected)
         }
 
         /// Stake `amount` tokens, accruing rewards first so the staker's
