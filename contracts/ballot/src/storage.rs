@@ -45,6 +45,17 @@ pub enum DataKey {
     Revealed(Address),
     /// Number of commitments submitted; used to gate the reveal phase.
     CommitCount,
+    // ── result certification / tie-breaking (#1332, #1333) ─────────────────
+    /// Configured tie-breaker policy ([`crate::TieBreaker`]).
+    TieBreaker,
+    /// Choice index selected by the admin to break a tie, if any (`u32`).
+    TieResolution,
+    /// Immutable snapshot hash of the certified result (`BytesN<32>`).
+    CertifiedHash,
+    /// Winning choice index captured at certification (`u32`).
+    CertifiedWinner,
+    /// Ledger sequence at which the result was certified (`u32`).
+    CertifiedAt,
 }
 
 /// A single instant-runoff elimination round result.

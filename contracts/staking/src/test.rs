@@ -633,3 +633,121 @@ proptest! {
         assert_eq!(client.get_total_staked(), 0);
     }
 }
+
+// ── #1334: set_reward_rate validation ─────────────────────────────────────────
+
+/// Register a fresh contract and return `(client, contract_id, stake_token)`.
+fn setup_rate(env: &Env) -> (StakingContractClient, Address, Address) {
+    let admin = Address::generate(env);
+    let stake_token = make_token(env, &admin, 10_000);
+    let reward_token = make_token(env, &admin, 10_000);
+    let slash_dest = Address::generate(env);
+    let addr = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(env, &addr);
+    client.initialize(&admin, &stake_token, &reward_token, &0u32, &slash_dest);
+    (client, addr, stake_token)
+}
+
+#[test]
+fn test_set_reward_rate_rejects_negative_rate() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(10);
+    let (client, _addr, _stake_token) = setup_rate(&env);
+
+    let result = client.try_set_reward_rate(&-1i128, &1_000u32);
+    assert_eq!(result, Err(Ok(StakingError::InvalidRewardRate)));
+}
+
+#[test]
+fn test_set_reward_rate_rejects_current_ledger_period_end() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(50);
+    let (client, _addr, _stake_token) = setup_rate(&env);
+
+    // `period_end` equal to the current ledger is not in the future.
+    let result = client.try_set_reward_rate(&1i128, &50u32);
+    assert_eq!(result, Err(Ok(StakingError::InvalidPeriodEnd)));
+}
+
+#[test]
+fn test_set_reward_rate_rejects_past_period_end() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(50);
+    let (client, _addr, _stake_token) = setup_rate(&env);
+
+    let result = client.try_set_reward_rate(&1i128, &49u32);
+    assert_eq!(result, Err(Ok(StakingError::InvalidPeriodEnd)));
+}
+
+#[test]
+fn test_set_reward_rate_accepts_valid_config() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(10);
+    let (client, _addr, _stake_token) = setup_rate(&env);
+
+    let result = client.try_set_reward_rate(&5i128, &1_000u32);
+    assert_eq!(result, Ok(Ok(())));
+}
+
+// ── #1335: pending_rewards is a read-only view ────────────────────────────────
+
+/// Reads `LastUpdateLedger` directly from the contract's instance storage so a
+/// test can prove a view call did not advance it.
+fn read_last_update_ledger(env: &Env, addr: &Address) -> u32 {
+    env.as_contract(addr, || {
+        env.storage()
+            .instance()
+            .get::<crate::DataKey, u32>(&crate::DataKey::LastUpdateLedger)
+            .unwrap_or(0u32)
+    })
+}
+
+#[test]
+fn test_pending_rewards_leaves_storage_unchanged() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(10);
+    let (client, addr, stake_token) = setup_rate(&env);
+    client.set_reward_rate(&10i128, &1_000u32);
+
+    let staker = Address::generate(&env);
+    StellarAssetClient::new(&env, &stake_token).mint(&staker, &1_000);
+    client.stake(&staker, &1_000);
+
+    // Snapshot the accumulator and the bookkeeping ledger before querying.
+    let rpt_before = client.reward_per_token_stored();
+    let last_before = read_last_update_ledger(&env, &addr);
+
+    // Time passes, so a naive implementation would persist a larger
+    // accumulator when the view is simulated.
+    env.ledger().set_sequence_number(60);
+    let pending = client.pending_rewards(&staker);
+
+    // Rewards are projected (30 ledgers remaining * 10/ledger over 1_000 staked
+    // => 500), but nothing may be written back to storage.
+    assert!(pending > 0);
+    assert_eq!(client.reward_per_token_stored(), rpt_before);
+    assert_eq!(read_last_update_ledger(&env, &addr), last_before);
+}
+
+#[test]
+fn test_pending_rewards_matches_persisted_accrual() {
+    let env = setup_env();
+    env.ledger().set_sequence_number(10);
+    let (client, _addr, stake_token) = setup_rate(&env);
+    client.set_reward_rate(&10i128, &1_000u32);
+
+    let staker = Address::generate(&env);
+    StellarAssetClient::new(&env, &stake_token).mint(&staker, &1_000);
+    client.stake(&staker, &1_000);
+
+    env.ledger().set_sequence_number(60);
+    let projected = client.pending_rewards(&staker);
+    let rpt_before = client.reward_per_token_stored();
+
+    // A state-changing call realizes exactly the accrual the view projected.
+    client.set_reward_rate(&10i128, &1_000u32);
+    let rpt_after = client.reward_per_token_stored();
+
+    assert!(projected > 0);
+    assert!(rpt_after > rpt_before);
+}

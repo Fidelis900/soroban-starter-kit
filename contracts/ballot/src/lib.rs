@@ -45,8 +45,9 @@
 //! requires auth.
 
 use soroban_common::commit_hash;
-use soroban_sdk::{Address, Bytes, BytesN, Env, String, Vec, contract, contractimpl};
+use soroban_sdk::{Address, Bytes, BytesN, Env, String, Vec, contract, contractimpl, contracttype};
 
+mod errors;
 mod events;
 mod storage;
 
@@ -84,6 +85,28 @@ pub enum BallotResult {
     Certified(Vec<i128>),
     /// Turnout was below the configured quorum; results are not certified.
     QuorumNotMet,
+}
+
+/// Policy used to resolve a tie between two or more leading choices (#1332).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TieBreaker {
+    /// A tie blocks certification until a runoff breaks it.
+    RunoffRequired,
+    /// The admin selects one of the tied choices via `resolve_tie`.
+    AdminDecidingVote,
+}
+
+/// Winner of a closed ballot (#1332).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BallotWinner {
+    /// A single choice holds the strictly highest tally.
+    Choice(u32),
+    /// Two or more choices share the highest tally; carries their indices.
+    Tied(Vec<u32>),
+    /// No votes were cast.
+    NoVotes,
 }
 
 /// Multi-choice on-chain ballot contract.
@@ -608,6 +631,252 @@ mod contract {
             events::tally_completed(&env, &results);
             Ok(results)
         }
+
+        /// Configure how ties between leading choices are resolved (#1332).
+        ///
+        /// Admin-only.  Defaults to [`TieBreaker::RunoffRequired`], meaning a
+        /// tied ballot cannot be certified until the tie is broken.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::Unauthorized`] if the caller is not the admin.
+        pub fn set_tie_breaker(env: Env, tie_breaker: TieBreaker) -> Result<(), BallotError> {
+            let admin = ballot_admin(&env)?;
+            admin.require_auth();
+            env.storage()
+                .instance()
+                .set(&DataKey::TieBreaker, &tie_breaker);
+            Ok(())
+        }
+
+        /// Returns the configured tie-breaker policy.
+        pub fn tie_breaker(env: Env) -> TieBreaker {
+            env.storage()
+                .instance()
+                .get(&DataKey::TieBreaker)
+                .unwrap_or(TieBreaker::RunoffRequired)
+        }
+
+        /// Admin selects one of the tied leading choices, allowing an
+        /// `AdminDecidingVote` ballot to be certified (#1332).
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::Unauthorized`] if the caller is not the admin.
+        /// - [`BallotError::VotingNotClosed`] if voting is still open.
+        /// - [`BallotError::InvalidTieResolution`] if `choice` is not among the
+        ///   tied choices.
+        pub fn resolve_tie(env: Env, choice: u32) -> Result<(), BallotError> {
+            let admin = ballot_admin(&env)?;
+            admin.require_auth();
+            ballot_require_closed(&env)?;
+
+            let tied = ballot_tied_choices(&env)?;
+            if !tied.contains(choice) {
+                return Err(BallotError::InvalidTieResolution);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::TieResolution, &choice);
+            Ok(())
+        }
+
+        /// Determines the winner of a closed ballot without mutating state
+        /// (#1332).
+        ///
+        /// Returns [`BallotWinner::Tied`] with the tied choice indices when no
+        /// single choice leads.
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::VotingNotClosed`] if voting is still open.
+        pub fn get_winner(env: Env) -> Result<BallotWinner, BallotError> {
+            ballot_require_closed(&env)?;
+            let tied = ballot_tied_choices(&env)?;
+            if tied.is_empty() {
+                return Ok(BallotWinner::NoVotes);
+            }
+            if tied.len() == 1 {
+                return Ok(BallotWinner::Choice(tied.get(0).unwrap_or(0u32)));
+            }
+            Ok(BallotWinner::Tied(tied))
+        }
+
+        /// Certifies the final result once voting has closed (#1333).
+        ///
+        /// Snapshots the winning choice and the per-choice tally into an
+        /// immutable `BytesN<32>` hash, stores it in instance storage, emits a
+        /// `BallotCertified` event and returns the hash.  Certification is
+        /// one-shot: a second call fails with
+        /// [`BallotError::AlreadyCertified`].
+        ///
+        /// # Errors
+        /// - [`BallotError::NotInitialized`]
+        /// - [`BallotError::AlreadyCertified`] if results are already certified.
+        /// - [`BallotError::VotingNotClosed`] if voting is still open.
+        /// - [`BallotError::QuorumNotMet`] if turnout is below the quorum.
+        /// - [`BallotError::ResultsNotReady`] if no votes were cast.
+        /// - [`BallotError::Tied`] if the leading choices are tied and the
+        ///   configured tie-breaker has not resolved the tie.
+        pub fn certify_results(env: Env) -> Result<BytesN<32>, BallotError> {
+            if env.storage().instance().has(&DataKey::CertifiedHash) {
+                return Err(BallotError::AlreadyCertified);
+            }
+            ballot_require_closed(&env)?;
+
+            let counts = ballot_tally_counts(&env)?;
+            let total = ballot_total_votes(&env);
+            let quorum = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::Quorum)
+                .unwrap_or(0u32);
+            if total < quorum as i128 {
+                return Err(BallotError::QuorumNotMet);
+            }
+
+            let tied = ballot_tied_choices(&env)?;
+            let winner = if tied.is_empty() {
+                return Err(BallotError::ResultsNotReady);
+            } else if tied.len() == 1 {
+                tied.get(0).unwrap_or(0u32)
+            } else {
+                match Self::tie_breaker(env.clone()) {
+                    TieBreaker::AdminDecidingVote => {
+                        let resolved: Option<u32> =
+                            env.storage().instance().get(&DataKey::TieResolution);
+                        match resolved {
+                            Some(choice) if tied.contains(choice) => choice,
+                            _ => return Err(BallotError::Tied),
+                        }
+                    }
+                    TieBreaker::RunoffRequired => return Err(BallotError::Tied),
+                }
+            };
+
+            let hash = ballot_result_hash(&env, winner, &counts);
+            let now = env.ledger().sequence();
+            env.storage()
+                .instance()
+                .set(&DataKey::CertifiedHash, &hash);
+            env.storage()
+                .instance()
+                .set(&DataKey::CertifiedWinner, &winner);
+            env.storage().instance().set(&DataKey::CertifiedAt, &now);
+            events::ballot_certified(&env, &hash, winner, &counts);
+            Ok(hash)
+        }
+
+        /// Returns `(hash, certified_at_ledger)` once results are certified.
+        pub fn certified_results(env: Env) -> Option<(BytesN<32>, u32)> {
+            let hash: Option<BytesN<32>> = env.storage().instance().get(&DataKey::CertifiedHash);
+            hash.map(|h| {
+                let at: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CertifiedAt)
+                    .unwrap_or(0u32);
+                (h, at)
+            })
+        }
+    }
+
+    /// Returns the admin address or [`BallotError::NotInitialized`].
+    fn ballot_admin(env: &Env) -> Result<Address, BallotError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(BallotError::NotInitialized)
+    }
+
+    /// Rejects tally/certification calls made before `voting_end`.
+    fn ballot_require_closed(env: &Env) -> Result<(), BallotError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(BallotError::NotInitialized);
+        }
+        let voting_end: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::VotingEnd)
+            .unwrap_or(0u32);
+        if env.ledger().sequence() <= voting_end {
+            return Err(BallotError::VotingNotClosed);
+        }
+        Ok(())
+    }
+
+    /// Reads the per-choice tallies in declaration order.
+    fn ballot_tally_counts(env: &Env) -> Result<Vec<i128>, BallotError> {
+        let choices: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Choices)
+            .ok_or(BallotError::NotInitialized)?;
+        let mut results: Vec<i128> = Vec::new(env);
+        for i in 0..choices.len() {
+            let count: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ChoiceVotes(i))
+                .unwrap_or(0i128);
+            results.push_back(count);
+        }
+        Ok(results)
+    }
+
+    /// Total number of votes cast, tolerating the legacy `u32` encoding.
+    fn ballot_total_votes(env: &Env) -> i128 {
+        if let Some(v) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::TotalVotes)
+        {
+            return v;
+        }
+        env.storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::TotalVotes)
+            .map(|v| v as i128)
+            .unwrap_or(0i128)
+    }
+
+    /// Returns the indices of the choices sharing the highest tally.
+    ///
+    /// An empty vector means no votes were cast; a single element means a
+    /// unique leader.  This makes tie detection deterministic and independent
+    /// of iteration order (#1332).
+    fn ballot_tied_choices(env: &Env) -> Result<Vec<u32>, BallotError> {
+        let counts = ballot_tally_counts(env)?;
+        let mut max = 0i128;
+        for count in counts.iter() {
+            if count > max {
+                max = count;
+            }
+        }
+        let mut tied: Vec<u32> = Vec::new(env);
+        if max > 0 {
+            for i in 0..counts.len() {
+                if counts.get(i).unwrap_or(0i128) == max {
+                    tied.push_back(i);
+                }
+            }
+        }
+        Ok(tied)
+    }
+
+    /// Builds the immutable `(winner, tallies)` snapshot hash (#1333).
+    fn ballot_result_hash(env: &Env, winner: u32, counts: &Vec<i128>) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(&winner.to_be_bytes());
+        for count in counts.iter() {
+            preimage.extend_from_array(&i128_to_be_bytes(count));
+        }
+        commit_hash(env, &preimage)
+    }
+
+    /// Encodes a non-negative tally as 16 big-endian bytes.
+    fn i128_to_be_bytes(value: i128) -> [u8; 16] {
+        value.to_be_bytes()
     }
 }
 
@@ -647,6 +916,120 @@ mod test {
             }
             BallotResult::QuorumNotMet => panic!("expected quorum to be met"),
         }
+    }
+
+    // ── #1332 / #1333: tie-breaking and result certification ───────────────
+
+    use soroban_sdk::testutils::Ledger as _;
+
+    /// Registers `votes.len()` fresh voters, casts each vote inside the open
+    /// window, then advances the ledger past `voting_end`.
+    fn setup_closed_ballot(
+        env: &Env,
+        quorum: u32,
+        votes: &[u32],
+    ) -> (Address, BallotContractClient) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(BallotContract, ());
+        let client = BallotContractClient::new(env, &contract_id);
+        let mut choices: Vec<String> = Vec::new(env);
+        choices.push_back(String::from_str(env, "no"));
+        choices.push_back(String::from_str(env, "yes"));
+        client.initialize(&admin, &1u32, &100u32, &choices, &quorum);
+
+        env.ledger().set_sequence_number(50);
+        for choice in votes {
+            let voter = Address::generate(env);
+            client.register_voter(&voter);
+            client.vote(&voter, choice);
+        }
+        env.ledger().set_sequence_number(101);
+        (admin, client)
+    }
+
+    #[test]
+    fn get_winner_detects_tie() {
+        let env = Env::default();
+        let (_admin, client) = setup_closed_ballot(&env, 2, &[0, 1]);
+
+        match client.get_winner() {
+            BallotWinner::Tied(indices) => assert_eq!(indices.len(), 2),
+            other => panic!("expected a tie, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn certify_results_rejects_tied_ballot() {
+        let env = Env::default();
+        let (_admin, client) = setup_closed_ballot(&env, 2, &[0, 1]);
+
+        let result = client.try_certify_results();
+        assert_eq!(result, Err(Ok(BallotError::Tied)));
+    }
+
+    #[test]
+    fn admin_tie_break_allows_certification() {
+        let env = Env::default();
+        let (_admin, client) = setup_closed_ballot(&env, 2, &[0, 1]);
+
+        client.set_tie_breaker(&TieBreaker::AdminDecidingVote);
+        client.resolve_tie(&1u32);
+
+        let hash = client.certify_results();
+        let (stored, at) = client.certified_results().unwrap();
+        assert_eq!(stored, hash);
+        assert_eq!(at, 101);
+
+        // Certification is one-shot.
+        assert_eq!(
+            client.try_certify_results(),
+            Err(Ok(BallotError::AlreadyCertified))
+        );
+    }
+
+    #[test]
+    fn resolve_tie_rejects_non_tied_choice() {
+        let env = Env::default();
+        let (_admin, client) = setup_closed_ballot(&env, 2, &[0, 1]);
+
+        client.set_tie_breaker(&TieBreaker::AdminDecidingVote);
+        // Two choices are tied; index 5 is neither of them.
+        let result = client.try_resolve_tie(&5u32);
+        assert_eq!(result, Err(Ok(BallotError::InvalidTieResolution)));
+    }
+
+    #[test]
+    fn certify_results_snapshots_unique_winner() {
+        let env = Env::default();
+        // 2 votes for "yes" (1), 1 vote for "no" (0).
+        let (_admin, client) = setup_closed_ballot(&env, 2, &[1, 1, 0]);
+
+        match client.get_winner() {
+            BallotWinner::Choice(1) => {}
+            other => panic!("expected choice 1 to win, got {:?}", other),
+        }
+
+        let hash = client.certify_results();
+        let (stored, at) = client.certified_results().unwrap();
+        assert_eq!(stored, hash);
+        assert_eq!(at, 101);
+    }
+
+    #[test]
+    fn certify_results_requires_voting_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(BallotContract, ());
+        let client = BallotContractClient::new(&env, &contract_id);
+        let mut choices: Vec<String> = Vec::new(&env);
+        choices.push_back(String::from_str(&env, "no"));
+        choices.push_back(String::from_str(&env, "yes"));
+        client.initialize(&admin, &1u32, &100u32, &choices, &0u32);
+
+        let result = client.try_certify_results();
+        assert_eq!(result, Err(Ok(BallotError::VotingNotClosed)));
     }
 
     #[test]
