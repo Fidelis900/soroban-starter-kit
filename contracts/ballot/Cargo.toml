@@ -10,7 +10,7 @@ soroban-common = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.4"
-proptest-state-machine = "0.1"
+proptest-state-machine = "0.3"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
