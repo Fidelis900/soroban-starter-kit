@@ -192,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "proptest-state-machine",
+ "soroban-common",
  "soroban-sdk",
 ]
 
@@ -1245,9 +1246,9 @@ dependencies = [
 
 [[package]]
 name = "proptest-state-machine"
-version = "0.1.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b52a714915de2d16a5289616d2265a934780f50a9dd30359322b687403fa2ac2"
+checksum = "76fe42bc434fdb72020f41a6e9dbc6d29fdcc3ac43fb3470dba5147039cf5220"
 dependencies = [
  "proptest",
 ]
