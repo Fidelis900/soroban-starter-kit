@@ -54,6 +54,13 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
   - Storage costs
   - Optimization strategies
 
+## Fuzzing & Benchmark Specs
+
+- **[Fuzz: lottery_draw](fuzzing/lottery-draw.md)** — Commit-reveal fairness, winner uniqueness, pot conservation (#1364)
+- **[Fuzz: vesting_state_machine](fuzzing/vesting-state-machine.md)** — Create/claim/revoke interleavings, grant conservation (#1365)
+- **[Fuzz: nft_state_machine](fuzzing/nft-state-machine.md)** — Approvals, `transfer_from`, royalty bounds (#1366)
+- **[Bench: lottery_ops](benchmarks/lottery-ops.md)** — Ticket purchase scaling (10–500) and multi-winner draw costs (#1367)
+
 ## Architecture Decision Records (ADRs)
 
 The [adr/](adr/) directory contains detailed decision records for key design choices:
