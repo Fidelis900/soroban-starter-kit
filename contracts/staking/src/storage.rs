@@ -61,7 +61,26 @@ pub enum DataKey {
     UndistributedRewardsFor(Address),
     /// Penalty applied to emergency unstakes, in basis points (1 bps = 0.01%).
     EmergencyPenaltyBps,
+    /// Total boosted weight (reward-share denominator).
+    TotalWeight,
+    /// Per-staker: boosted weight (`stake * boost`).
+    Weight(Address),
+    /// Per-staker: boost multiplier in basis points.
+    Boost(Address),
+    /// Per-staker: ledger until which the stake is locked.
+    LockedUntil(Address),
+    /// Cumulative rewards emitted to stakers.
+    TotalEmitted,
+    /// Cumulative rewards claimed by stakers.
+    TotalClaimed,
 }
+
+/// Boost denominator: 10_000 basis points = 1x.
+pub const BOOST_DENOMINATOR: i128 = 10_000;
+
+/// Lockup tiers as `(min_lockup_ledgers, boost_bps)` at ~5s ledgers:
+/// 90 days → 1.5x, 365 days → 2x.
+pub const LOCKUP_TIERS: [(u32, i128); 2] = [(1_555_200, 15_000), (6_307_200, 20_000)];
 
 /// Scaling factor for reward-per-token fixed-point arithmetic.
 /// Using 1e12 gives enough precision for typical token amounts.

@@ -3,7 +3,7 @@
 //! This module provides a reusable two-step ownership transfer mechanism
 //! that can be shared across contracts to standardize admin transfer logic.
 
-use soroban_sdk::{contracterror, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contracterror, contracttype, panic_with_error, Address, Env, Symbol};
 
 /// Storage keys used by the Ownable2Step helper.
 #[allow(missing_docs)]

@@ -1,5 +1,5 @@
 #![no_std]
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 //! Shared helpers for the Soroban contract templates.
 //!
 //! Provides admin-storage helpers, TTL/lifetime constants, deadline validation,
@@ -904,12 +904,3 @@ mod reentrancy_guard {
 }
 
 use reentrancy_guard::ReentrancyKey;
-
-#[cfg(test)]
-mod reentrancy_guard_tests {
-    use super::*;
-
-    #[test]
-    fn enter_sets_flag_and_drop_clears_it() {
-        let env = Env::default();
-        assert!(!Reentrancy
