@@ -33,6 +33,8 @@ pub enum AirdropError {
     EmptyBatch = 15,
     /// Claims are temporarily paused by the admin.
     Paused = 16,
+    /// Decay parameters are out of range.
+    InvalidDecayConfig = 17,
 }
 
 #[cfg(test)]

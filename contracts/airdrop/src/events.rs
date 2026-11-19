@@ -11,6 +11,20 @@ pub fn paused(env: &Env, paused: bool) {
     env.events().publish((symbol_short!("paused"),), paused);
 }
 
+pub fn decay_config_set(env: &Env, treasury: &Address, config: &crate::DecayConfig) {
+    env.events().publish(
+        (Symbol::new(env, "decay_config_set"),),
+        (treasury.clone(), config.clone()),
+    );
+}
+
+pub fn decay_remainder(env: &Env, treasury: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "decay_remainder"),),
+        (treasury.clone(), token.clone(), amount),
+    );
+}
+
 pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128) {
     env.events().publish(
         (symbol_short!("claimed"),),

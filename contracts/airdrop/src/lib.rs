@@ -37,7 +37,7 @@ mod events;
 mod storage;
 
 pub use errors::AirdropError;
-pub use storage::{DataKey, VestingConfig, VestingSchedule};
+pub use storage::{DataKey, DecayConfig, VestingConfig, VestingSchedule};
 
 use soroban_common::{
     BPS_DENOMINATOR, LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee,
@@ -148,8 +148,40 @@ fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
     root_bytes.try_into().map_err(|_| AirdropError::RootNotSet)
 }
 
+/// Claimable share (in basis points) for a claim at ledger `now`.
+fn decay_bps(cfg: &DecayConfig, now: u32) -> u32 {
+    if now <= cfg.start_ledger + cfg.full_window_ledgers {
+        return BPS_DENOMINATOR as u32;
+    }
+    let elapsed = now - cfg.start_ledger - cfg.full_window_ledgers;
+    let steps = elapsed / cfg.decay_step_ledgers;
+    let reduction = steps
+        .saturating_mul(cfg.decay_bps_per_step)
+        .min(BPS_DENOMINATOR as u32 - cfg.floor_bps);
+    (BPS_DENOMINATOR as u32 - cfg.floor_bps - reduction).max(cfg.floor_bps)
+}
+
+/// Apply the configured time decay to `amount`, returning the claimant's share
+/// and the remainder that belongs to the campaign treasury.
+fn decayed_amount(env: &Env, amount: i128) -> Result<(i128, i128), AirdropError> {
+    let cfg: Option<DecayConfig> = env.storage().instance().get(&DataKey::DecayConfig);
+    let Some(cfg) = cfg else {
+        return Ok((amount, 0));
+    };
+    let bps = i128::from(decay_bps(&cfg, env.ledger().sequence()));
+    let claimable = amount
+        .checked_mul(bps)
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .ok_or(AirdropError::ArithmeticOverflow)?;
+    let remainder = amount
+        .checked_sub(claimable)
+        .ok_or(AirdropError::ArithmeticOverflow)?;
+    Ok((claimable, remainder))
+}
+
 /// Mark `(recipient, token)` claimed and pay out `amount`: the liquid portion
-/// is transferred now and the rest is locked in a vesting schedule.
+/// is transferred now and the rest is locked in a vesting schedule. When a
+/// decay schedule is configured, the decayed remainder is sent to the treasury.
 ///
 /// Callers must have already validated the proof, the claimed flag, and the
 /// available balance.
@@ -159,6 +191,8 @@ fn settle_claim(
     token: &Address,
     amount: i128,
 ) -> Result<(), AirdropError> {
+    let (claimable, remainder) = decayed_amount(env, amount)?;
+
     // Checks-effects-interactions: mark claimed before transfer.
     let claimed_key = DataKey::Claimed(recipient.clone(), token.clone());
     env.storage().persistent().set(&claimed_key, &true);
@@ -166,11 +200,11 @@ fn settle_claim(
 
     let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
     let liquid = match &vesting {
-        Some(cfg) => apply_bps_fee(amount, cfg.initial_unlock_bps)
+        Some(cfg) => apply_bps_fee(claimable, cfg.initial_unlock_bps)
             .ok_or(AirdropError::ArithmeticOverflow)?,
-        None => amount,
+        None => claimable,
     };
-    let locked = amount
+    let locked = claimable
         .checked_sub(liquid)
         .ok_or(AirdropError::ArithmeticOverflow)?;
 
@@ -199,7 +233,21 @@ fn settle_claim(
         token::Client::new(env, token).transfer(&env.current_contract_address(), recipient, &liquid);
     }
 
-    events::claimed(env, recipient, token, amount);
+    if remainder > 0 {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(AirdropError::NotInitialized)?;
+        token::Client::new(env, token).transfer(
+            &env.current_contract_address(),
+            &treasury,
+            &remainder,
+        );
+        events::decay_remainder(env, &treasury, token, remainder);
+    }
+
+    events::claimed(env, recipient, token, claimable);
     Ok(())
 }
 
@@ -365,6 +413,39 @@ mod contract {
                 .instance()
                 .get::<_, bool>(&DataKey::Paused)
                 .unwrap_or(false)
+        }
+
+        /// Configure time-decaying claim windows and the treasury that receives
+        /// the unclaimed decay remainder. Only the admin may call this.
+        pub fn set_decay_config(
+            env: Env,
+            treasury: Address,
+            config: DecayConfig,
+        ) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+
+            if config.decay_step_ledgers == 0
+                || config.floor_bps > BPS_DENOMINATOR as u32
+                || config.decay_bps_per_step > BPS_DENOMINATOR as u32
+            {
+                return Err(AirdropError::InvalidDecayConfig);
+            }
+
+            env.storage().instance().set(&DataKey::Treasury, &treasury);
+            env.storage().instance().set(&DataKey::DecayConfig, &config);
+            bump_instance(&env);
+            events::decay_config_set(&env, &treasury, &config);
+            Ok(())
+        }
+
+        /// Returns the configured decay schedule, if any.
+        pub fn get_decay_config(env: Env) -> Option<DecayConfig> {
+            env.storage().instance().get(&DataKey::DecayConfig)
         }
 
         /// Claim `amount` of `token` by supplying a valid merkle proof.
