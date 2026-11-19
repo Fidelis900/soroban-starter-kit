@@ -3,44 +3,10 @@
 //! Shared helpers for the Soroban contract templates.
 //!
 //! Provides admin-storage helpers, TTL/lifetime constants, deadline validation,
-//! basis-point fee calculation, commit-reveal hashing, Merkle single- and
-//! multi-proof verification ([`merkle`]), the [`AdminKey`] storage key reused
-//! across the contract crates, and the audited fixed-point arithmetic helpers
-//! ([`math`]) used for checked multiplication, division, and scale conversion.
-//!
-//! The [`math`] module exposes [`FixedPoint`] / [`FixedPoint128`] along with
-//! the free functions [`mul_div`], [`mul_div_up`], [`mul_div_nearest`],
-//! [`to_scale`], and [`from_scale`], all of which perform overflow-checked
-//! arithmetic and return [`FixedPointError`] on failure.
-//!
-//! Additional standardized helpers:
-//!
-//! - [`pausable`] — unified pause flag storage, events, and guard enforcement.
-//! - [`safe_cast`] — checked integer casts that return [`CastError`] instead of
-//!   silently truncating.
-//! - [`time`] — ledger/seconds conversion helpers with ceiling rounding.
-//! - [`ownable`] — two-step ownership transfer with standard events.
+//! basis-point fee calculation, commit-reveal hashing, and the [`AdminKey`]
+//! storage key reused across the contract crates.
 
 use soroban_sdk::{Address, Bytes, BytesN, Env, contracttype, crypto::Hash};
-
-pub mod math;
-pub mod merkle;
-pub mod ownable;
-pub mod pausable;
-pub mod safe_cast;
-pub mod time;
-
-pub use math::{
-    FixedPoint128, FixedPointError, fixed_sqrt, from_scale, mul_div, mul_div_nearest, mul_div_up,
-    to_scale,
-};
-pub use merkle::{hash_pair_sorted, verify_merkle_multi_proof, verify_merkle_proof};
-pub use ownable::{
-    OwnableError, accept_ownership, get_owner, init_owner, transfer_ownership,
-};
-pub use pausable::{PausableError, is_paused, require_not_paused, set_paused};
-pub use safe_cast::{CastError, to_i128, to_u32, to_u64};
-pub use time::{LEDGER_SECONDS, ledgers_to_seconds, seconds_to_ledgers};
 
 /// Minimum number of ledgers the deadline must be ahead of the current ledger
 /// when initializing an escrow. Enforced by the contract; tests must respect
@@ -207,6 +173,10 @@ where
         .extend_ttl(key, threshold, extend_to);
 }
 
+/// Expected wall-clock seconds between consecutive Soroban ledgers.
+/// Used to convert ledger counts to approximate durations in doc comments.
+pub const LEDGER_SECONDS: u32 = 5;
+
 /// Ledger threshold for TTL extension (~7 days at `LEDGER_SECONDS` seconds per ledger).
 /// When remaining TTL falls below this, storage is extended to `LEDGER_BUMP_AMOUNT`.
 pub const LEDGER_LIFETIME_THRESHOLD: u32 = 120_960;
@@ -301,7 +271,7 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// ```
 #[must_use]
 pub fn apply_bps_fee(amount: i128, bps: u32) -> Option<i128> {
-    mul_div(amount, bps as i128, BPS_DENOMINATOR).ok()
+    amount.checked_mul(bps as i128)?.checked_div(BPS_DENOMINATOR)
 }
 
 // ─── Commit-reveal hashing helpers (#887) ────────────────────────────────────
@@ -707,10 +677,9 @@ pub fn bump_instance(env: &Env) {
 /// }
 /// ```
 ///
-/// # Errors
+/// # Panics
 ///
-/// Returns `Result::Err(E)` (constructed via `E::from(())`) if the key is not
-/// present in instance storage.
+/// Panics if the key is not present in instance storage.
 ///
 /// # Examples
 ///

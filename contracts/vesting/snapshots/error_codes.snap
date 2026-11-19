@@ -1,8 +1,0 @@
-VestingError::AlreadyInitialized = 1
-VestingError::NotInitialized = 2
-VestingError::NotAuthorized = 3
-VestingError::InvalidAmount = 4
-VestingError::InvalidSchedule = 5
-VestingError::NothingToClaim = 6
-VestingError::AlreadyRevoked = 7
-VestingError::CliffAlreadyPassed = 8

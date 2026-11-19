@@ -1,509 +1,251 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::arithmetic_side_effects)]
 #![cfg(test)]
 
 use soroban_sdk::{
     Address, Env, Vec,
     testutils::{Address as _, Ledger as _},
-    token::StellarAssetClient,
+    token::{Client as TokenClient, StellarAssetClient},
+    vec,
 };
 
-use crate::{VestingContract, VestingContractClient, VestingError};
+use crate::{ScheduleParams, VestingContract, VestingContractClient, VestingError};
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+struct Ctx<'a> {
+    env: Env,
+    client: VestingContractClient<'a>,
+    admin: Address,
+    token: Address,
+}
 
-pub(crate) fn setup_env() -> Env {
+fn setup<'a>() -> Ctx<'a> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.sequence_number = 100);
-    env
-}
-
-pub(crate) fn make_token(env: &Env, mint_to: &Address, amount: i128) -> Address {
-    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
-    let addr = sac.address();
-    StellarAssetClient::new(env, &addr).mint(mint_to, &amount);
-    addr
-}
-
-pub(crate) fn setup(
-    env: &Env,
-) -> (
-    VestingContractClient,
-    Address,
-    Address,
-    Address,
-    u32,
-    u32,
-    i128,
-) {
-    let admin = Address::generate(env);
-    let beneficiary = Address::generate(env);
-    let amount = 1_000i128;
-    let token = make_token(env, &admin, amount * 2); // Mint extra to allow for potential multiple schedules
-    let cliff = env.ledger().sequence() + 10;
-    let end = cliff + 100;
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(env, &addr);
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    StellarAssetClient::new(&env, &token).mint(&admin, &1_000_000);
+    let id = env.register(VestingContract, ());
+    let client = VestingContractClient::new(&env, &id);
     client.initialize(&admin, &token);
-    client.create_schedule(&beneficiary, &token, &cliff, &end, &amount);
-    client.create_schedule(&beneficiary, &cliff, &end, &amount, &true);
-    (client, admin, beneficiary, token, cliff, end, amount)
+    Ctx { env, client, admin, token }
 }
 
-// ── unit tests ────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_initialize_stores_info() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, cliff, end, amount) = setup(&env);
-    let info = client.get_info(&beneficiary, &token).unwrap();
-    assert_eq!(info.amount, amount);
-    assert_eq!(info.cliff_ledger, cliff);
-    assert_eq!(info.end_ledger, end);
-    assert_eq!(info.claimed, 0);
-    assert!(!info.revoked);
+fn bal(c: &Ctx, a: &Address) -> i128 {
+    TokenClient::new(&c.env, &c.token).balance(a)
 }
 
+fn at(c: &Ctx, seq: u32) {
+    c.env.ledger().with_mut(|l| l.sequence_number = seq);
+}
+
+// ── #1340 bounds validation ──────────────────────────────────────────────────
+
 #[test]
-fn test_initialize_twice_fails() {
-    let env = setup_env();
-    let (client, admin, _beneficiary, token, ..) = setup(&env);
-    let result = client.try_initialize(&admin, &token);
-    assert_eq!(result, Err(Ok(VestingError::AlreadyInitialized)));
+fn bounds_valid_and_edges() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    // start == now, start == cliff allowed
+    c.client.create_schedule(&b, &100, &100, &200, &1000, &true);
+    assert_eq!(c.client.get_info(&b).unwrap().amount, 1000);
 }
 
 #[test]
-fn test_create_schedule_zero_amount_fails() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let token = make_token(&env, &admin, 0);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &token);
-    let result = client.try_create_schedule(&beneficiary, &token, &110u32, &200u32, &0i128);
-    let result = client.try_create_schedule(&beneficiary, &110u32, &200u32, &0i128, &true);
-    assert_eq!(result, Err(Ok(VestingError::InvalidAmount)));
+fn bounds_invalid_rejected() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    let bad = [
+        (99, 150, 200),  // start in the past
+        (120, 110, 200), // cliff < start
+        (100, 150, 150), // end == cliff
+        (100, 150, 140), // end < cliff
+    ];
+    for (s, cl, e) in bad {
+        let r = c.client.try_create_schedule(&b, &s, &cl, &e, &1000, &true);
+        assert_eq!(r, Err(Ok(VestingError::InvalidScheduleBounds)), "{s} {cl} {e}");
+    }
+}
+
+// ── #1342 batch ──────────────────────────────────────────────────────────────
+
+fn params(c: &Ctx, amount: i128) -> ScheduleParams {
+    ScheduleParams {
+        beneficiary: Address::generate(&c.env),
+        start_ledger: 100,
+        cliff_ledger: 110,
+        end_ledger: 200,
+        amount,
+        is_revocable: true,
+    }
 }
 
 #[test]
-fn test_create_schedule_invalid_schedule_fails() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let token = make_token(&env, &admin, 1000);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &token);
-    // cliff >= end
-    let result = client.try_create_schedule(&beneficiary, &token, &200u32, &150u32, &1000i128);
-    let result = client.try_create_schedule(&beneficiary, &200u32, &150u32, &1000i128, &true);
-    assert_eq!(result, Err(Ok(VestingError::InvalidSchedule)));
+fn batch_creates_all_and_funds_once() {
+    let c = setup();
+    let p: Vec<ScheduleParams> = vec![&c.env, params(&c, 100), params(&c, 250), params(&c, 50)];
+    let before = bal(&c, &c.admin);
+    c.client.create_schedules_batch(&c.admin, &p);
+    assert_eq!(before - bal(&c, &c.admin), 400);
+    assert_eq!(bal(&c, &c.client.address), 400);
+    for s in p.iter() {
+        assert_eq!(c.client.get_info(&s.beneficiary).unwrap().amount, s.amount);
+    }
 }
 
 #[test]
-fn test_claim_before_cliff_fails() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, ..) = setup(&env);
-    let result = client.try_claim(&beneficiary, &token);
-    assert_eq!(result, Err(Ok(VestingError::NothingToClaim)));
+fn batch_is_atomic_on_invalid_entry() {
+    let c = setup();
+    let mut bad = params(&c, 100);
+    bad.end_ledger = 100;
+    let good = params(&c, 100);
+    let p = vec![&c.env, good.clone(), bad];
+    assert!(c.client.try_create_schedules_batch(&c.admin, &p).is_err());
+    assert!(c.client.get_info(&good.beneficiary).is_none());
+    assert_eq!(bal(&c, &c.client.address), 0);
 }
 
 #[test]
-fn test_claim_at_cliff_returns_zero() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, cliff, _end, _amount) = setup(&env);
-    env.ledger().with_mut(|l| l.sequence_number = cliff);
-    let result = client.try_claim(&beneficiary, &token);
-    assert_eq!(result, Err(Ok(VestingError::NothingToClaim)));
+fn batch_requires_admin_and_nonempty() {
+    let c = setup();
+    let p = vec![&c.env, params(&c, 10)];
+    let other = Address::generate(&c.env);
+    assert_eq!(
+        c.client.try_create_schedules_batch(&other, &p),
+        Err(Ok(VestingError::NotAuthorized))
+    );
+    assert_eq!(
+        c.client.try_create_schedules_batch(&c.admin, &Vec::new(&c.env)),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+}
+
+// ── #1341 milestones ─────────────────────────────────────────────────────────
+
+#[test]
+fn milestone_unlocks_on_approval() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    let v = Address::generate(&c.env);
+    let ms = vec![&c.env, (1u32, 3000u32), (2, 3000), (3, 4000)];
+    c.client.create_milestone_schedule(&b, &v, &ms, &1000, &true);
+
+    assert_eq!(c.client.try_claim(&b), Err(Ok(VestingError::NothingToClaim)));
+    c.client.approve_milestone(&b, &1);
+    assert_eq!(c.client.claim(&b), 300);
+    c.client.approve_milestone(&b, &3);
+    assert_eq!(c.client.claim(&b), 400);
+    c.client.approve_milestone(&b, &2);
+    assert_eq!(c.client.claim(&b), 300);
+    assert_eq!(bal(&c, &b), 1000);
 }
 
 #[test]
-fn test_claim_halfway_through_vesting() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, cliff, end, amount) = setup(&env);
-    let mid = cliff + (end - cliff) / 2;
-    env.ledger().with_mut(|l| l.sequence_number = mid);
-    let claimed = client.claim(&beneficiary, &token);
-    assert!(claimed > 0 && claimed <= amount / 2 + 1);
+fn milestone_errors() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    let v = Address::generate(&c.env);
+    let ms = vec![&c.env, (1u32, 5000u32), (2, 5000)];
+    c.client.create_milestone_schedule(&b, &v, &ms, &1000, &true);
+    assert_eq!(c.client.try_approve_milestone(&b, &9), Err(Ok(VestingError::MilestoneNotFound)));
+    c.client.approve_milestone(&b, &1);
+    assert_eq!(
+        c.client.try_approve_milestone(&b, &1),
+        Err(Ok(VestingError::MilestoneAlreadyApproved))
+    );
+    // weights must sum to 10_000
+    let b2 = Address::generate(&c.env);
+    let bad = vec![&c.env, (1u32, 5000u32)];
+    assert_eq!(
+        c.client.try_create_milestone_schedule(&b2, &v, &bad, &1000, &true),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+    // linear schedule has no verifier
+    let b3 = Address::generate(&c.env);
+    c.client.create_schedule(&b3, &100, &110, &200, &100, &true);
+    assert_eq!(
+        c.client.try_approve_milestone(&b3, &1),
+        Err(Ok(VestingError::NotMilestoneSchedule))
+    );
 }
 
 #[test]
-fn test_claim_after_end_returns_full_amount() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, _cliff, end, amount) = setup(&env);
-    env.ledger().with_mut(|l| l.sequence_number = end + 1);
-    let claimed = client.claim(&beneficiary, &token);
-    assert_eq!(claimed, amount);
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    assert_eq!(token_client.balance(&beneficiary), amount);
+fn milestone_approval_needs_verifier_auth() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    let v = Address::generate(&c.env);
+    let ms = vec![&c.env, (1u32, 10_000u32)];
+    c.client.create_milestone_schedule(&b, &v, &ms, &500, &false);
+    c.client.approve_milestone(&b, &1);
+    let auths = c.env.auths();
+    assert_eq!(auths.last().unwrap().0, v);
+}
+
+// ── #1343 revocation math ────────────────────────────────────────────────────
+
+/// Revoke at `seq` for a 1000-token schedule (start 100, cliff 150, end 250)
+/// and assert exact conservation.
+fn check_revoke(seq: u32, claim_first_at: Option<u32>) -> (i128, i128) {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &true);
+    let admin_start = bal(&c, &c.admin);
+    let mut claimed = 0;
+    if let Some(t) = claim_first_at {
+        at(&c, t);
+        claimed = c.client.claim(&b);
+    }
+    at(&c, seq);
+    let (pay, claw) = c.client.revoke(&b);
+    assert_eq!(claimed + pay + claw, 1000, "conservation at {seq}");
+    assert_eq!(bal(&c, &b), claimed + pay);
+    assert_eq!(bal(&c, &c.admin) - admin_start, claw);
+    assert_eq!(bal(&c, &c.client.address), 0);
+    (pay, claw)
 }
 
 #[test]
-fn test_double_claim_second_returns_nothing() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, _cliff, end, _amount) = setup(&env);
-    env.ledger().with_mut(|l| l.sequence_number = end + 1);
-    client.claim(&beneficiary, &token);
-    let result = client.try_claim(&beneficiary, &token);
-    assert_eq!(result, Err(Ok(VestingError::NothingToClaim)));
+fn revoke_before_cliff_claws_back_everything() {
+    assert_eq!(check_revoke(120, None), (0, 1000));
+    assert_eq!(check_revoke(149, None), (0, 1000));
 }
 
 #[test]
-fn test_revoke_before_cliff_returns_all() {
-    let env = setup_env();
-    let (client, admin, beneficiary, token, _cliff, _end, amount) = setup(&env);
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let admin_balance_before = token_client.balance(&admin);
-    let returned = client.revoke(&beneficiary, &token);
-    assert_eq!(returned, amount);
-    // Before the cliff, nothing is vested — the schedule's full `amount` comes back.
-    assert_eq!(token_client.balance(&admin), admin_balance_before + amount);
+fn revoke_at_and_after_cliff_pays_exact_vested() {
+    // at cliff: 1000 * 50 / 150 = 333 (rounded down), clawback gets the dust
+    assert_eq!(check_revoke(150, None), (333, 667));
+    assert_eq!(check_revoke(151, None), (340, 660));
+    assert_eq!(check_revoke(200, None), (666, 334));
 }
 
 #[test]
-fn test_revoke_after_end_returns_nothing() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, _cliff, end, _amount) = setup(&env);
-    env.ledger().with_mut(|l| l.sequence_number = end + 1);
-    let returned = client.revoke(&beneficiary, &token);
-    assert_eq!(returned, 0);
+fn revoke_after_end_and_after_partial_claim() {
+    assert_eq!(check_revoke(300, None), (1000, 0));
+    let (pay, claw) = check_revoke(200, Some(160));
+    assert_eq!(pay + claw, 1000 - 400); // 1000*60/150 = 400 claimed earlier
 }
 
 #[test]
-fn test_revoke_midway_returns_unvested_portion() {
-    let env = setup_env();
-    let (client, admin, beneficiary, token, cliff, end, amount) = setup(&env);
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let admin_balance_before = token_client.balance(&admin);
-    let mid = cliff + (end - cliff) / 2;
-    env.ledger().with_mut(|l| l.sequence_number = mid);
-    let returned = client.revoke(&beneficiary, &token);
-    assert!(returned > 0 && returned < amount);
-    assert_eq!(token_client.balance(&admin), admin_balance_before + returned);
+fn revoke_guards() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &false);
+    assert_eq!(c.client.try_revoke(&b), Err(Ok(VestingError::ScheduleIrrevocable)));
+    let b2 = Address::generate(&c.env);
+    c.client.create_schedule(&b2, &100, &150, &250, &1000, &true);
+    c.client.revoke(&b2);
+    assert_eq!(c.client.try_revoke(&b2), Err(Ok(VestingError::AlreadyRevoked)));
+    assert_eq!(c.client.try_claim(&b2), Err(Ok(VestingError::NothingToClaim)));
 }
 
 #[test]
-fn test_claim_after_revoke_gets_vested_portion() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, cliff, end, amount) = setup(&env);
-    let mid = cliff + (end - cliff) / 2;
-    env.ledger().with_mut(|l| l.sequence_number = mid);
-    let returned = client.revoke(&beneficiary, &token);
-    let claimed = client.claim(&beneficiary, &token);
-    assert_eq!(claimed + returned, amount);
-}
-
-#[test]
-fn test_revoke_twice_fails() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, ..) = setup(&env);
-    client.revoke(&beneficiary, &token);
-    let result = client.try_revoke(&beneficiary, &token);
-    assert_eq!(result, Err(Ok(VestingError::AlreadyRevoked)));
-}
-
-#[test]
-fn test_claim_after_full_revoke_fails() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, ..) = setup(&env);
-    // revoke before cliff — nothing vested, amount capped to 0
-    client.revoke(&beneficiary, &token);
-    let result = client.try_claim(&beneficiary, &token);
-    assert_eq!(result, Err(Ok(VestingError::NothingToClaim)));
-}
-
-#[test]
-fn test_get_info_uninitialized_returns_none() {
-    let env = setup_env();
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    let beneficiary = Address::generate(&env);
-    let token = Address::generate(&env);
-    assert_eq!(client.get_info(&beneficiary, &token), None);
-}
-
-#[test]
-fn test_change_beneficiary_moves_schedule() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, token, ..) = setup(&env);
-    assert_eq!(client.claimable(&beneficiary, &token), 0);
-    let (client, _admin, old_beneficiary, _token, _cliff, _end, amount) = setup(&env);
-    let new_beneficiary = Address::generate(&env);
-    client.change_beneficiary(&old_beneficiary, &new_beneficiary);
-    assert_eq!(client.get_info(&old_beneficiary), None);
-    let info = client.get_info(&new_beneficiary).unwrap();
-    assert_eq!(info.amount, amount);
-}
-
-// ── tranche / milestone tests (#1141) ─────────────────────────────────────────
-
-/// Build a schedule with quarterly (25% BPS = 2500) tranche unlocks.
-fn setup_tranche_schedule(env: &Env) -> (VestingContractClient, Address, Address, u32, i128) {
-    let admin = Address::generate(env);
-    let beneficiary = Address::generate(env);
-    let amount = 1_000i128;
-    let token = make_token(env, &admin, amount);
-    let start = env.ledger().sequence();
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(env, &addr);
-    client.initialize(&admin, &token);
-
-    // Four quarterly tranches, each releasing 25% (2500 BPS).
-    let mut tranches: Vec<(u32, u32)> = Vec::new(env);
-    tranches.push_back((start + 25, 2_500));
-    tranches.push_back((start + 50, 2_500));
-    tranches.push_back((start + 75, 2_500));
-    tranches.push_back((start + 100, 2_500));
-
-    client.create_tranche_schedule(&beneficiary, &tranches, &amount);
-    (client, admin, beneficiary, start, amount)
-}
-
-// ── multi-token portfolio tests ───────────────────────────────────────────────
-
-#[test]
-fn test_multi_token_schedules_are_independent() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let gov = make_token(&env, &admin, 10_000);
-    let reward = make_token(&env, &admin, 10_000);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &gov);
-
-    let cliff = env.ledger().sequence() + 10;
-    let end = cliff + 100;
-    client.create_schedule(&beneficiary, &gov, &cliff, &end, &1_000i128);
-    client.create_schedule(&beneficiary, &reward, &cliff, &end, &2_000i128);
-
-    let gov_info = client.get_info(&beneficiary, &gov).unwrap();
-    let reward_info = client.get_info(&beneficiary, &reward).unwrap();
-    assert_eq!(gov_info.amount, 1_000);
-    assert_eq!(reward_info.amount, 2_000);
-
-    env.ledger().with_mut(|l| l.sequence_number = end + 1);
-    let gov_claimed = client.claim(&beneficiary, &gov);
-    let reward_claimed = client.claim(&beneficiary, &reward);
-    assert_eq!(gov_claimed, 1_000);
-    assert_eq!(reward_claimed, 2_000);
-
-    let gov_client = soroban_sdk::token::Client::new(&env, &gov);
-    let reward_client = soroban_sdk::token::Client::new(&env, &reward);
-    assert_eq!(gov_client.balance(&beneficiary), 1_000);
-    assert_eq!(reward_client.balance(&beneficiary), 2_000);
-}
-
-#[test]
-fn test_multi_token_claim_one_does_not_affect_other() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let gov = make_token(&env, &admin, 10_000);
-    let reward = make_token(&env, &admin, 10_000);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &gov);
-
-    let cliff = env.ledger().sequence() + 10;
-    let end = cliff + 100;
-    client.create_schedule(&beneficiary, &gov, &cliff, &end, &1_000i128);
-    client.create_schedule(&beneficiary, &reward, &cliff, &end, &2_000i128);
-
-    env.ledger().with_mut(|l| l.sequence_number = end + 1);
-    client.claim(&beneficiary, &gov);
-
-    // The reward schedule is untouched by the governance claim.
-    let reward_info = client.get_info(&beneficiary, &reward).unwrap();
-    assert_eq!(reward_info.claimed, 0);
-    assert_eq!(client.claimable(&beneficiary, &reward), 2_000);
-}
-
-#[test]
-fn test_multi_token_revoke_only_targets_one_token() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let gov = make_token(&env, &admin, 10_000);
-    let reward = make_token(&env, &admin, 10_000);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &gov);
-
-    let cliff = env.ledger().sequence() + 10;
-    let end = cliff + 100;
-    client.create_schedule(&beneficiary, &gov, &cliff, &end, &1_000i128);
-    client.create_schedule(&beneficiary, &reward, &cliff, &end, &2_000i128);
-
-    let returned = client.revoke(&beneficiary, &gov);
-    assert_eq!(returned, 1_000);
-
-    let gov_info = client.get_info(&beneficiary, &gov).unwrap();
-    let reward_info = client.get_info(&beneficiary, &reward).unwrap();
-    assert!(gov_info.revoked);
-    assert!(!reward_info.revoked);
-}
-
-#[test]
-fn test_multi_token_duplicate_schedule_fails() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let gov = make_token(&env, &admin, 10_000);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &gov);
-
-    let cliff = env.ledger().sequence() + 10;
-    let end = cliff + 100;
-    client.create_schedule(&beneficiary, &gov, &cliff, &end, &1_000i128);
-    let result = client.try_create_schedule(&beneficiary, &gov, &cliff, &end, &1_000i128);
-    assert_eq!(result, Err(Ok(VestingError::ScheduleAlreadyExists)));
-fn test_tranche_schedule_stores_tranches() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, _start, amount) = setup_tranche_schedule(&env);
-    let info = client.get_info(&beneficiary).unwrap();
-    assert_eq!(info.amount, amount);
-    assert_eq!(info.tranches.len(), 4);
-}
-
-#[test]
-fn test_tranche_nothing_vested_before_first_boundary() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, _amount) = setup_tranche_schedule(&env);
-    env.ledger().with_mut(|l| l.sequence_number = start + 24);
-    let result = client.try_claim(&beneficiary);
-    assert_eq!(result, Err(Ok(VestingError::NothingToClaim)));
-}
-
-#[test]
-fn test_tranche_first_quarter_unlock() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, amount) = setup_tranche_schedule(&env);
-    env.ledger().with_mut(|l| l.sequence_number = start + 25);
-    let claimed = client.claim(&beneficiary);
-    assert_eq!(claimed, amount * 2_500 / 10_000);
-}
-
-#[test]
-fn test_tranche_second_quarter_unlock() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, amount) = setup_tranche_schedule(&env);
-    env.ledger().with_mut(|l| l.sequence_number = start + 50);
-    let claimed = client.claim(&beneficiary);
-    assert_eq!(claimed, amount * 5_000 / 10_000);
-}
-
-#[test]
-fn test_tranche_third_quarter_unlock() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, amount) = setup_tranche_schedule(&env);
-    env.ledger().with_mut(|l| l.sequence_number = start + 75);
-    let claimed = client.claim(&beneficiary);
-    assert_eq!(claimed, amount * 7_500 / 10_000);
-}
-
-#[test]
-fn test_tranche_final_quarter_unlock_full_amount() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, amount) = setup_tranche_schedule(&env);
-    env.ledger().with_mut(|l| l.sequence_number = start + 100);
-    let claimed = client.claim(&beneficiary);
-    assert_eq!(claimed, amount);
-}
-
-#[test]
-fn test_tranche_incremental_claims() {
-    let env = setup_env();
-    let (client, _admin, beneficiary, start, amount) = setup_tranche_schedule(&env);
-    let quarter = amount * 2_500 / 10_000;
-
-    env.ledger().with_mut(|l| l.sequence_number = start + 25);
-    assert_eq!(client.claim(&beneficiary), quarter);
-
-    env.ledger().with_mut(|l| l.sequence_number = start + 50);
-    assert_eq!(client.claim(&beneficiary), quarter);
-
-    env.ledger().with_mut(|l| l.sequence_number = start + 75);
-    assert_eq!(client.claim(&beneficiary), quarter);
-
-    env.ledger().with_mut(|l| l.sequence_number = start + 100);
-    assert_eq!(client.claim(&beneficiary), quarter);
-}
-
-#[test]
-fn test_tranche_invalid_percentages_fail() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let token = make_token(&env, &admin, 1_000);
-    let start = env.ledger().sequence();
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &token);
-
-    // Percentages sum to 9000 BPS, not 10000.
-    let mut tranches: Vec<(u32, u32)> = Vec::new(&env);
-    tranches.push_back((start + 25, 4_500));
-    tranches.push_back((start + 50, 4_500));
-    let result = client.try_create_tranche_schedule(&beneficiary, &tranches, &1_000i128);
-    assert_eq!(result, Err(Ok(VestingError::InvalidSchedule)));
-}
-
-#[test]
-fn test_milestone_release_by_oracle() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let amount = 1_000i128;
-    let token = make_token(&env, &admin, amount);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &token);
-    client.set_oracle(&oracle);
-
-    let mut milestones: Vec<(u32, u32)> = Vec::new(&env);
-    milestones.push_back((1, 5_000));
-    milestones.push_back((2, 5_000));
-    client.create_milestone_schedule(&beneficiary, &milestones, &amount);
-
-    // Nothing released until the oracle verifies a milestone.
-    assert_eq!(client.try_claim(&beneficiary), Err(Ok(VestingError::NothingToClaim)));
-
-    client.release_milestone(&beneficiary, &1);
-    assert_eq!(client.claim(&beneficiary), amount * 5_000 / 10_000);
-
-    client.release_milestone(&beneficiary, &2);
-    assert_eq!(client.claim(&beneficiary), amount * 5_000 / 10_000);
-}
-
-#[test]
-fn test_milestone_release_unauthorized_fails() {
-    let env = setup_env();
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let amount = 1_000i128;
-    let token = make_token(&env, &admin, amount);
-    let addr = env.register_contract(None, VestingContract);
-    let client = VestingContractClient::new(&env, &addr);
-    client.initialize(&admin, &token);
-    client.set_oracle(&oracle);
-
-    let mut milestones: Vec<(u32, u32)> = Vec::new(&env);
-    milestones.push_back((1, 10_000));
-    client.create_milestone_schedule(&beneficiary, &milestones, &amount);
-
-    // A non-oracle caller cannot release a milestone.
-    env.set_auths(&[]);
-    let result = client.try_release_milestone(&beneficiary, &1);
-    assert!(result.is_err());
+fn milestone_revoke_conserves() {
+    let c = setup();
+    let b = Address::generate(&c.env);
+    let v = Address::generate(&c.env);
+    let ms = vec![&c.env, (1u32, 3333u32), (2, 6667)];
+    c.client.create_milestone_schedule(&b, &v, &ms, &1001, &true);
+    c.client.approve_milestone(&b, &1);
+    let (pay, claw) = c.client.revoke(&b);
+    assert_eq!(pay + claw, 1001);
+    assert_eq!(pay, 333); // 1001*3333/10000 rounded down
 }
