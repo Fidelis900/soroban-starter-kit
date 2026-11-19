@@ -3,44 +3,10 @@
 //! Shared helpers for the Soroban contract templates.
 //!
 //! Provides admin-storage helpers, TTL/lifetime constants, deadline validation,
-//! basis-point fee calculation, commit-reveal hashing, Merkle single- and
-//! multi-proof verification ([`merkle`]), the [`AdminKey`] storage key reused
-//! across the contract crates, and the audited fixed-point arithmetic helpers
-//! ([`math`]) used for checked multiplication, division, and scale conversion.
-//!
-//! The [`math`] module exposes [`FixedPoint`] / [`FixedPoint128`] along with
-//! the free functions [`mul_div`], [`mul_div_up`], [`mul_div_nearest`],
-//! [`to_scale`], and [`from_scale`], all of which perform overflow-checked
-//! arithmetic and return [`FixedPointError`] on failure.
-//!
-//! Additional standardized helpers:
-//!
-//! - [`pausable`] — unified pause flag storage, events, and guard enforcement.
-//! - [`safe_cast`] — checked integer casts that return [`CastError`] instead of
-//!   silently truncating.
-//! - [`time`] — ledger/seconds conversion helpers with ceiling rounding.
-//! - [`ownable`] — two-step ownership transfer with standard events.
+//! basis-point fee calculation, commit-reveal hashing, and the [`AdminKey`]
+//! storage key reused across the contract crates.
 
 use soroban_sdk::{Address, Bytes, BytesN, Env, contracttype, crypto::Hash};
-
-pub mod math;
-pub mod merkle;
-pub mod ownable;
-pub mod pausable;
-pub mod safe_cast;
-pub mod time;
-
-pub use math::{
-    FixedPoint128, FixedPointError, fixed_sqrt, from_scale, mul_div, mul_div_nearest, mul_div_up,
-    to_scale,
-};
-pub use merkle::{hash_pair_sorted, verify_merkle_multi_proof, verify_merkle_proof};
-pub use ownable::{
-    OwnableError, accept_ownership, get_owner, init_owner, transfer_ownership,
-};
-pub use pausable::{PausableError, is_paused, require_not_paused, set_paused};
-pub use safe_cast::{CastError, to_i128, to_u32, to_u64};
-pub use time::{LEDGER_SECONDS, ledgers_to_seconds, seconds_to_ledgers};
 
 /// Minimum number of ledgers the deadline must be ahead of the current ledger
 /// when initializing an escrow. Enforced by the contract; tests must respect
@@ -207,6 +173,10 @@ where
         .extend_ttl(key, threshold, extend_to);
 }
 
+/// Expected wall-clock seconds between consecutive Soroban ledgers.
+/// Used to convert ledger counts to approximate durations in doc comments.
+pub const LEDGER_SECONDS: u32 = 5;
+
 /// Ledger threshold for TTL extension (~7 days at `LEDGER_SECONDS` seconds per ledger).
 /// When remaining TTL falls below this, storage is extended to `LEDGER_BUMP_AMOUNT`.
 pub const LEDGER_LIFETIME_THRESHOLD: u32 = 120_960;
@@ -301,7 +271,7 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 /// ```
 #[must_use]
 pub fn apply_bps_fee(amount: i128, bps: u32) -> Option<i128> {
-    mul_div(amount, bps as i128, BPS_DENOMINATOR).ok()
+    amount.checked_mul(bps as i128)?.checked_div(BPS_DENOMINATOR)
 }
 
 // ─── Commit-reveal hashing helpers (#887) ────────────────────────────────────
@@ -707,10 +677,9 @@ pub fn bump_instance(env: &Env) {
 /// }
 /// ```
 ///
-/// # Errors
+/// # Panics
 ///
-/// Returns `Result::Err(E)` (constructed via `E::from(())`) if the key is not
-/// present in instance storage.
+/// Panics if the key is not present in instance storage.
 ///
 /// # Examples
 ///
@@ -772,144 +741,3 @@ mod common_key {
         Token,
     }
 }
-
-// ─── Reentrancy guard (#1206) ───────────────────────────────────────────────
-
-/// Reentrancy guard backed by an instance-storage boolean flag.
-///
-/// Construct one with [`ReentrancyGuard::enter`] at the top of any entry point
-/// that performs a cross-contract call (`token::Client`, `NftClient`, arbiter
-/// calls, …).  The flag is set on entry and cleared automatically when the
-/// guard is dropped, so a re-entrant invocation of the same entry point panics
-/// instead of corrupting state.
-///
-/// # Examples
-///
-/// ```ignore
-/// use soroban_common::ReentrancyGuard;
-/// use soroban_sdk::Env;
-///
-/// pub fn transfer(env: Env) {
-///     let _guard = ReentrancyGuard::enter(&env);
-///     // ... cross-contract call ...
-/// } // flag cleared here
-/// ```
-pub struct ReentrancyGuard<'a> {
-    env: &'a Env,
-}
-
-impl<'a> ReentrancyGuard<'a> {
-    /// Acquires the guard, panicking if it is already held.
-    ///
-    /// Reads the lock flag from instance storage.  If it is already `true` a
-    /// re-entrant call is in progress and the function panics with
-    /// `"reentrancy detected"`.  Otherwise the flag is set to `true` and a
-    /// guard is returned; dropping the guard clears the flag.
-    ///
-    /// # Panics
-    ///
-    /// Panics with `"reentrancy detected"` when the lock flag is already set.
-    #[must_use]
-    #[allow(clippy::panic)] // intentional panic: reentrancy intercepted
-    pub fn enter(env: &'a Env) -> Self {
-        if Self::is_locked(env) {
-            panic!("reentrancy detected");
-        }
-        env.storage().instance().set(&ReentrancyKey::Locked, &true);
-        Self { env }
-    }
-
-    /// Fallible variant of [`ReentrancyGuard::enter`].
-    ///
-    /// Returns `Ok(guard)` when the lock was free, or `Err(())` when a
-    /// re-entrant call was detected.  Callers can map the error into their own
-    /// `#[contracterror]` type.
-    pub fn try_enter(env: &'a Env) -> Result<Self, ()> {
-        if Self::is_locked(env) {
-            return Err(());
-        }
-        env.storage().instance().set(&ReentrancyKey::Locked, &true);
-        Ok(Self { env })
-    }
-
-    /// Returns `true` when the lock flag is currently set.
-    #[must_use]
-    pub fn is_locked(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&ReentrancyKey::Locked)
-            .unwrap_or(false)
-    }
-
-    /// Explicitly releases the guard, clearing the lock flag.
-    ///
-    /// Calling this is optional — [`Drop`] performs the same work — but it
-    /// allows the flag to be cleared before the end of the enclosing scope.
-    pub fn exit(self) {
-        // `self` is consumed; `Drop` runs here and clears the flag.
-    }
-
-    /// Alias for [`ReentrancyGuard::exit`].
-    pub fn release(self) {
-        self.exit();
-    }
-}
-
-impl Drop for ReentrancyGuard<'_> {
-    fn drop(&mut self) {
-        self.env
-            .storage()
-            .instance()
-            .set(&ReentrancyKey::Locked, &false);
-    }
-}
-
-/// Runs `f` while holding a [`ReentrancyGuard`], clearing the flag afterwards.
-///
-/// Convenience wrapper around [`ReentrancyGuard::enter`] for callers that do
-/// not need to hold the guard across statements.
-///
-/// # Panics
-///
-/// Panics with `"reentrancy detected"` if the guard is already held.
-///
-/// # Examples
-///
-/// ```ignore
-/// use soroban_common::with_guard;
-/// use soroban_sdk::Env;
-///
-/// let env = Env::default();
-/// let result = with_guard(&env, || 42u32);
-/// assert_eq!(result, 42);
-/// ```
-pub fn with_guard<R>(env: &Env, f: impl FnOnce() -> R) -> R {
-    let _guard = ReentrancyGuard::enter(env);
-    f()
-}
-
-// `#[contracttype]` generates an undocumented public associated item; confine
-// the missing_docs allowance to this module and re-export the guard above.
-mod reentrancy_guard {
-    #![allow(missing_docs)]
-    use super::contracttype;
-
-    /// Instance-storage key for the reentrancy lock flag.
-    #[contracttype]
-    #[derive(Clone)]
-    pub enum ReentrancyKey {
-        /// Boolean slot holding the lock state.
-        Locked,
-    }
-}
-
-use reentrancy_guard::ReentrancyKey;
-
-#[cfg(test)]
-mod reentrancy_guard_tests {
-    use super::*;
-
-    #[test]
-    fn enter_sets_flag_and_drop_clears_it() {
-        let env = Env::default();
-        assert!(!Reentrancy
