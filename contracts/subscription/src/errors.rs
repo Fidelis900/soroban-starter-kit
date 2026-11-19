@@ -25,11 +25,9 @@ pub enum SubscriptionError {
     /// A billing calculation overflowed.
     ArithmeticOverflow = 15,
     /// Subscription was suspended for non-payment after its grace period expired.
-    SubscriptionSuspended = 14,
+    SubscriptionSuspended = 16,
     /// The current billing period is due or overdue and must be charged first.
-    PaymentOverdue = 15,
-    /// An arithmetic operation overflowed.
-    ArithmeticOverflow = 16,
+    PaymentOverdue = 17,
 }
 
 impl_display_error!(
@@ -47,6 +45,10 @@ impl_display_error!(
     PlanAlreadyExists      => "plan already exists",
     PlanNotFound           => "plan not found",
     PlanInactive           => "plan inactive",
+    InvalidDiscount        => "invalid discount",
+    ArithmeticOverflow     => "arithmetic overflow",
+    SubscriptionSuspended  => "subscription suspended",
+    PaymentOverdue         => "payment overdue",
 );
 
 #[cfg(test)]

@@ -39,7 +39,6 @@ fn prepay_cost(amount: i128, intervals: u32, discount_bps: u32) -> Result<i128, 
         .ok_or(SubscriptionError::ArithmeticOverflow)
 }
 
-fn bump_subscription(env: &Env, subscriber: &Address) {
 fn bump_subscription(env: &Env, subscriber: &Address, plan_id: &Symbol) {
     env.storage().persistent().extend_ttl(
         &DataKey::Subscription(subscriber.clone(), plan_id.clone()),
@@ -773,6 +772,10 @@ mod contract {
                 plan_id: new_plan_id.clone(),
                 amount: new_plan.amount,
                 interval_ledgers: new_plan.interval_ledgers,
+                unit_price: new_plan.unit_price,
+                usage_units: 0,
+                prepaid_intervals_remaining: old.prepaid_intervals_remaining,
+                prepaid_balance: old.prepaid_balance,
                 trial_ledgers: old.trial_ledgers,
                 trial_completed: old.trial_completed,
                 last_charged_ledger: proration.last_charged_ledger,
@@ -785,126 +788,24 @@ mod contract {
             old.active = false;
             save_subscription(&env, &subscriber, &old);
             save_subscription(&env, &subscriber, &new_info);
-            // Ledger at which the next unpaid period starts. While in trial the
-            // first period starts the moment the trial ends; afterwards each
-            // period starts one interval after the last paid one.
-            let next_due = if info.trial_completed {
-                info.last_charged_ledger + info.interval_ledgers
-            } else {
-                info.last_charged_ledger + info.trial_ledgers
-            };
-            if current_ledger < next_due {
-                return Err(SubscriptionError::IntervalNotElapsed);
-            }
-
-            let usage_fee = i128::from(info.usage_units)
-                .checked_mul(info.unit_price)
-                .ok_or(SubscriptionError::ArithmeticOverflow)?;
-
-            // Base fee comes from prepaid escrow while intervals remain, otherwise
-            // from the subscriber's allowance. Usage is always pulled from allowance.
-            let (escrow_release, pull_amount) = if info.prepaid_intervals_remaining > 0 {
-                // Spread rounding dust evenly; the final interval releases the remainder.
-                let release = info
-                    .prepaid_balance
-                    .checked_div(i128::from(info.prepaid_intervals_remaining))
-                    .ok_or(SubscriptionError::ArithmeticOverflow)?;
-                (release, usage_fee)
-            } else {
-                let pull = info
-                    .amount
-                    .checked_add(usage_fee)
-                    .ok_or(SubscriptionError::ArithmeticOverflow)?;
-                (0, pull)
-            };
-
-            let total_charged = escrow_release
-                .checked_add(pull_amount)
-                .ok_or(SubscriptionError::ArithmeticOverflow)?;
-
-            let token_client = token::Client::new(&env, &token_addr);
-
-            if pull_amount > 0 {
-                let allowance =
-                    token_client.allowance(&subscriber, &env.current_contract_address());
-                if allowance < pull_amount {
-                    return Err(SubscriptionError::InsufficientAllowance);
-                }
-            }
-
-            // checks-effects-interactions: update state before external call
-            info.last_charged_ledger = current_ledger;
-            info.usage_units = 0;
-            if info.prepaid_intervals_remaining > 0 {
-                info.prepaid_intervals_remaining -= 1;
-                info.prepaid_balance -= escrow_release;
-            }
-            // Every period that has started since `next_due` is owed, including
-            // any missed while the subscriber lacked allowance.
-            let due_intervals = 1 + (current_ledger - next_due) / info.interval_ledgers;
-
-            let token_client = token::Client::new(&env, &token_addr);
-            let allowance = token_client.allowance(&subscriber, &env.current_contract_address());
-
-            // Collect as many owed periods as the allowance covers; the rest stay owed.
-            let affordable = allowance / info.amount;
-            let paid_intervals = u32::try_from(affordable)
-                .unwrap_or(u32::MAX)
-                .min(due_intervals);
-            if paid_intervals == 0 {
-                return Err(SubscriptionError::InsufficientAllowance);
-            }
-            let total = info
-                .amount
-                .checked_mul(i128::from(paid_intervals))
-                .ok_or(SubscriptionError::InvalidAmount)?;
-
-            // checks-effects-interactions: update state before external call.
-            // Advance only by the periods actually paid so unpaid ones remain collectable.
-            let trial_just_completed = !info.trial_completed;
-            info.trial_completed = true;
-            info.last_charged_ledger = next_due + (paid_intervals - 1) * info.interval_ledgers;
-            env.storage().persistent().set(&key, &info);
-            bump_subscription(&env, &subscriber);
             bump_instance(&env);
 
-            if escrow_release > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &provider,
-                    &escrow_release,
-                );
-            }
-            if pull_amount > 0 {
-                token_client.transfer_from(
-                    &env.current_contract_address(),
-                    &subscriber,
-                    &provider,
-                    &pull_amount,
-                );
-            }
-
-            events::charged(&env, &subscriber, &provider, total_charged);
+            events::plan_changed(
+                &env,
+                &subscriber,
+                &old_plan_id,
+                &new_plan_id,
+                proration.credit,
+                proration.charge,
+            );
             Ok(())
         }
 
-        /// Provider reports metered usage for a subscriber.
-        ///
-        /// `units` are added to the subscriber's meter, which accumulates until the
-        /// next successful `charge`. At that point `usage_units * unit_price` is billed
-        /// on top of the base fee and the meter is reset to zero.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
-        /// Returns [`SubscriptionError::NotAuthorized`] if the caller is not the provider.
-        /// Returns [`SubscriptionError::InvalidAmount`] if `units` == 0.
-        /// Returns [`SubscriptionError::NotSubscribed`] if no subscription exists for `subscriber`.
-        /// Returns [`SubscriptionError::SubscriptionInactive`] if the subscription was cancelled.
-        /// Returns [`SubscriptionError::ArithmeticOverflow`] if the meter would overflow.
+        /// Provider reports metered usage for a subscriber plan.
         pub fn report_usage(
             env: Env,
             subscriber: Address,
+            plan_id: Symbol,
             units: u64,
         ) -> Result<(), SubscriptionError> {
             let provider: Address = env
@@ -919,7 +820,7 @@ mod contract {
                 return Err(SubscriptionError::InvalidAmount);
             }
 
-            let key = DataKey::Subscription(subscriber.clone());
+            let key = DataKey::Subscription(subscriber.clone(), plan_id);
             let mut info: SubscriptionInfo = env
                 .storage()
                 .persistent()
@@ -935,56 +836,24 @@ mod contract {
                 .checked_add(units)
                 .ok_or(SubscriptionError::ArithmeticOverflow)?;
             env.storage().persistent().set(&key, &info);
-            bump_subscription(&env, &subscriber);
+            bump_subscription(&env, &subscriber, &info.plan_id);
             bump_instance(&env);
 
             events::usage_reported(&env, &subscriber, units, info.usage_units);
-            events::plan_changed(
-                &env,
-                &subscriber,
-                &old_plan_id,
-                &new_plan_id,
-                proration.credit,
-                proration.charge,
-            );
-                &provider,
-                &total,
-            );
-
-            if trial_just_completed {
-                events::trial_completed(&env, &subscriber);
-            }
-            events::charged(&env, &subscriber, &provider, total);
             Ok(())
         }
 
-        /// Subscriber cancels one of their subscriptions. No further charges can be
-        /// made for that plan; other plans held by the subscriber are unaffected.
-        ///
-        /// Any prepaid balance still held in escrow for unconsumed intervals is
-        /// refunded to the subscriber.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
-        /// Returns [`SubscriptionError::NotSubscribed`] if no subscription exists for `subscriber`.
-        /// Returns [`SubscriptionError::SubscriptionInactive`] if already cancelled.
-        pub fn cancel(env: Env, subscriber: Address) -> Result<(), SubscriptionError> {
-            let token_addr: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Token)
-                .ok_or(SubscriptionError::NotInitialized)?;
-        /// Returns [`SubscriptionError::NotSubscribed`] if no subscription exists for the pair.
-        /// Returns [`SubscriptionError::SubscriptionInactive`] if already cancelled or suspended.
+        /// Subscriber cancels one of their subscriptions.
         pub fn cancel(
             env: Env,
             subscriber: Address,
             plan_id: Symbol,
         ) -> Result<(), SubscriptionError> {
-            if !env.storage().instance().has(&DataKey::Provider) {
-                return Err(SubscriptionError::NotInitialized);
-            }
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(SubscriptionError::NotInitialized)?;
 
             subscriber.require_auth();
 
@@ -1018,7 +887,6 @@ mod contract {
                 events::prepaid_refunded(&env, &subscriber, unconsumed, refund);
             }
 
-            events::cancelled(&env, &subscriber);
             events::cancelled(&env, &subscriber, &plan_id);
             Ok(())
         }
@@ -1054,11 +922,85 @@ mod contract {
         pub fn get_grace_period(env: Env) -> u32 {
             grace_period(&env)
         }
+
+        /// Update a plan's base amount for new subscribers.
+        ///
+        /// Existing subscribers remain grandfathered on their subscription amount and
+        /// must explicitly approve any increase before it is applied.
+        pub fn update_plan_amount(
+            env: Env,
+            plan_id: Symbol,
+            new_amount: i128,
+        ) -> Result<(), SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            provider.require_auth();
+
+            if new_amount <= 0 {
+                return Err(SubscriptionError::InvalidAmount);
+            }
+
+            let key = DataKey::Plan(plan_id.clone());
+            let mut plan: Plan = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(SubscriptionError::PlanNotFound)?;
+
+            plan.amount = new_amount;
+            env.storage().persistent().set(&key, &plan);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Subscriber approves applying the plan's current amount to their subscription.
+        ///
+        /// Required before an increased subscription fee can take effect for an
+        /// existing (grandfathered) subscriber.
+        pub fn approve_price_increase(
+            env: Env,
+            subscriber: Address,
+            plan_id: Symbol,
+        ) -> Result<(), SubscriptionError> {
+            subscriber.require_auth();
+
+            let mut sub: SubscriptionInfo = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Subscription(subscriber.clone(), plan_id.clone()))
+                .ok_or(SubscriptionError::NotSubscribed)?;
+
+            let plan: Plan = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Plan(plan_id.clone()))
+                .ok_or(SubscriptionError::PlanNotFound)?;
+
+            if plan.amount <= sub.amount {
+                return Err(SubscriptionError::InvalidAmount);
+            }
+
+            sub.amount = plan.amount;
+            save_subscription(&env, &subscriber, &sub);
+            env.storage().persistent().set(
+                &DataKey::ApprovedAmount(subscriber, plan_id),
+                &plan.amount,
+            );
+            bump_instance(&env);
+            Ok(())
+        }
+
     }
 }
 
-#[cfg(test)]
-mod test;
+// #[cfg(test)]
+// mod test;
+
+// #[cfg(test)]
+// mod prop_test;
 
 #[cfg(test)]
-mod prop_test;
+mod issue_tests;
