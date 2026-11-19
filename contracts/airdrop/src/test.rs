@@ -369,3 +369,50 @@ fn test_claim_before_deadline_succeeds() {
     client.claim(&1u32, &alice, &500i128, &proof_a);
     assert_eq!(TokenClient::new(&env, &token).balance(&alice), 500i128);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1348: emergency pause / resume
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_rejects_claims_and_resume_restores_them() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+
+    let proof = Vec::<BytesN<32>>::new(&env);
+    assert!(!client.is_paused());
+
+    client.set_paused(&true);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::Paused))
+    );
+
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+    // With claims resumed the pause error is gone (the root is not set yet).
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::RootNotSet))
+    );
+}
+
+#[test]
+fn pause_state_defaults_to_false() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    assert!(!client.is_paused());
+}

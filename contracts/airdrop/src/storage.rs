@@ -26,6 +26,8 @@ pub enum DataKey {
     Vesting(Address, Address),
     /// Total still-locked vesting balance of a token owed to recipients (persistent).
     TotalLocked(Address),
+    /// Emergency pause flag: when true all claims are rejected (instance).
+    Paused,
 }
 
 /// Vesting parameters applied to every claim.

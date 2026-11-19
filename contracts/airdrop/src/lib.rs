@@ -110,8 +110,22 @@ fn ensure_available(env: &Env, token: &Address, amount: i128) -> Result<(), Aird
     Ok(())
 }
 
-/// Load the root, and reject if the claim window has closed.
+/// Reject claims while the airdrop is emergency-paused.
+fn require_not_paused(env: &Env) -> Result<(), AirdropError> {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&DataKey::Paused)
+        .unwrap_or(false)
+    {
+        return Err(AirdropError::Paused);
+    }
+    Ok(())
+}
+
+/// Load the root, and reject if the claim window has closed or claims are paused.
 fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
+    require_not_paused(env)?;
     if !env.storage().instance().has(&DataKey::Admin) {
         return Err(AirdropError::NotInitialized);
     }
@@ -325,6 +339,32 @@ mod contract {
 
             events::root_set(&env, round_id, &root_bytes);
             Ok(())
+        }
+
+        /// Pause or resume all claims. Only the admin may call this.
+        ///
+        /// Pausing is an emergency brake for a bad Merkle root or leaf list:
+        /// `claim`, `claim_for` and `claim_batch` all fail with
+        /// [`AirdropError::Paused`] until the admin resumes the airdrop.
+        pub fn set_paused(env: Env, paused: bool) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Paused, &paused);
+            bump_instance(&env);
+            events::paused(&env, paused);
+            Ok(())
+        }
+
+        /// Returns `true` while claims are emergency-paused.
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false)
         }
 
         /// Claim `amount` of `token` by supplying a valid merkle proof.

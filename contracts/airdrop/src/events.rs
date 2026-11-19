@@ -7,6 +7,10 @@ pub fn root_set(env: &Env, round_id: u32, root: &Bytes) {
     );
 }
 
+pub fn paused(env: &Env, paused: bool) {
+    env.events().publish((symbol_short!("paused"),), paused);
+}
+
 pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128) {
     env.events().publish(
         (symbol_short!("claimed"),),
