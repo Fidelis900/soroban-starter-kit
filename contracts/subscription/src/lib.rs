@@ -993,6 +993,72 @@ mod contract {
             Ok(())
         }
 
+        /// Returns true only if the subscription is due now and the subscriber has
+        /// sufficient token balance and allowance for the expected charge.
+        pub fn can_charge(env: Env, subscriber: Address, plan_id: Symbol) -> bool {
+            let provider = match env.storage().instance().get::<_, Address>(&DataKey::Provider) {
+                Some(p) => p,
+                None => return false,
+            };
+            let token_addr = match env.storage().instance().get::<_, Address>(&DataKey::Token) {
+                Some(t) => t,
+                None => return false,
+            };
+
+            let info: SubscriptionInfo = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Subscription(subscriber.clone(), plan_id))
+            {
+                Some(i) => i,
+                None => return false,
+            };
+
+            if !info.active || info.suspended {
+                return false;
+            }
+
+            let current = env.ledger().sequence();
+            if !info.trial_completed {
+                if current < info.last_charged_ledger.saturating_add(info.trial_ledgers) {
+                    return false;
+                }
+                // Trial completion path may not transfer tokens, but only if still in trial window we returned false above.
+                // At/after trial end, charge can proceed.
+            } else if current < info.last_charged_ledger.saturating_add(info.interval_ledgers) {
+                return false;
+            }
+
+            // Estimate charge amount similar to charge_one base behavior.
+            let mut amount = info.amount;
+            if info.prepaid_intervals_remaining == 0 {
+                let usage_fee = match i128::from(info.usage_units).checked_mul(info.unit_price) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                amount = match amount.checked_add(usage_fee) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            } else {
+                // Prepaid base covered from escrow; usage fee (if any) pulled from allowance.
+                amount = match i128::from(info.usage_units).checked_mul(info.unit_price) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            }
+
+            if amount <= 0 {
+                // e.g. prepaid interval with no usage: transfer comes from contract escrow, not subscriber.
+                return true;
+            }
+
+            let token_client = token::Client::new(&env, &token_addr);
+            let balance = token_client.balance(&subscriber);
+            let allowance = token_client.allowance(&subscriber, &env.current_contract_address());
+            let _ = provider;
+            balance >= amount && allowance >= amount
+        }
     }
 }
 
