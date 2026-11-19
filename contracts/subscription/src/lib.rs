@@ -7,7 +7,7 @@
 //! hold several plans concurrently; each (subscriber, plan) pair is billed on its
 //! own interval.
 
-use soroban_sdk::{Address, Env, Symbol, Vec, contract, contractimpl, token};
+use soroban_sdk::{Address, Bytes, Env, Symbol, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
@@ -37,6 +37,27 @@ fn prepay_cost(amount: i128, intervals: u32, discount_bps: u32) -> Result<i128, 
         .and_then(|gross| gross.checked_mul(i128::from(keep_bps)))
         .and_then(|scaled| scaled.checked_div(i128::from(BPS_DENOMINATOR)))
         .ok_or(SubscriptionError::ArithmeticOverflow)
+}
+
+/// Apply a pending referral voucher to the next recurring charge.
+///
+/// The active voucher is consumed once: after it has been applied the next
+/// invoice is charged at the plan's full amount again.
+fn discounted_charge(
+    env: &Env,
+    subscriber: &Address,
+    amount: i128,
+) -> Result<(i128, Option<(Bytes, u32)>), SubscriptionError> {
+    let key = DataKey::ActiveVoucher(subscriber.clone());
+    let Some(voucher) = env.storage().persistent().get::<_, (Bytes, u32)>(&key) else {
+        return Ok((amount, None));
+    };
+    let keep_bps = BPS_DENOMINATOR.saturating_sub(voucher.1);
+    let discounted = amount
+        .checked_mul(i128::from(keep_bps))
+        .and_then(|v| v.checked_div(i128::from(BPS_DENOMINATOR)))
+        .ok_or(SubscriptionError::ArithmeticOverflow)?;
+    Ok((discounted, Some(voucher)))
 }
 
 fn bump_subscription(env: &Env, subscriber: &Address) {
@@ -117,11 +138,12 @@ fn charge_one(
     // `try_` isolates a failed transfer (insufficient allowance or balance) so
     // it can be recorded as a delinquency instead of aborting the transaction.
     // Soroban forbids contract re-entrancy, so writing state after the call is safe.
+    let (charge_amount, applied_voucher) = discounted_charge(env, subscriber, info.amount)?;
     let transfer = token_client.try_transfer_from(
         &env.current_contract_address(),
         subscriber,
         provider,
-        &info.amount,
+        &charge_amount,
     );
 
     if matches!(transfer, Ok(Ok(()))) {
@@ -129,8 +151,21 @@ fn charge_one(
         info.failed_charges_count = 0;
         info.delinquent_since_ledger = None;
         save_subscription(env, subscriber, &info);
-        events::charged(env, subscriber, provider, plan_id, info.amount);
-        return Ok((ChargeOutcome::Charged, info.amount));
+        if let Some((code, discount_bps)) = applied_voucher {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveVoucher(subscriber.clone()));
+            events::voucher_applied(
+                env,
+                subscriber,
+                &code,
+                discount_bps,
+                info.amount,
+                charge_amount,
+            );
+        }
+        events::charged(env, subscriber, provider, plan_id, charge_amount);
+        return Ok((ChargeOutcome::Charged, charge_amount));
     }
 
     info.failed_charges_count = info.failed_charges_count.saturating_add(1);
@@ -527,6 +562,48 @@ mod contract {
                 plan.interval_ledgers,
             );
             Ok(())
+        }
+
+        /// Register a referral discount voucher for `subscriber`.
+        ///
+        /// `discount_bps` is expressed in basis points (0..=10_000) and is
+        /// deducted from the subscriber's next recurring invoice only. The
+        /// voucher code is stored on-chain and may be queried later.
+        pub fn apply_voucher(
+            env: Env,
+            subscriber: Address,
+            voucher_code: Bytes,
+            discount_bps: u32,
+        ) -> Result<(), SubscriptionError> {
+            subscriber.require_auth();
+            if discount_bps > BPS_DENOMINATOR {
+                return Err(SubscriptionError::InvalidVoucher);
+            }
+
+            env.storage().persistent().set(
+                &DataKey::Voucher(subscriber.clone(), voucher_code.clone()),
+                &discount_bps,
+            );
+            env.storage().persistent().set(
+                &DataKey::ActiveVoucher(subscriber.clone()),
+                &(voucher_code.clone(), discount_bps),
+            );
+            events::voucher_applied_to_subscriber(&env, &subscriber, &voucher_code, discount_bps);
+            Ok(())
+        }
+
+        /// Returns the discount attached to `voucher_code`, if registered.
+        pub fn get_voucher(env: Env, subscriber: Address, voucher_code: Bytes) -> Option<u32> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Voucher(subscriber, voucher_code))
+        }
+
+        /// Returns the voucher pending on the subscriber's next invoice.
+        pub fn get_active_voucher(env: Env, subscriber: Address) -> Option<(Bytes, u32)> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ActiveVoucher(subscriber))
         }
 
         /// Provider pulls a recurring payment for one of a subscriber's plans.
