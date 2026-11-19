@@ -9,7 +9,7 @@
 
 use soroban_sdk::{
     Address, Env, Symbol,
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     token::StellarAssetClient,
 };
 
@@ -547,4 +547,27 @@ fn revenue_accumulates_in_escrow_and_is_withdrawn_at_threshold() {
     assert_eq!(client.get_provider_revenue(&provider), 0);
     assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&provider), 200);
     assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 0);
+}
+
+#[test]
+fn due_subscriptions_are_queryable_with_advance_notice() {
+    let env = setup_env();
+    let (client, contract_addr, provider, token) = setup(&env);
+    let plan = Symbol::new(&env, "plan");
+    client.register_plan(&plan, &100, &100, &0, &0);
+    client.set_notification_window(&10);
+    let subscriber = Address::generate(&env);
+    approve_and_subscribe(&env, &client, &contract_addr, &token, &subscriber, &plan, 1_000, None);
+
+    env.ledger().with_mut(|l| l.sequence_number = 89);
+    assert_eq!(client.get_due_subscriptions(&10).len(), 0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 95);
+    let events_before = env.events().all().events().len();
+    let due = client.get_due_subscriptions(&10);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due.first().unwrap().0, subscriber);
+    assert_eq!(due.first().unwrap().2, 100);
+    assert!(env.events().all().events().len() > events_before);
+    assert_eq!(client.get_due_subscriptions(&0).len(), 0);
 }

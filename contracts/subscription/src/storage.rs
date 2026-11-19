@@ -27,6 +27,10 @@ pub enum DataKey {
     ProviderRevenue(Address),
     /// Minimum accumulated revenue required before a payout is allowed.
     MinPayoutThreshold(Address),
+    /// Number of ledgers before the due date that subscriptions are reported.
+    NotificationWindow,
+    /// Index of all (subscriber, plan) pairs for keeper queries.
+    SubscriptionIndex,
 }
 
 /// Plan configuration that can be registered by the admin.

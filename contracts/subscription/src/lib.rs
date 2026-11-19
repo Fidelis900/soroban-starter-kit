@@ -514,6 +514,14 @@ mod contract {
             };
 
             save_subscription(&env, &subscriber, &info);
+            let index_key = DataKey::SubscriptionIndex;
+            let mut index: Vec<(Address, Symbol)> = env
+                .storage()
+                .persistent()
+                .get(&index_key)
+                .unwrap_or(Vec::new(&env));
+            index.push_back((subscriber.clone(), info.plan_id.clone()));
+            env.storage().persistent().set(&index_key, &index);
             bump_instance(&env);
 
             if prepaid_balance > 0 {
@@ -1119,6 +1127,68 @@ mod contract {
                 .persistent()
                 .get(&DataKey::ProviderRevenue(provider))
                 .unwrap_or(0)
+        }
+
+        /// Configure how many ledgers ahead of the due date subscriptions are
+        /// reported to off-chain billing bots.
+        pub fn set_notification_window(env: Env, window: u32) -> Result<(), SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            provider.require_auth();
+            env.storage()
+                .instance()
+                .set(&DataKey::NotificationWindow, &window);
+            Ok(())
+        }
+
+        /// Return active subscriptions whose next billing ledger falls inside
+        /// the notification window, emitting `billing_due_soon` for each one.
+        /// `max_results` bounds the work done per keeper call.
+        pub fn get_due_subscriptions(
+            env: Env,
+            max_results: u32,
+        ) -> Vec<(Address, Symbol, u32)> {
+            let current = env.ledger().sequence();
+            let window: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NotificationWindow)
+                .unwrap_or(0);
+            let horizon = current.saturating_add(window);
+            let index: Vec<(Address, Symbol)> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SubscriptionIndex)
+                .unwrap_or(Vec::new(&env));
+            let mut due = Vec::new(&env);
+            for (subscriber, plan_id) in index.iter() {
+                if due.len() >= max_results {
+                    break;
+                }
+                if let Some(info) = env.storage().persistent().get::<_, SubscriptionInfo>(
+                    &DataKey::Subscription(subscriber.clone(), plan_id.clone()),
+                ) {
+                    let next_due = if info.trial_completed {
+                        info.last_charged_ledger.saturating_add(info.interval_ledgers)
+                    } else {
+                        info.last_charged_ledger.saturating_add(info.trial_ledgers)
+                    };
+                    if info.active && !info.suspended && next_due <= horizon {
+                        events::billing_due_soon(
+                            &env,
+                            &subscriber,
+                            &plan_id,
+                            next_due,
+                            current,
+                        );
+                        due.push_back((subscriber, plan_id, next_due));
+                    }
+                }
+            }
+            due
         }
     }
 }
