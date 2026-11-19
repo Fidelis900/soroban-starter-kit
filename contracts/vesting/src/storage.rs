@@ -3,33 +3,55 @@
 
 use soroban_sdk::{Address, Vec, contracttype};
 
-/// Stores all vesting schedule details for a single beneficiary.
+/// A beneficiary's vesting schedule: linear-with-cliff, stepped tranches, or
+/// milestone based.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct BeneficiarySchedule {
-    /// Total tokens to vest for this beneficiary.
+    /// Total tokens allocated (reduced to the vested amount on revocation).
     pub amount: i128,
-    /// Ledger sequence at which vesting begins (cliff).
+    /// Ledger at which linear vesting starts accruing.
+    pub start_ledger: u32,
+    /// Ledger before which nothing is claimable.
     pub cliff_ledger: u32,
-    /// Ledger sequence at which all tokens are fully vested.
+    /// Ledger at which everything is vested.
     pub end_ledger: u32,
-    /// Tokens already claimed by the beneficiary.
+    /// Tokens already paid to the beneficiary.
     pub claimed: i128,
-    /// Whether the schedule has been revoked by admin.
+    /// Whether the schedule has been revoked.
     pub revoked: bool,
     /// Whether the admin may revoke this schedule.
     pub is_revocable: bool,
     /// Optional stepped tranche schedule as `(ledger_sequence, percentage_bps)`
     /// pairs. When non-empty, vesting is discrete instead of linear.
     pub tranches: Vec<(u32, u32)>,
-    /// Address authorized to release the milestone (oracle / multi-sig).
+    /// Milestones as `(milestone_id, weight_bps)`; empty unless this is a
+    /// milestone schedule.
+    pub milestones: Vec<(u32, u32)>,
+    /// Approved milestone ids.
+    pub approved: Vec<u32>,
+    /// Address allowed to approve milestones.
+    pub verifier: Option<Address>,
+    /// Address authorized to release the whole schedule (oracle / multi-sig).
     pub milestone_oracle: Option<Address>,
-    /// Whether the milestone has been released (fully vests the schedule).
+    /// Whether the oracle has released the schedule (fully vests it).
     pub milestone_released: bool,
     /// Whether a revocation is pending its grace period.
     pub revocation_pending: bool,
     /// Ledger at which the revocation was requested (pending) or applied.
     pub revocation_ledger: u32,
+}
+
+/// Parameters for one schedule in a batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduleParams {
+    pub beneficiary: Address,
+    pub start_ledger: u32,
+    pub cliff_ledger: u32,
+    pub end_ledger: u32,
+    pub amount: i128,
+    pub is_revocable: bool,
 }
 
 /// A pending beneficiary key rotation, executable once `eta_ledger` is reached.
@@ -71,6 +93,7 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VestingInfo {
+    pub start_ledger: u32,
     pub cliff_ledger: u32,
     pub end_ledger: u32,
     pub amount: i128,
@@ -79,4 +102,6 @@ pub struct VestingInfo {
     pub is_revocable: bool,
     pub revocation_pending: bool,
     pub tranches: Vec<(u32, u32)>,
+    pub milestones: Vec<(u32, u32)>,
+    pub approved: Vec<u32>,
 }

@@ -7,18 +7,19 @@
 //! 1. `contract_token_balance >= sum(unclaimed_vested + unvested_remaining)`.
 //! 2. No beneficiary can claim more than their initial `amount`.
 //! 3. Revocation never clawbacks already-vested tokens.
-//! 4. Tokens returned to admin on revocation + claimed by beneficiary exactly
-//!    equals the initial allocation.
+//! 4. Tokens clawed back to admin on revocation + paid to the beneficiary
+//!    (claims and revocation payout) exactly equals the initial allocation.
 #![cfg(test)]
 
 use proptest::prelude::*;
 use soroban_sdk::{
+    Address, Env, U256,
     testutils::{Address as _, Ledger as _},
-    token, Address, Env, U256,
+    token,
 };
 use std::vec::Vec;
 
-use crate::{vested_amount, VestingContract, VestingContractClient, VestingError};
+use crate::{VestingContract, VestingContractClient, VestingError, vested_amount};
 
 const BASE_LEDGER: u32 = 100;
 
@@ -44,7 +45,13 @@ struct LinearModel {
 
 impl LinearModel {
     fn new(amount: i128, cliff: u32, end: u32) -> Self {
-        Self { amount, cliff, end, claimed: 0, cap: None }
+        Self {
+            amount,
+            cliff,
+            end,
+            claimed: 0,
+            cap: None,
+        }
     }
 
     /// Vested amount at `now`, honouring a revocation cap.
@@ -69,7 +76,11 @@ impl LinearModel {
 fn setup<'a>(
     env: &'a Env,
     params: &[(i128, u32, u32)],
-) -> (VestingContractClient<'a>, token::Client<'a>, Vec<(Address, LinearModel)>) {
+) -> (
+    VestingContractClient<'a>,
+    token::Client<'a>,
+    Vec<(Address, LinearModel)>,
+) {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.sequence_number = BASE_LEDGER);
 
@@ -88,7 +99,7 @@ fn setup<'a>(
         let beneficiary = Address::generate(env);
         let cliff = BASE_LEDGER + 1 + cliff_offset;
         let end = cliff + duration;
-        client.create_schedule(&beneficiary, &cliff, &end, &amount, &true);
+        client.create_schedule(&beneficiary, &cliff, &cliff, &end, &amount, &true);
         out.push((beneficiary, LinearModel::new(amount, cliff, end)));
     }
     (client, token, out)
@@ -141,10 +152,14 @@ proptest! {
                     if model.cap.is_some() {
                         continue;
                     }
-                    let returned = client.revoke(beneficiary);
-                    // Invariant 3: revocation never claws back vested tokens.
+                    let (paid, returned) = client.revoke(beneficiary);
+                    // Invariant 3: revocation never claws back vested tokens,
+                    // and pays out exactly the vested-but-unclaimed portion.
                     prop_assert_eq!(returned, model.amount - model.vested(now));
+                    prop_assert_eq!(paid, model.claimable(now));
                     model.cap = Some(now);
+                    model.claimed += paid;
+                    total_claimed += paid;
                     total_returned += returned;
                 }
             }
@@ -201,7 +216,7 @@ proptest! {
         let checkpoint = cliff + (u64::from(duration) * u64::from(checkpoint_pct) / 100) as u32;
 
         // Must not panic and must match the exact linear interpolation.
-        let vested = vested_amount(amount, cliff, end, checkpoint).unwrap();
+        let vested = vested_amount(amount, cliff, cliff, end, checkpoint).unwrap();
         let expected = if checkpoint < cliff {
             0
         } else if checkpoint >= end {
@@ -224,13 +239,13 @@ proptest! {
         let end = cliff + duration;
 
         // At the end ledger the full amount must vest exactly.
-        prop_assert_eq!(vested_amount(amount, cliff, end, end).unwrap(), amount);
+        prop_assert_eq!(vested_amount(amount, cliff, cliff, end, end).unwrap(), amount);
         // At the cliff nothing has vested yet.
-        prop_assert_eq!(vested_amount(amount, cliff, end, cliff).unwrap(), 0);
+        prop_assert_eq!(vested_amount(amount, cliff, cliff, end, cliff).unwrap(), 0);
         // Halfway through, the result must be the exact floor of the
         // linear interpolation computed with wide arithmetic.
         let mid = cliff + duration / 2;
         let expected = wide_mul_div(amount, duration / 2, duration);
-        prop_assert_eq!(vested_amount(amount, cliff, end, mid).unwrap(), expected);
+        prop_assert_eq!(vested_amount(amount, cliff, cliff, end, mid).unwrap(), expected);
     }
 }

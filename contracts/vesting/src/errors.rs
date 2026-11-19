@@ -20,13 +20,17 @@ pub enum VestingError {
     ArithmeticError = 11,
     ScheduleIrrevocable = 12,
     BeneficiaryAlreadyExists = 13,
-    RevocationNotDue = 14,
-    MilestoneAlreadyReleased = 15,
-    ClaimBelowMinimum = 16,
-    RotationNotFound = 17,
-    RotationPending = 18,
-    RotationTimelockActive = 19,
-    InvalidBeneficiary = 20,
+    InvalidScheduleBounds = 14,
+    NotMilestoneSchedule = 15,
+    MilestoneNotFound = 16,
+    MilestoneAlreadyApproved = 17,
+    RevocationNotDue = 18,
+    MilestoneAlreadyReleased = 19,
+    ClaimBelowMinimum = 20,
+    RotationNotFound = 21,
+    RotationPending = 22,
+    RotationTimelockActive = 23,
+    InvalidBeneficiary = 24,
 }
 
 impl_display_error!(
@@ -44,6 +48,10 @@ impl_display_error!(
     ArithmeticError          => "arithmetic error",
     ScheduleIrrevocable      => "schedule irrevocable",
     BeneficiaryAlreadyExists => "beneficiary already exists",
+    InvalidScheduleBounds    => "invalid schedule bounds",
+    NotMilestoneSchedule     => "not a milestone schedule",
+    MilestoneNotFound        => "milestone not found",
+    MilestoneAlreadyApproved => "milestone already approved",
     RevocationNotDue         => "revocation not due",
     MilestoneAlreadyReleased => "milestone already released",
     ClaimBelowMinimum        => "claim below minimum",
@@ -78,6 +86,10 @@ VestingError::ScheduleNotFound = {}\n\
 VestingError::ArithmeticError = {}\n\
 VestingError::ScheduleIrrevocable = {}\n\
 VestingError::BeneficiaryAlreadyExists = {}\n\
+VestingError::InvalidScheduleBounds = {}\n\
+VestingError::NotMilestoneSchedule = {}\n\
+VestingError::MilestoneNotFound = {}\n\
+VestingError::MilestoneAlreadyApproved = {}\n\
 VestingError::RevocationNotDue = {}\n\
 VestingError::MilestoneAlreadyReleased = {}\n\
 VestingError::ClaimBelowMinimum = {}\n\
@@ -98,6 +110,10 @@ VestingError::InvalidBeneficiary = {}\n",
             VestingError::ArithmeticError as u32,
             VestingError::ScheduleIrrevocable as u32,
             VestingError::BeneficiaryAlreadyExists as u32,
+            VestingError::InvalidScheduleBounds as u32,
+            VestingError::NotMilestoneSchedule as u32,
+            VestingError::MilestoneNotFound as u32,
+            VestingError::MilestoneAlreadyApproved as u32,
             VestingError::RevocationNotDue as u32,
             VestingError::MilestoneAlreadyReleased as u32,
             VestingError::ClaimBelowMinimum as u32,
