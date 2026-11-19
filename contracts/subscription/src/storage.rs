@@ -51,6 +51,14 @@ pub struct Plan {
     pub active: bool,
 }
 
+/// Lifecycle status of a fixed-term subscription.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    Active,
+    Expired,
+}
+
 /// Subscription configuration and state for a single (subscriber, plan) pair.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +97,12 @@ pub struct SubscriptionInfo {
     pub failed_charges_count: u32,
     /// Ledger of the first failed charge attempt in the current delinquency, if any.
     pub delinquent_since_ledger: Option<u32>,
+    /// Number of successfully completed billing cycles.
+    pub billing_cycles: u32,
+    /// Terminal cycle limit for fixed-term subscriptions (`None` = open-ended).
+    pub max_billing_cycles: Option<u32>,
+    /// Whether the subscription is still active or has reached its term end.
+    pub status: SubscriptionStatus,
 }
 
 /// Result of a single charge attempt that did not abort with an error.

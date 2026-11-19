@@ -206,3 +206,11 @@ pub fn billing_due_soon(
         (next_billing_ledger, current_ledger),
     );
 }
+
+/// Emitted when a fixed-term subscription reaches its billing cycle limit.
+pub fn subscription_expired(env: &Env, subscriber: &Address, plan_id: &Symbol) {
+    env.events().publish(
+        (Symbol::new(env, "subscription_expired"), subscriber.clone()),
+        plan_id.clone(),
+    );
+}

@@ -16,6 +16,7 @@ mod storage;
 pub use errors::SubscriptionError;
 pub use storage::{
     BatchChargeResult, ChargeOutcome, DEFAULT_GRACE_PERIOD_LEDGERS, DataKey, Plan, SubscriptionInfo,
+    SubscriptionStatus,
 };
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
@@ -85,8 +86,19 @@ fn charge_one(
     if info.suspended {
         return Err(SubscriptionError::SubscriptionSuspended);
     }
-    if !info.active {
+    if !info.active || info.status == SubscriptionStatus::Expired {
         return Err(SubscriptionError::SubscriptionInactive);
+    }
+
+    // Fixed-term subscriptions stop billing once their cycle limit is reached.
+    if let Some(limit) = info.max_billing_cycles {
+        if info.billing_cycles >= limit {
+            info.status = SubscriptionStatus::Expired;
+            info.active = false;
+            save_subscription(env, subscriber, &info);
+            events::subscription_expired(env, subscriber, plan_id);
+            return Ok((ChargeOutcome::Skipped, 0));
+        }
     }
 
     let current_ledger = env.ledger().sequence();
@@ -127,6 +139,7 @@ fn charge_one(
     );
 
     if matches!(transfer, Ok(Ok(()))) {
+        info.billing_cycles = info.billing_cycles.saturating_add(1);
         let revenue_key = DataKey::ProviderRevenue(provider.clone());
         let accumulated: i128 = env.storage().persistent().get(&revenue_key).unwrap_or(0);
         env.storage().persistent().set(
@@ -459,6 +472,7 @@ mod contract {
             plan_id: Symbol,
             trial_ledgers: Option<u32>,
             prepay_intervals: Option<u32>,
+            max_billing_cycles: Option<u32>,
         ) -> Result<(), SubscriptionError> {
             let token_addr: Address = env
                 .storage()
@@ -493,6 +507,9 @@ mod contract {
 
             let trial_ledgers = trial_ledgers.unwrap_or(0);
             let prepay_intervals = prepay_intervals.unwrap_or(0);
+            if max_billing_cycles == Some(0) {
+                return Err(SubscriptionError::InvalidMaxBillingCycles);
+            }
             let prepaid_balance =
                 prepay_cost(plan.amount, prepay_intervals, plan.prepay_discount_bps)?;
 
@@ -511,6 +528,9 @@ mod contract {
                 suspended: false,
                 failed_charges_count: 0,
                 delinquent_since_ledger: None,
+                billing_cycles: 0,
+                max_billing_cycles,
+                status: SubscriptionStatus::Active,
             };
 
             save_subscription(&env, &subscriber, &info);
@@ -796,6 +816,9 @@ mod contract {
                 suspended: false,
                 failed_charges_count: 0,
                 delinquent_since_ledger: None,
+                billing_cycles: old.billing_cycles,
+                max_billing_cycles: old.max_billing_cycles,
+                status: old.status,
             };
 
             old.active = false;
@@ -1176,7 +1199,11 @@ mod contract {
                     } else {
                         info.last_charged_ledger.saturating_add(info.trial_ledgers)
                     };
-                    if info.active && !info.suspended && next_due <= horizon {
+                    if info.active
+                        && !info.suspended
+                        && info.status == SubscriptionStatus::Active
+                        && next_due <= horizon
+                    {
                         events::billing_due_soon(
                             &env,
                             &subscriber,

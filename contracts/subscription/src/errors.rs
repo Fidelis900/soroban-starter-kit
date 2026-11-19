@@ -36,6 +36,8 @@ pub enum SubscriptionError {
     BelowPayoutThreshold = 21,
     /// Payout threshold must be positive.
     InvalidPayoutThreshold = 22,
+    /// A fixed-term subscription must allow at least one billing cycle.
+    InvalidMaxBillingCycles = 23,
 }
 
 impl_display_error!(
@@ -56,6 +58,7 @@ impl_display_error!(
     PayoutThresholdNotSet  => "payout threshold not set",
     BelowPayoutThreshold   => "accumulated revenue is below payout threshold",
     InvalidPayoutThreshold => "payout threshold must be positive",
+    InvalidMaxBillingCycles => "max billing cycles must be at least one",
 );
 
 #[cfg(test)]
