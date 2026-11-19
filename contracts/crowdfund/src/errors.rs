@@ -26,13 +26,13 @@ pub enum CrowdfundError {
     CampaignCancelled = 17,
     TierCapacityExceeded = 18,
     InvalidTierId = 19,
-    ClaimDeadlineExpired = 17,
-    Overflow = 18,
-    MilestoneNotFound = 19,
-    MilestoneNotReady = 20,
-    MilestoneAlreadyReleased = 21,
-    InvalidTokenPrice = 22,
-    TokenNotWhitelisted = 23,
+    ClaimDeadlineExpired = 20,
+    Overflow = 21,
+    MilestoneNotFound = 22,
+    MilestoneNotReady = 23,
+    MilestoneAlreadyReleased = 24,
+    InvalidTokenPrice = 25,
+    TokenNotWhitelisted = 26,
 }
 
 impl_display_error!(
@@ -95,7 +95,7 @@ CrowdfundError::PledgeCapExceeded = {}\n\
 CrowdfundError::DeadlineAlreadyExtended = {}\n\
 CrowdfundError::CampaignCancelled = {}\n\
 CrowdfundError::TierCapacityExceeded = {}\n\
-CrowdfundError::InvalidTierId = {}\n",
+CrowdfundError::InvalidTierId = {}\n\
 CrowdfundError::ClaimDeadlineExpired = {}\n\
 CrowdfundError::Overflow = {}\n\
 CrowdfundError::MilestoneNotFound = {}\n\
