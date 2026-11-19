@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CrowdfundError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
@@ -33,6 +33,10 @@ pub enum CrowdfundError {
     MilestoneAlreadyReleased = 21,
     InvalidTokenPrice = 22,
     TokenNotWhitelisted = 23,
+    /// Milestone release needs approval from >50% of pledged voting power.
+    MilestoneApprovalThresholdNotMet = 24,
+    /// The creator has not proposed this milestone for release.
+    MilestoneNotRequested = 25,
 }
 
 impl_display_error!(
@@ -63,6 +67,8 @@ impl_display_error!(
     MilestoneAlreadyReleased => "milestone already released",
     InvalidTokenPrice       => "invalid token price from oracle",
     TokenNotWhitelisted     => "token not whitelisted for contributions",
+    MilestoneApprovalThresholdNotMet => "milestone approval threshold not met",
+    MilestoneNotRequested   => "milestone release has not been proposed",
 );
 
 #[cfg(test)]
@@ -95,7 +101,7 @@ CrowdfundError::PledgeCapExceeded = {}\n\
 CrowdfundError::DeadlineAlreadyExtended = {}\n\
 CrowdfundError::CampaignCancelled = {}\n\
 CrowdfundError::TierCapacityExceeded = {}\n\
-CrowdfundError::InvalidTierId = {}\n",
+CrowdfundError::InvalidTierId = {}\n\
 CrowdfundError::ClaimDeadlineExpired = {}\n\
 CrowdfundError::Overflow = {}\n\
 CrowdfundError::MilestoneNotFound = {}\n\
@@ -129,7 +135,7 @@ CrowdfundError::TokenNotWhitelisted = {}\n",
             CrowdfundError::MilestoneAlreadyReleased as u32,
             CrowdfundError::InvalidTokenPrice as u32,
             CrowdfundError::TokenNotWhitelisted as u32,
-        )
+        );
     }
 
     #[test]

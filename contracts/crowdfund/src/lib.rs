@@ -384,17 +384,39 @@ mod contract {
                 return Err(CrowdfundError::GoalNotMet);
             }
 
+            // With milestone governance enabled the creator cannot bypass
+            // contributor voting by calling `claim`. Every milestone must have
+            // been released first, and only the unreleased remainder is claimable.
+            let milestones: Vec<storage::Milestone> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Milestones)
+                .unwrap_or(Vec::new(&env));
+            let mut released_total = 0_i128;
+            for milestone in milestones.iter() {
+                let released: bool = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::MilestoneReleased(milestone.milestone_id))
+                    .unwrap_or(false);
+                if !released {
+                    return Err(CrowdfundError::MilestoneNotReady);
+                }
+                released_total += milestone.amount;
+            }
+            let claimable = total.saturating_sub(released_total);
+
             env.storage().instance().set(&DataKey::Claimed, &true);
 
             let token: Address = get_instance(&env, &DataKey::Token)?;
             token::Client::new(&env, &token).transfer(
                 &env.current_contract_address(),
                 &creator,
-                &total,
+                &claimable,
             );
 
             bump_instance(&env);
-            events::claimed(&env, &creator, total);
+            events::claimed(&env, &creator, claimable);
             Ok(())
         }
 
@@ -615,6 +637,12 @@ mod contract {
                 return Err(CrowdfundError::MilestoneAlreadyReleased);
             }
 
+            // Opening a release proposal starts the contributor voting window.
+            env.storage().persistent().set(
+                &DataKey::MilestoneRequested(milestone_id),
+                &true,
+            );
+
             // Mark as ready for voting
             bump_instance(&env);
             Ok(())
@@ -656,10 +684,28 @@ mod contract {
                 .find(|m| m.milestone_id == milestone_id)
                 .ok_or(CrowdfundError::MilestoneNotFound)?;
 
-            env.storage().persistent().set(
-                &DataKey::MilestoneVotes(milestone_id, voter.clone()),
-                &approve,
-            );
+            // A contributor's pledge is their voting power. Track the
+            // weighted approval total so changing a vote cannot double count.
+            let power_key = DataKey::MilestoneApprovalPower(milestone_id);
+            let mut approval_power: i128 =
+                env.storage().persistent().get(&power_key).unwrap_or(0);
+            let vote_key = DataKey::MilestoneVotes(milestone_id, voter.clone());
+            if let Some(previous) = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&vote_key)
+            {
+                if previous {
+                    approval_power -= pledge;
+                }
+            }
+            if approve {
+                approval_power += pledge;
+            }
+            env.storage().persistent().set(&vote_key, &approve);
+            env.storage()
+                .persistent()
+                .set(&power_key, &approval_power);
 
             bump_instance(&env);
             events::milestone_voted(&env, milestone_id, &voter, approve);
@@ -703,8 +749,27 @@ mod contract {
                 return Err(CrowdfundError::MilestoneAlreadyReleased);
             }
 
-            // TODO: Count votes and verify votes_required threshold is met
-            // For simplicity, we'll assume approval for now
+            let requested: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MilestoneRequested(milestone_id))
+                .unwrap_or(false);
+            if !requested {
+                return Err(CrowdfundError::MilestoneNotRequested);
+            }
+
+            // Contributor governance: a tranche may only be released when
+            // approving voting power is strictly greater than 50% of all
+            // pledged voting power.
+            let total_pledged: i128 = get_instance(&env, &DataKey::TotalPledged)?;
+            let approval_power: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MilestoneApprovalPower(milestone_id))
+                .unwrap_or(0);
+            if approval_power <= total_pledged / 2 {
+                return Err(CrowdfundError::MilestoneApprovalThresholdNotMet);
+            }
 
             env.storage()
                 .persistent()
@@ -753,6 +818,7 @@ mod contract {
                 .persistent()
                 .get(&DataKey::PledgeTier(pledger))
                 .unwrap_or(None)
+        }
         /// Pledge with alternative token (multi-token support).
         /// Closes #1169
         ///
