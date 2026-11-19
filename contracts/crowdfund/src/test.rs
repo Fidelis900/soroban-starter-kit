@@ -9,7 +9,7 @@
 
 use super::*;
 use soroban_sdk::{
-    Address, Env,
+    Address, BytesN, Env, String,
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
 };
@@ -73,6 +73,30 @@ fn test_stretch_goals_unlock_dynamically() {
     let info = client.get_info();
     assert!(info.stretch_goals.get(0).unwrap().unlocked);
     assert!(info.stretch_goals.get(1).unwrap().unlocked);
+}
+
+#[test]
+fn test_post_update_emits_event() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, _, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    client.initialize(
+        &creator,
+        &token,
+        &1_000,
+        &deadline,
+        &soroban_sdk::Vec::new(&env),
+        &None,
+        &None,
+    );
+
+    let hash = BytesN::from_array(&env, &[7u8; 32]);
+    let uri = String::from_str(&env, "ipfs://update-1");
+    client.post_update(&creator, &hash, &uri);
 }
 
 #[test]

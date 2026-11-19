@@ -6,7 +6,7 @@
 //! goal is met the creator claims the funds; otherwise contributors refund
 //! their pledges.
 
-use soroban_sdk::{Address, Env, Vec, contract, contractimpl, token};
+use soroban_sdk::{Address, BytesN, Env, String, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
@@ -516,6 +516,28 @@ mod contract {
 
             bump_instance(&env);
             events::campaign_cancelled(&env, &creator);
+            Ok(())
+        }
+
+        /// Post an immutable project update for backers.
+        ///
+        /// # Errors
+        ///
+        /// - [`CrowdfundError::NotInitialized`] if not set up.
+        pub fn post_update(
+            env: Env,
+            creator: Address,
+            update_hash: BytesN<32>,
+            uri: String,
+        ) -> Result<(), CrowdfundError> {
+            let stored_creator: Address = get_instance(&env, &DataKey::Creator)?;
+            creator.require_auth();
+            if creator != stored_creator {
+                return Err(CrowdfundError::NotAuthorized);
+            }
+
+            bump_instance(&env);
+            events::project_update(&env, &creator, &update_hash, &uri);
             Ok(())
         }
 
