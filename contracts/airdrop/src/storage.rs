@@ -32,6 +32,10 @@ pub enum DataKey {
     DecayConfig,
     /// Address receiving the unclaimed decay remainder (instance).
     Treasury,
+    /// Governance DAO allowed to advance the campaign to a new Merkle epoch.
+    Governance,
+    /// Current Merkle epoch (instance). Claimed bitmaps are shared across epochs.
+    Epoch,
 }
 
 /// Time-decaying claim schedule.

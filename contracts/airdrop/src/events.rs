@@ -18,6 +18,13 @@ pub fn decay_config_set(env: &Env, treasury: &Address, config: &crate::DecayConf
     );
 }
 
+pub fn epoch_root_updated(env: &Env, epoch: u32, root: &Bytes, deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "epoch_root_updated"), epoch),
+        (root.clone(), deadline),
+    );
+}
+
 pub fn decay_remainder(env: &Env, treasury: &Address, token: &Address, amount: i128) {
     env.events().publish(
         (Symbol::new(env, "decay_remainder"),),

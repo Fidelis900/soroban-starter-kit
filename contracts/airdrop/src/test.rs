@@ -477,3 +477,56 @@ fn invalid_decay_config_is_rejected() {
         Err(Ok(AirdropError::InvalidDecayConfig))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1350: governance-authorized multi-epoch Merkle root updates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governance_root_updates_preserve_claimed_bitmaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let dao = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    client.set_governance(&dao);
+    assert_eq!(client.get_governance(), Some(dao.clone()));
+
+    // Simulate a claim in epoch zero; the bitmap must survive both updates.
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Claimed(alice.clone(), token.clone()), &true);
+    });
+
+    assert_eq!(client.get_epoch(), 0);
+    let root_one = BytesN::from_array(&env, &[1u8; 32]);
+    client.update_root_by_governance(&root_one, &2_000);
+    assert_eq!(client.get_epoch(), 1);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(1)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
+
+    let root_two = BytesN::from_array(&env, &[2u8; 32]);
+    client.update_root_by_governance(&root_two, &3_000);
+    assert_eq!(client.get_epoch(), 2);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(2)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
+}

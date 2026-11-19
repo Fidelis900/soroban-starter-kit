@@ -448,6 +448,75 @@ mod contract {
             env.storage().instance().get(&DataKey::DecayConfig)
         }
 
+        /// Configure the DAO contract authorised to advance Merkle epochs.
+        /// Only the admin may call this.
+        pub fn set_governance(env: Env, governance: Address) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Governance, &governance);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Install a new Merkle root for the next campaign epoch.
+        ///
+        /// Only the configured governance DAO may call this. The previous
+        /// epoch's claimed bitmaps are intentionally left untouched, so a
+        /// recipient who already claimed cannot claim again under the new root.
+        pub fn update_root_by_governance(
+            env: Env,
+            new_root: BytesN<32>,
+            new_deadline: u32,
+        ) -> Result<(), AirdropError> {
+            let governance: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Governance)
+                .ok_or(AirdropError::NotInitialized)?;
+            governance.require_auth();
+
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(AirdropError::NotInitialized);
+            }
+
+            let epoch: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Epoch)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(AirdropError::ArithmeticOverflow)?;
+
+            let root_bytes = Bytes::from(new_root);
+            let key = DataKey::MerkleRoot(epoch);
+            env.storage().instance().set(&key, &root_bytes);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerkleRoot, &root_bytes);
+            env.storage().instance().set(&DataKey::Epoch, &epoch);
+            env.storage()
+                .instance()
+                .set(&DataKey::ClaimDeadline, &new_deadline);
+            bump_instance(&env);
+
+            events::epoch_root_updated(&env, epoch, &root_bytes, new_deadline);
+            Ok(())
+        }
+
+        /// Returns the current Merkle epoch (0 before the first governance update).
+        pub fn get_epoch(env: Env) -> u32 {
+            env.storage().instance().get(&DataKey::Epoch).unwrap_or(0)
+        }
+
+        /// Returns the configured governance address, if any.
+        pub fn get_governance(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::Governance)
+        }
+
         /// Claim `amount` of `token` by supplying a valid merkle proof.
         ///
         /// The tree must contain the leaf `(recipient, token, amount)`. A
