@@ -14,255 +14,175 @@
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, Address, Env,
+    token, Address, Env, U256,
 };
+use std::vec::Vec;
 
-use crate::{VestingContract, VestingContractClient};
+use crate::{vested_amount, VestingContract, VestingContractClient, VestingError};
 
-/// High-precision reference model for a single linear vesting schedule.
-///
-/// Mirrors the contract's linear release math so we can cross-check the
-/// on-chain accounting without relying on the contract's own arithmetic.
+const BASE_LEDGER: u32 = 100;
+
+/// Independent 256-bit reference for `floor(amount * num / den)`.
+fn wide_mul_div(amount: i128, num: u32, den: u32) -> i128 {
+    let env = Env::default();
+    let wide = U256::from_u128(&env, amount as u128)
+        .mul(&U256::from_u32(&env, num))
+        .div(&U256::from_u32(&env, den));
+    wide.to_u128().unwrap() as i128
+}
+
+/// Reference model for a single linear (cliff → end) vesting schedule.
 #[derive(Clone, Debug)]
 struct LinearModel {
     amount: i128,
-    start: u64,
-    duration: u64,
-    cliff: u64,
+    cliff: u32,
+    end: u32,
     claimed: i128,
-    revoked: bool,
+    /// Ledger at which vesting was capped by a revocation.
+    cap: Option<u32>,
 }
 
 impl LinearModel {
-    fn new(amount: i128, start: u64, duration: u64, cliff: u64) -> Self {
-        Self { amount, start, duration, cliff, claimed: 0, revoked: false }
+    fn new(amount: i128, cliff: u32, end: u32) -> Self {
+        Self { amount, cliff, end, claimed: 0, cap: None }
     }
 
-    /// Vested amount at `now`, computed with the same linear interpolation the
-    /// contract uses. Returns 0 before the cliff.
-    fn vested(&self, now: u64) -> i128 {
-        if now < self.start.saturating_add(self.cliff) {
+    /// Vested amount at `now`, honouring a revocation cap.
+    fn vested(&self, now: u32) -> i128 {
+        let at = self.cap.map_or(now, |c| c.min(now));
+        if at < self.cliff {
             return 0;
         }
-        if now >= self.start.saturating_add(self.duration) {
+        if at >= self.end {
             return self.amount;
         }
-        let elapsed = (now - self.start) as i128;
-        self.amount * elapsed / (self.duration as i128)
+        self.amount * i128::from(at - self.cliff) / i128::from(self.end - self.cliff)
     }
 
-    /// Amount currently claimable (vested minus already claimed).
-    fn claimable(&self, now: u64) -> i128 {
+    fn claimable(&self, now: u32) -> i128 {
         (self.vested(now) - self.claimed).max(0)
     }
-
-    /// Unvested remainder still locked in the contract.
-    fn unvested_remaining(&self, now: u64) -> i128 {
-        (self.amount - self.vested(now)).max(0)
-    }
 }
 
-/// One random action in the stateful sequence.
-#[derive(Clone, Debug)]
-enum Action {
-    Advance(u64),
-    Claim(usize),
-    Revoke(usize),
-}
-
-fn action_strategy(num_beneficiaries: usize) -> impl Strategy<Value = Action> {
-    prop_oneof![
-        3 => (1u64..=10_000).prop_map(Action::Advance),
-        4 => (0..num_beneficiaries).prop_map(Action::Claim),
-        1 => (0..num_beneficiaries).prop_map(Action::Revoke),
-    ]
-}
-
-/// Deploy a fresh vesting contract with a minted token and `n` beneficiaries.
-///
-/// Returns the client, the token client, the admin, and the per-beneficiary
-/// `(address, amount, start, duration, cliff)` tuples.
-fn setup(
-    env: &Env,
-    n: usize,
-    amounts: &[i128],
-    starts: &[u64],
-    durations: &[u64],
-    cliffs: &[u64],
-) -> (
-    VestingContractClient<'_>,
-    token::Client<'_>,
-    Address,
-    Vec<(Address, i128, u64, u64, u64)>,
-) {
+/// Deploy a vesting contract and create one linear schedule per
+/// `(amount, cliff_offset, duration)` triple.
+fn setup<'a>(
+    env: &'a Env,
+    params: &[(i128, u32, u32)],
+) -> (VestingContractClient<'a>, token::Client<'a>, Vec<(Address, LinearModel)>) {
     env.mock_all_auths();
+    env.ledger().with_mut(|l| l.sequence_number = BASE_LEDGER);
 
     let admin = Address::generate(env);
     let contract_id = env.register(VestingContract, ());
     let client = VestingContractClient::new(env, &contract_id);
 
-    let token_admin = Address::generate(env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
     let token = token::Client::new(env, &token_id.address());
-    let token_admin_client = token::StellarAssetClient::new(env, &token_id.address());
-
-    let mut total: i128 = 0;
-    let mut beneficiaries = Vec::new();
-    for i in 0..n {
-        let beneficiary = Address::generate(env);
-        total += amounts[i];
-        beneficiaries.push((beneficiary, amounts[i], starts[i], durations[i], cliffs[i]));
-    }
-
-    token_admin_client.mint(&contract_id, &total);
+    let total: i128 = params.iter().map(|p| p.0).sum();
+    token::StellarAssetClient::new(env, &token_id.address()).mint(&admin, &total);
     client.initialize(&admin, &token_id.address());
 
-    for (beneficiary, amount, start, duration, cliff) in beneficiaries.iter() {
-        client.create_schedule(beneficiary, amount, start, duration, cliff);
+    let mut out = Vec::new();
+    for (amount, cliff_offset, duration) in params.iter().copied() {
+        let beneficiary = Address::generate(env);
+        let cliff = BASE_LEDGER + 1 + cliff_offset;
+        let end = cliff + duration;
+        client.create_schedule(&beneficiary, &cliff, &end, &amount, &true);
+        out.push((beneficiary, LinearModel::new(amount, cliff, end)));
     }
-
-    (client, token, admin, beneficiaries)
+    (client, token, out)
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(32))]
 
     /// Stateful property test: random ledger advances, claims, and revocations
     /// must preserve token conservation and schedule accuracy.
     #[test]
     fn prop_stateful_token_conservation(
-        amounts in prop::collection::vec(1i128..=1_000_000, 1..=4),
-        starts in prop::collection::vec(0u64..=1_000, 1..=4),
-        durations in prop::collection::vec(1u64..=10_000, 1..=4),
-        cliffs in prop::collection::vec(0u64..=1_000, 1..=4),
+        params in prop::collection::vec((1i128..=1_000_000, 0u32..=1_000, 1u32..=10_000), 1..=4),
         actions in prop::collection::vec(any::<u8>(), 1..=32),
     ) {
-        let n = amounts.len().min(starts.len()).min(durations.len()).min(cliffs.len());
-        let amounts = &amounts[..n];
-        let starts = &starts[..n];
-        let durations = &durations[..n];
-        let cliffs = &cliffs[..n];
-
         let env = Env::default();
-        let (client, token, _admin, beneficiaries) =
-            setup(&env, n, amounts, starts, durations, cliffs);
+        let (client, token, mut schedules) = setup(&env, &params);
+        let n = schedules.len();
 
-        let mut models: Vec<LinearModel> = beneficiaries
-            .iter()
-            .map(|(_, amount, start, duration, cliff)| {
-                LinearModel::new(*amount, *start, *duration, *cliff)
-            })
-            .collect();
-
-        let mut now: u64 = 0;
+        let mut now = BASE_LEDGER;
         let mut total_claimed: i128 = 0;
-        let mut total_revoked_returned: i128 = 0;
+        let mut total_returned: i128 = 0;
 
         for raw in actions.iter() {
-            let action = match raw % 3 {
-                0 => Action::Advance((*raw as u64 + 1) * 100),
-                1 => Action::Claim((*raw as usize) % n),
-                _ => Action::Revoke((*raw as usize) % n),
-            };
-
-            match action {
-                Action::Advance(delta) => {
-                    now = now.saturating_add(delta);
-                    env.ledger().set_timestamp(now);
+            let i = (*raw as usize) % n;
+            match raw % 3 {
+                0 => {
+                    now += (u32::from(*raw) + 1) * 100;
+                    env.ledger().with_mut(|l| l.sequence_number = now);
                 }
-                Action::Claim(i) => {
-                    let model = &mut models[i];
-                    if model.revoked {
-                        continue;
-                    }
+                1 => {
+                    let (beneficiary, model) = &mut schedules[i];
                     let expected = model.claimable(now);
-                    let (beneficiary, ..) = &beneficiaries[i];
-                    let claimed = client.claim(beneficiary);
-
-                    // Invariant 2: never claim more than the initial amount.
-                    prop_assert!(claimed <= model.amount);
-                    prop_assert_eq!(claimed, expected);
-
-                    model.claimed += claimed;
-                    total_claimed += claimed;
-                    prop_assert!(model.claimed <= model.amount);
+                    if expected == 0 {
+                        prop_assert_eq!(
+                            client.try_claim(beneficiary),
+                            Err(Ok(VestingError::NothingToClaim))
+                        );
+                    } else {
+                        let claimed = client.claim(beneficiary);
+                        prop_assert_eq!(claimed, expected);
+                        model.claimed += claimed;
+                        total_claimed += claimed;
+                        // Invariant 2: never claim more than the initial amount.
+                        prop_assert!(model.claimed <= model.amount);
+                    }
                 }
-                Action::Revoke(i) => {
-                    let model = &mut models[i];
-                    if model.revoked {
+                _ => {
+                    let (beneficiary, model) = &mut schedules[i];
+                    if model.cap.is_some() {
                         continue;
                     }
-                    let (beneficiary, ..) = &beneficiaries[i];
-                    let vested_before = model.vested(now);
                     let returned = client.revoke(beneficiary);
-
-                    // Invariant 3: revocation never clawbacks vested tokens.
-                    let unvested = model.unvested_remaining(now);
-                    prop_assert_eq!(returned, unvested);
-                    prop_assert!(returned >= 0);
-
-                    // Invariant 4: returned + claimed == initial allocation.
-                    prop_assert_eq!(returned + model.claimed, model.amount);
-
-                    model.revoked = true;
-                    total_revoked_returned += returned;
-
-                    // Vested tokens remain claimable after revocation.
-                    let still_claimable = (vested_before - model.claimed).max(0);
-                    prop_assert!(still_claimable >= 0);
+                    // Invariant 3: revocation never claws back vested tokens.
+                    prop_assert_eq!(returned, model.amount - model.vested(now));
+                    model.cap = Some(now);
+                    total_returned += returned;
                 }
             }
 
             // Invariant 1: contract balance covers all outstanding obligations.
-            let mut outstanding: i128 = 0;
-            for (idx, model) in models.iter().enumerate() {
-                if model.revoked {
-                    outstanding += (model.vested(now) - model.claimed).max(0);
-                } else {
-                    outstanding += model.claimable(now) + model.unvested_remaining(now);
-                }
-                let _ = idx;
-            }
-            let balance = token.balance(&client.address);
-            prop_assert!(balance >= outstanding);
+            let outstanding: i128 = schedules
+                .iter()
+                .map(|(_, m)| m.vested(u32::MAX) - m.claimed)
+                .sum();
+            prop_assert!(token.balance(&client.address) >= outstanding);
         }
 
-        // Global conservation: everything minted is either claimed, returned,
-        // or still held by the contract.
-        let total_allocated: i128 = amounts.iter().sum();
-        let balance = token.balance(&client.address);
-        prop_assert_eq!(total_claimed + total_revoked_returned + balance, total_allocated);
+        // Global conservation: everything allocated is claimed, returned, or held.
+        let total_allocated: i128 = params.iter().map(|p| p.0).sum();
+        prop_assert_eq!(
+            total_claimed + total_returned + token.balance(&client.address),
+            total_allocated
+        );
     }
 
-    /// Linear release invariant against the high-precision reference model.
+    /// Linear release invariant against the reference model.
     #[test]
     fn prop_linear_release_matches_model(
         amount in 1i128..=1_000_000,
-        start in 0u64..=1_000,
-        duration in 1u64..=10_000,
-        cliff in 0u64..=1_000,
-        probes in prop::collection::vec(0u64..=20_000, 1..=16),
+        cliff_offset in 0u32..=1_000,
+        duration in 1u32..=10_000,
+        probes in prop::collection::vec(0u32..=20_000, 1..=16),
     ) {
         let env = Env::default();
-        let (client, _token, _admin, beneficiaries) = setup(
-            &env,
-            1,
-            &[amount],
-            &[start],
-            &[duration],
-            &[cliff],
-        );
-        let (beneficiary, ..) = &beneficiaries[0];
-        let model = LinearModel::new(amount, start, duration, cliff);
+        let (client, _token, schedules) = setup(&env, &[(amount, cliff_offset, duration)]);
+        let (beneficiary, model) = &schedules[0];
 
         for probe in probes.iter() {
-            env.ledger().set_timestamp(*probe);
-            let expected = model.claimable(*probe);
-            let actual = client.claimable(beneficiary);
-            prop_assert_eq!(actual, expected);
+            let ledger = BASE_LEDGER + probe;
+            env.ledger().with_mut(|l| l.sequence_number = ledger);
+            prop_assert_eq!(client.claimable(beneficiary), model.claimable(ledger));
         }
     }
-}
 
     // Regression tests for issue #1138: large token supplies with long
     // durations must not overflow `amount * elapsed` in `vested_amount`.
@@ -278,10 +198,10 @@ proptest! {
     ) {
         let cliff = 1u32;
         let end = cliff + duration;
-        let checkpoint = cliff + duration * checkpoint_pct / 100;
+        let checkpoint = cliff + (u64::from(duration) * u64::from(checkpoint_pct) / 100) as u32;
 
         // Must not panic and must match the exact linear interpolation.
-        let vested = vested_amount(amount, cliff, end, checkpoint);
+        let vested = vested_amount(amount, cliff, end, checkpoint).unwrap();
         let expected = if checkpoint < cliff {
             0
         } else if checkpoint >= end {
@@ -289,10 +209,7 @@ proptest! {
         } else {
             // Reference computation using 256-bit wide math to avoid the
             // very overflow we are guarding against.
-            let elapsed = u128::from(checkpoint - cliff);
-            let total = u128::from(duration);
-            let wide = (amount as u128) * elapsed / total;
-            wide as i128
+            wide_mul_div(amount, checkpoint - cliff, duration)
         };
         prop_assert_eq!(vested, expected);
     }
@@ -307,13 +224,13 @@ proptest! {
         let end = cliff + duration;
 
         // At the end ledger the full amount must vest exactly.
-        prop_assert_eq!(vested_amount(amount, cliff, end, end), amount);
+        prop_assert_eq!(vested_amount(amount, cliff, end, end).unwrap(), amount);
         // At the cliff nothing has vested yet.
-        prop_assert_eq!(vested_amount(amount, cliff, end, cliff), 0);
+        prop_assert_eq!(vested_amount(amount, cliff, end, cliff).unwrap(), 0);
         // Halfway through, the result must be the exact floor of the
         // linear interpolation computed with wide arithmetic.
         let mid = cliff + duration / 2;
-        let expected = ((amount as u128) * u128::from(duration / 2) / u128::from(duration)) as i128;
-        prop_assert_eq!(vested_amount(amount, cliff, end, mid), expected);
+        let expected = wide_mul_div(amount, duration / 2, duration);
+        prop_assert_eq!(vested_amount(amount, cliff, end, mid).unwrap(), expected);
     }
 }

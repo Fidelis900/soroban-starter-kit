@@ -21,17 +21,24 @@
 //! - [`time`] — ledger/seconds conversion helpers with ceiling rounding.
 //! - [`ownable`] — two-step ownership transfer with standard events.
 
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{Address, Bytes, BytesN, Env, contracttype, crypto::Hash};
 
 pub mod math;
 pub mod merkle;
+#[allow(missing_docs)] // `#[contracterror]` generates undocumented items
 pub mod ownable;
+#[allow(missing_docs)] // `#[contracterror]` generates undocumented items
 pub mod pausable;
+/// Checked numeric conversions.
+#[allow(missing_docs)] // `#[contracterror]` generates undocumented items
 pub mod safe_cast;
 pub mod time;
 
 pub use math::{
-    FixedPoint128, FixedPointError, fixed_sqrt, from_scale, mul_div, mul_div_nearest, mul_div_up,
+    FixedPoint128, FixedPointError, fixed_sqrt, fixed_sqrt_scaled, from_scale, mul_div, mul_div_nearest, mul_div_up,
     to_scale,
 };
 pub use merkle::{hash_pair_sorted, verify_merkle_multi_proof, verify_merkle_proof};
@@ -909,7 +916,20 @@ use reentrancy_guard::ReentrancyKey;
 mod reentrancy_guard_tests {
     use super::*;
 
+    #[soroban_sdk::contract]
+    struct GuardHost;
+
     #[test]
     fn enter_sets_flag_and_drop_clears_it() {
         let env = Env::default();
-        assert!(!Reentrancy
+        let id = env.register(GuardHost, ());
+        env.as_contract(&id, || {
+            assert!(!ReentrancyGuard::is_locked(&env));
+            {
+                let _guard = ReentrancyGuard::enter(&env);
+                assert!(ReentrancyGuard::is_locked(&env));
+            }
+            assert!(!ReentrancyGuard::is_locked(&env));
+        });
+    }
+}

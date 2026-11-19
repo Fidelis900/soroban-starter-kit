@@ -9,20 +9,38 @@
 //!
 //! # Leaf format
 //!
-//! Every leaf is bound to the network, to this contract instance, and to the
-//! token being distributed, so a proof cannot be replayed on another network,
-//! another airdrop contract, or for another token:
+//! Every leaf is bound to the network, to this contract instance, to the
+//! token being distributed, and to the allocation tier, so a proof cannot be
+//! replayed on another network, another airdrop contract, for another token,
+//! or under a different tier:
 //!
 //! ```text
 //! leaf = sha256(
-//!     "SOROBAN_AIRDROP_LEAF_V1"      // 23-byte ASCII domain separator
+//!     "SOROBAN_AIRDROP_LEAF_V2"      // 23-byte ASCII domain separator
 //!  || network_id                     // 32 bytes (sha256 of the network passphrase)
 //!  || xdr(ScVal::Address(contract))  // this airdrop contract
 //!  || xdr(ScVal::Address(recipient))
 //!  || xdr(ScVal::Address(token))
 //!  || amount                         // i128, 16-byte big-endian
+//!  || tier                           // u32, 4-byte big-endian tier identifier
 //! )
 //! ```
+//!
+//! # Tiers
+//!
+//! Campaigns may distribute tiered allocations (e.g. tier 1 = 1,000 tokens,
+//! tier 2 = 5,000 tokens). The tier identifier is part of the leaf, so a
+//! recipient can only claim under the tier the tree assigns them. The claimed
+//! tier is recorded on-chain (see `get_claimed_tier`) and emitted on the
+//! `claimed` event for analytics indexing.
+//!
+//! # Front-running protection
+//!
+//! Every claim requires `recipient.require_auth()`, and tokens are only ever
+//! paid to the recipient committed in the leaf. A bot that copies a pending
+//! proof from the mempool can neither submit it without the recipient's
+//! signature nor redirect the payout to itself: substituting its own address
+//! changes the leaf and the proof no longer verifies.
 //!
 //! Internal nodes are `sha256(min(a, b) || max(a, b))` (see
 //! [`soroban_common::merkle`]). Because a leaf preimage is never 64 bytes
@@ -45,7 +63,7 @@ use soroban_common::{
 };
 
 /// Domain separator prepended to every leaf preimage.
-pub const LEAF_DOMAIN: &[u8] = b"SOROBAN_AIRDROP_LEAF_V1";
+pub const LEAF_DOMAIN: &[u8] = b"SOROBAN_AIRDROP_LEAF_V2";
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -57,23 +75,24 @@ fn bump_persistent(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
-fn bump_claimed(env: &Env, round_id: u32, recipient: &Address) {
-    env.storage().persistent().extend_ttl(
-        &DataKey::Claimed(round_id, recipient.clone()),
-        LEDGER_LIFETIME_THRESHOLD,
-        LEDGER_BUMP_AMOUNT,
-    );
 }
 
-/// Compute the merkle leaf for `(recipient, token, amount)` as described in
-/// the crate-level docs.
-fn compute_leaf(env: &Env, recipient: &Address, token: &Address, amount: i128) -> BytesN<32> {
+/// Compute the merkle leaf for `(recipient, token, amount, tier)` as described
+/// in the crate-level docs.
+pub fn compute_leaf(
+    env: &Env,
+    recipient: &Address,
+    token: &Address,
+    amount: i128,
+    tier: u32,
+) -> BytesN<32> {
     let mut data = Bytes::from_slice(env, LEAF_DOMAIN);
     data.append(&Bytes::from(env.ledger().network_id()));
     data.append(&env.current_contract_address().to_xdr(env));
     data.append(&recipient.clone().to_xdr(env));
     data.append(&token.clone().to_xdr(env));
     data.extend_from_array(&amount.to_be_bytes());
+    data.extend_from_array(&tier.to_be_bytes());
     env.crypto().sha256(&data).into()
 }
 
@@ -144,11 +163,16 @@ fn settle_claim(
     recipient: &Address,
     token: &Address,
     amount: i128,
+    tier: u32,
 ) -> Result<(), AirdropError> {
     // Checks-effects-interactions: mark claimed before transfer.
     let claimed_key = DataKey::Claimed(recipient.clone(), token.clone());
     env.storage().persistent().set(&claimed_key, &true);
     bump_persistent(env, &claimed_key);
+
+    let tier_key = DataKey::ClaimedTier(recipient.clone(), token.clone());
+    env.storage().persistent().set(&tier_key, &tier);
+    bump_persistent(env, &tier_key);
 
     let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
     let liquid = match &vesting {
@@ -185,7 +209,7 @@ fn settle_claim(
         token::Client::new(env, token).transfer(&env.current_contract_address(), recipient, &liquid);
     }
 
-    events::claimed(env, recipient, token, amount);
+    events::claimed(env, recipient, token, amount, tier);
     Ok(())
 }
 
@@ -214,14 +238,10 @@ fn releasable_amount(schedule: &VestingSchedule, now: u32) -> Result<i128, Airdr
 /// 1. Admin calls `initialize` with the claim deadline and optional vesting configuration.
 /// 2. Admin calls `set_root` with the merkle root of the airdrop distribution tree
 ///    and funds the contract with every token in the tree.
-/// 3. Each eligible address calls `claim(recipient, token, amount, proof)`, or a relayer
-///    calls `claim_batch` with a single multi-proof. Duplicate claims are rejected on-chain.
+/// 3. Each eligible address calls `claim(recipient, token, amount, tier, proof)`, or a
+///    relayer calls `claim_batch` with a single multi-proof (each recipient must
+///    still authorize their own entry). Duplicate claims are rejected on-chain.
 /// 4. If vesting is enabled, recipients call `release` to withdraw vested tokens.
-/// 1. Admin calls `initialize` to set the token address.
-/// 2. Admin calls `set_root` with the merkle root of the airdrop distribution tree.
-/// 3. Each eligible address calls `claim(round_id, recipient, amount, proof)` with a
-///    pre-computed merkle proof, or signs an off-chain authorization that a sponsor
-///    submits via `claim_for`. Duplicate claims are rejected on-chain.
 pub use contract::*;
 
 // The `#[contract]` / `#[contractimpl]` macros generate an undocumented public
@@ -277,22 +297,13 @@ mod contract {
             Ok(())
         }
 
-        /// Set (or replace) the merkle root for a given round. Only the admin may call this.
-        ///
-        /// The root of an active, unexpired round cannot be replaced: once a round's
-        /// root is set and its claim window is still open, it is immutable. This
-        /// prevents an admin from invalidating outstanding proofs mid-round.
+        /// Set (or replace) the merkle root. Only the admin may call this.
         ///
         /// # Errors
         ///
         /// Returns [`AirdropError::NotInitialized`] if the contract has not been initialized.
         /// Returns [`AirdropError::Unauthorized`] if caller is not the admin.
-        /// Returns [`AirdropError::RoundActive`] if the round already has a root and is unexpired.
-        pub fn set_root(
-            env: Env,
-            round_id: u32,
-            root: BytesN<32>,
-        ) -> Result<(), AirdropError> {
+        pub fn set_root(env: Env, root: BytesN<32>) -> Result<(), AirdropError> {
             let admin: Address = env
                 .storage()
                 .instance()
@@ -301,41 +312,23 @@ mod contract {
 
             admin.require_auth();
 
-            // Prevent changing the root of an active, unexpired round.
-            let existing: Option<Bytes> = env
-                .storage()
-                .instance()
-                .get(&DataKey::MerkleRoot(round_id));
-            if existing.is_some() {
-                let deadline: u32 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::ClaimDeadline)
-                    .ok_or(AirdropError::NotInitialized)?;
-                if env.ledger().sequence() <= deadline {
-                    return Err(AirdropError::RoundActive);
-                }
-            }
-
             let root_bytes = Bytes::from(root.clone());
             env.storage()
                 .instance()
-                .set(&DataKey::MerkleRoot(round_id), &root_bytes);
+                .set(&DataKey::MerkleRoot, &root_bytes);
             bump_instance(&env);
 
-            events::root_set(&env, round_id, &root_bytes);
+            events::root_set(&env, &root_bytes);
             Ok(())
         }
 
-        /// Claim `amount` of `token` by supplying a valid merkle proof.
+        /// Claim `amount` of `token` under allocation `tier` by supplying a
+        /// valid merkle proof.
         ///
-        /// The tree must contain the leaf `(recipient, token, amount)`. A
-        /// recipient may claim each token in the tree once.
-        /// Claim tokens by supplying a valid merkle proof for a given round.
-        ///
-        /// The caller must appear in the round's airdrop tree with exactly `amount` tokens.
-        /// Claims are tracked per `(round_id, recipient)`, so a recipient may claim
-        /// once in each round of a multi-round campaign.
+        /// The tree must contain the leaf `(recipient, token, amount, tier)`. A
+        /// recipient may claim each token in the tree once. `recipient` must
+        /// authorize the call, so a copied proof cannot be submitted by a
+        /// front-runner, and tokens are only ever paid to `recipient`.
         ///
         /// # Errors
         ///
@@ -344,125 +337,43 @@ mod contract {
         /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
         /// Returns [`AirdropError::InvalidAmount`] if `amount <= 0`.
         /// Returns [`AirdropError::AlreadyClaimed`] if this `(recipient, token)` already claimed.
-        /// Returns [`AirdropError::RootNotSet`] if no merkle root has been set for the round.
-        /// Returns [`AirdropError::InvalidAmount`] if `amount <= 0`.
-        /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
-        /// Returns [`AirdropError::AlreadyClaimed`] if the address already claimed in this round.
         /// Returns [`AirdropError::InvalidProof`] if the merkle proof does not verify.
         /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover the claim.
         pub fn claim(
             env: Env,
-            round_id: u32,
             recipient: Address,
             token: Address,
             amount: i128,
+            tier: u32,
             proof: Vec<BytesN<32>>,
         ) -> Result<(), AirdropError> {
+            // Bind the claim to the recipient before any other work so that a
+            // mempool sniper replaying the proof is rejected outright.
+            recipient.require_auth();
+
             let root = load_claim_context(&env)?;
-            let token_addr: Address = env
-            recipient.require_auth();
-            execute_claim(&env, round_id, &recipient, amount, &proof)?;
-            events::claimed(&env, round_id, &recipient, amount);
-            Ok(())
-        }
 
-        /// Claim on behalf of `recipient` using an off-chain ed25519 signature.
-        ///
-        /// Lets a relayer or sponsor submit (and pay the fee for) a claim for a
-        /// recipient who holds no native XLM. The recipient signs the payload
-        /// returned by [`claim_for_payload`](Self::claim_for_payload) with the
-        /// ed25519 key behind their `G...` account address; tokens are always
-        /// delivered to `recipient`, never to the submitter.
-        ///
-        /// Replay protection: the signed payload is bound to the network, this
-        /// contract, the round, the recipient and the amount, and each
-        /// `(round_id, recipient)` pair can be claimed at most once.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`AirdropError::InvalidSignature`] if `recipient` is not an
-        /// ed25519 account address. Otherwise returns the same errors as
-        /// [`claim`](Self::claim).
-        ///
-        /// # Panics
-        ///
-        /// Traps if `signature` does not verify against the recipient's public key.
-        pub fn claim_for(
-            env: Env,
-            round_id: u32,
-            recipient: Address,
-            amount: i128,
-            proof: Vec<BytesN<32>>,
-            signature: BytesN<64>,
-        ) -> Result<(), AirdropError> {
-            let public_key = account_public_key(&env, &recipient)?;
-            let payload = claim_for_payload(&env, round_id, &recipient, amount);
-            env.crypto().ed25519_verify(&public_key, &payload, &signature);
-
-            execute_claim(&env, round_id, &recipient, amount, &proof)?;
-            events::claimed_for(&env, round_id, &recipient, amount);
-            Ok(())
-        }
-
-        /// Return the exact bytes a recipient must sign to authorize [`claim_for`](Self::claim_for).
-        pub fn claim_for_payload(env: Env, round_id: u32, recipient: Address, amount: i128) -> Bytes {
-            claim_for_payload(&env, round_id, &recipient, amount)
-        }
-
-        /// Sweep any tokens left unclaimed after the claim deadline.
-        ///
-        /// Only the admin may call this, and only once the claim window has
-        /// closed (`env.ledger().sequence() > claim_deadline`). The entire
-        /// remaining token balance held by the contract is transferred to
-        /// `recipient`, preventing funds from being permanently locked.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`AirdropError::NotInitialized`] if not initialized.
-        /// Returns [`AirdropError::ClaimWindowNotClosed`] if the deadline has not passed.
-        /// Returns [`AirdropError::NothingToSweep`] if the contract holds no tokens.
-        pub fn sweep_unclaimed(env: Env, recipient: Address) -> Result<(), AirdropError> {
-            let admin: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Admin)
-                .ok_or(AirdropError::NotInitialized)?;
-
-            admin.require_auth();
-
-            let token_addr: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Token)
-                .ok_or(AirdropError::NotInitialized)?;
-
-            recipient.require_auth();
+            if amount <= 0 {
+                return Err(AirdropError::InvalidAmount);
+            }
 
             if is_claimed(&env, &recipient, &token) {
-            // Duplicate-claim prevention, scoped to this round.
-            let claimed_key = DataKey::Claimed(round_id, recipient.clone());
-            if env
-                .storage()
-                .persistent()
-                .get::<_, bool>(&claimed_key)
-                .unwrap_or(false)
-            {
                 return Err(AirdropError::AlreadyClaimed);
             }
 
-            let leaf = compute_leaf(&env, &recipient, &token, amount);
+            let leaf = compute_leaf(&env, &recipient, &token, amount, tier);
             if !verify_merkle_proof(&env, &leaf, &proof, &root) {
                 return Err(AirdropError::InvalidProof);
             }
 
             ensure_available(&env, &token, amount)?;
 
-            settle_claim(&env, &recipient, &token, amount)?;
+            settle_claim(&env, &recipient, &token, amount, tier)?;
             bump_instance(&env);
             Ok(())
         }
 
-        /// Batch-claim for multiple `(recipient, token, amount)` entries using
+        /// Batch-claim for multiple `(recipient, token, amount, tier)` entries using
         /// a single merkle **multi-proof**.
         ///
         /// Intermediate nodes shared between the entries' paths are hashed
@@ -471,8 +382,10 @@ mod contract {
         /// produced by the multi-proof generator; see
         /// [`soroban_common::verify_merkle_multi_proof`] for the proof format.
         ///
-        /// A relayer may submit on behalf of recipients (tokens always go to
-        /// the recipient in the leaf). All-or-nothing: if any entry is invalid,
+        /// A relayer may submit on behalf of recipients, but every recipient
+        /// must authorize the invocation (`require_auth`), so a relayer or a
+        /// front-runner cannot force a claim the recipient did not sign for.
+        /// Tokens always go to the recipient in the leaf. All-or-nothing: if any entry is invalid,
         /// nothing is claimed.
         ///
         /// # Errors
@@ -488,7 +401,7 @@ mod contract {
         /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover a token's total.
         pub fn claim_batch(
             env: Env,
-            entries: Vec<(Address, Address, i128)>,
+            entries: Vec<(Address, Address, i128, u32)>,
             proof: Vec<BytesN<32>>,
             proof_flags: Vec<bool>,
         ) -> Result<(), AirdropError> {
@@ -500,10 +413,15 @@ mod contract {
 
             // --- Validate all entries before any state change (all-or-nothing) ---
             let mut seen: Map<(Address, Address), bool> = Map::new(&env);
+            let mut authorized: Map<Address, bool> = Map::new(&env);
             let mut totals: Map<Address, i128> = Map::new(&env);
             let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
 
-            for (recipient, token, amount) in entries.iter() {
+            for (recipient, token, amount, tier) in entries.iter() {
+                if !authorized.contains_key(recipient.clone()) {
+                    recipient.require_auth();
+                    authorized.set(recipient.clone(), true);
+                }
                 if amount <= 0 {
                     return Err(AirdropError::InvalidAmount);
                 }
@@ -524,7 +442,7 @@ mod contract {
                     .ok_or(AirdropError::ArithmeticOverflow)?;
                 totals.set(token.clone(), total);
 
-                leaves.push_back(compute_leaf(&env, &recipient, &token, amount));
+                leaves.push_back(compute_leaf(&env, &recipient, &token, amount, tier));
             }
 
             if !verify_merkle_multi_proof(&env, &leaves, &proof, &proof_flags, &root) {
@@ -536,8 +454,8 @@ mod contract {
             }
 
             // --- Apply state changes and transfers ---
-            for (recipient, token, amount) in entries.iter() {
-                settle_claim(&env, &recipient, &token, amount)?;
+            for (recipient, token, amount, tier) in entries.iter() {
+                settle_claim(&env, &recipient, &token, amount, tier)?;
             }
 
             bump_instance(&env);
@@ -595,6 +513,14 @@ mod contract {
             is_claimed(&env, &address, &token)
         }
 
+        /// Returns the tier under which `address` claimed its `token`
+        /// allocation, or `None` if it has not claimed.
+        pub fn get_claimed_tier(env: Env, address: Address, token: Address) -> Option<u32> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ClaimedTier(address, token))
+        }
+
         /// Returns the current merkle root, or `None` if not set.
         pub fn get_root(env: Env) -> Option<Bytes> {
             env.storage().instance().get(&DataKey::MerkleRoot)
@@ -630,196 +556,6 @@ mod contract {
 
 #[cfg(test)]
 mod test;
-            // Checks-effects-interactions: mark claimed before transfer.
-            env.storage().persistent().set(&claimed_key, &true);
-            bump_claimed(&env, round_id, &recipient);
-            let deadline: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::ClaimDeadline)
-                .ok_or(AirdropError::NotInitialized)?;
-            if env.ledger().sequence() <= deadline {
-                return Err(AirdropError::ClaimWindowNotClosed);
-            }
-
-            let token_client = token::Client::new(&env, &token_addr);
-            let balance = token_client.balance(&env.current_contract_address());
-            if balance <= 0 {
-                return Err(AirdropError::NothingToSweep);
-            }
-
-            token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-            bump_instance(&env);
-
-            events::unclaimed_swept(&env, &recipient, balance);
-            Ok(())
-        }
-
-        /// Claim for many recipients in one transaction, skipping invalid entries.
-        ///
-        /// Entries with a non-positive amount, an invalid proof, or a recipient that
-        /// has already claimed this round are skipped rather than reverting the batch.
-        /// Returns the recipients that were successfully paid.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`AirdropError::NotInitialized`] if not initialized.
-        /// Returns [`AirdropError::RootNotSet`] if no merkle root has been set for the round.
-        /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
-        pub fn claim_batch_lenient(
-            env: Env,
-            round_id: u32,
-            claims: Vec<(Address, i128, Vec<BytesN<32>>)>,
-        ) -> Result<Vec<Address>, AirdropError> {
-            let (token_addr, root) = load_claim_context(&env, round_id)?;
-            let token_client = token::Client::new(&env, &token_addr);
-
-            let mut claimed = Vec::new(&env);
-            for (recipient, amount, proof) in claims.iter() {
-                if amount <= 0 {
-                    continue;
-                }
-                let claimed_key = DataKey::Claimed(round_id, recipient.clone());
-                if env.storage().persistent().has(&claimed_key) {
-                    continue;
-                }
-                let leaf = compute_leaf(&env, &recipient, amount);
-                if !verify_proof(&env, leaf, &proof, &root) {
-                    continue;
-                }
-
-                env.storage().persistent().set(&claimed_key, &true);
-                bump_claimed(&env, round_id, &recipient);
-                token_client.transfer(&env.current_contract_address(), &recipient, &amount);
-
-                events::batch_claimed(&env, round_id, &recipient, amount);
-                claimed.push_back(recipient);
-            }
-
-            bump_instance(&env);
-            Ok(claimed)
-        }
-
-        /// Returns `true` if `address` has already claimed in `round_id`.
-        pub fn is_claimed(env: Env, round_id: u32, address: Address) -> bool {
-            env.storage()
-                .persistent()
-                .get::<_, bool>(&DataKey::Claimed(round_id, address))
-                .unwrap_or(false)
-        }
-
-        /// Returns the merkle root for `round_id`, or `None` if not set.
-        pub fn get_root(env: Env, round_id: u32) -> Option<Bytes> {
-            env.storage().instance().get(&DataKey::MerkleRoot(round_id))
-        }
-    }
-}
-
-/// Load the token address and merkle root for a round, rejecting claims after the deadline.
-fn load_claim_context(env: &Env, round_id: u32) -> Result<(Address, BytesN<32>), AirdropError> {
-    let token_addr: Address = env
-        .storage()
-        .instance()
-        .get(&DataKey::Token)
-        .ok_or(AirdropError::NotInitialized)?;
-
-    let root_bytes: Bytes = env
-        .storage()
-        .instance()
-        .get(&DataKey::MerkleRoot(round_id))
-        .ok_or(AirdropError::RootNotSet)?;
-
-    let deadline: u32 = env
-        .storage()
-        .instance()
-        .get(&DataKey::ClaimDeadline)
-        .ok_or(AirdropError::NotInitialized)?;
-    if env.ledger().sequence() > deadline {
-        return Err(AirdropError::ClaimWindowClosed);
-    }
-
-    let root: BytesN<32> = root_bytes
-        .try_into()
-        .map_err(|_| AirdropError::RootNotSet)?;
-    Ok((token_addr, root))
-}
-
-/// Verify and settle a single claim. The caller is responsible for authorizing `recipient`.
-fn execute_claim(
-    env: &Env,
-    round_id: u32,
-    recipient: &Address,
-    amount: i128,
-    proof: &Vec<BytesN<32>>,
-) -> Result<(), AirdropError> {
-    if amount <= 0 {
-        return Err(AirdropError::InvalidAmount);
-    }
-
-    let (token_addr, root) = load_claim_context(env, round_id)?;
-
-    // Duplicate-claim prevention, scoped to this round.
-    let claimed_key = DataKey::Claimed(round_id, recipient.clone());
-    if env.storage().persistent().has(&claimed_key) {
-        return Err(AirdropError::AlreadyClaimed);
-    }
-
-    let leaf = compute_leaf(env, recipient, amount);
-    if !verify_proof(env, leaf, proof, &root) {
-        return Err(AirdropError::InvalidProof);
-    }
-
-    // Checks-effects-interactions: mark claimed before transfer.
-    env.storage().persistent().set(&claimed_key, &true);
-    bump_claimed(env, round_id, recipient);
-    bump_instance(env);
-
-    token::Client::new(env, &token_addr).transfer(
-        &env.current_contract_address(),
-        recipient,
-        &amount,
-    );
-    Ok(())
-}
-
-/// Domain-separation tag for [`AirdropContract::claim_for`] payloads.
-const CLAIM_FOR_DOMAIN: &[u8] = b"soroban-airdrop:claim_for:v1";
-
-/// Build the payload a recipient signs to authorize a sponsored claim:
-/// `domain || network_id || contract_xdr || round_id_be || recipient_xdr || amount_be`.
-fn claim_for_payload(env: &Env, round_id: u32, recipient: &Address, amount: i128) -> Bytes {
-    let mut payload = Bytes::from_slice(env, CLAIM_FOR_DOMAIN);
-    payload.append(&Bytes::from(env.ledger().network_id()));
-    payload.append(&env.current_contract_address().to_xdr(env));
-    payload.append(&Bytes::from_slice(env, &round_id.to_be_bytes()));
-    payload.append(&recipient.clone().to_xdr(env));
-    payload.append(&Bytes::from_slice(env, &amount.to_be_bytes()));
-    payload
-}
-
-/// XDR prefix of an `ScVal::Address(ScAddress::Account(PublicKey::Ed25519(..)))`:
-/// ScVal type 18 (address), ScAddress type 0 (account), PublicKey type 0 (ed25519).
-const ACCOUNT_ED25519_XDR_PREFIX: [u8; 12] = [0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0];
-const ACCOUNT_ED25519_XDR_PREFIX_LEN: u32 = 12;
-const ACCOUNT_ED25519_XDR_LEN: u32 = ACCOUNT_ED25519_XDR_PREFIX_LEN + 32;
-
-/// Extract the ed25519 public key behind a `G...` account address.
-fn account_public_key(env: &Env, address: &Address) -> Result<BytesN<32>, AirdropError> {
-    let xdr = address.clone().to_xdr(env);
-    if xdr.len() != ACCOUNT_ED25519_XDR_LEN
-        || xdr.slice(..ACCOUNT_ED25519_XDR_PREFIX_LEN)
-            != Bytes::from_array(env, &ACCOUNT_ED25519_XDR_PREFIX)
-    {
-        return Err(AirdropError::InvalidSignature);
-    }
-    xdr.slice(ACCOUNT_ED25519_XDR_PREFIX_LEN..)
-        .try_into()
-        .map_err(|_| AirdropError::InvalidSignature)
-}
-
-#[cfg(test)]
-mod test;
 
 #[cfg(test)]
 mod prop_test;
-

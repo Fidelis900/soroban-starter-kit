@@ -20,26 +20,17 @@ pub enum VestingError {
     ArithmeticError = 11,
     ScheduleIrrevocable = 12,
     BeneficiaryAlreadyExists = 13,
-    RevocationPending = 11,
-    RevocationNotPending = 12,
-    RevocationDelayNotElapsed = 13,
+    RevocationNotDue = 14,
+    MilestoneAlreadyReleased = 15,
+    ClaimBelowMinimum = 16,
+    RotationNotFound = 17,
+    RotationPending = 18,
+    RotationTimelockActive = 19,
+    InvalidBeneficiary = 20,
 }
 
 impl_display_error!(
     VestingError,
-    AlreadyInitialized    => "already initialized",
-    NotInitialized        => "not initialized",
-    NotAuthorized         => "not authorized",
-    InvalidAmount         => "invalid amount",
-    InvalidSchedule       => "invalid schedule",
-    NothingToClaim        => "nothing to claim",
-    AlreadyRevoked        => "already revoked",
-    CliffAlreadyPassed    => "cliff already passed",
-    ScheduleAlreadyExists => "schedule already exists",
-    ScheduleNotFound      => "schedule not found",
-    ArithmeticError       => "arithmetic error",
-    ScheduleIrrevocable   => "schedule irrevocable",
-    BeneficiaryAlreadyExists => "beneficiary already exists",
     AlreadyInitialized       => "already initialized",
     NotInitialized           => "not initialized",
     NotAuthorized            => "not authorized",
@@ -50,9 +41,16 @@ impl_display_error!(
     CliffAlreadyPassed       => "cliff already passed",
     ScheduleAlreadyExists    => "schedule already exists",
     ScheduleNotFound         => "schedule not found",
-    RevocationPending        => "revocation pending",
-    RevocationNotPending     => "revocation not pending",
-    RevocationDelayNotElapsed => "revocation delay not elapsed",
+    ArithmeticError          => "arithmetic error",
+    ScheduleIrrevocable      => "schedule irrevocable",
+    BeneficiaryAlreadyExists => "beneficiary already exists",
+    RevocationNotDue         => "revocation not due",
+    MilestoneAlreadyReleased => "milestone already released",
+    ClaimBelowMinimum        => "claim below minimum",
+    RotationNotFound         => "rotation not found",
+    RotationPending          => "rotation pending",
+    RotationTimelockActive   => "rotation timelock active",
+    InvalidBeneficiary       => "invalid beneficiary",
 );
 
 #[cfg(test)]
@@ -79,10 +77,14 @@ VestingError::ScheduleAlreadyExists = {}\n\
 VestingError::ScheduleNotFound = {}\n\
 VestingError::ArithmeticError = {}\n\
 VestingError::ScheduleIrrevocable = {}\n\
-VestingError::BeneficiaryAlreadyExists = {}\n",
-VestingError::RevocationPending = {}\n\
-VestingError::RevocationNotPending = {}\n\
-VestingError::RevocationDelayNotElapsed = {}\n",
+VestingError::BeneficiaryAlreadyExists = {}\n\
+VestingError::RevocationNotDue = {}\n\
+VestingError::MilestoneAlreadyReleased = {}\n\
+VestingError::ClaimBelowMinimum = {}\n\
+VestingError::RotationNotFound = {}\n\
+VestingError::RotationPending = {}\n\
+VestingError::RotationTimelockActive = {}\n\
+VestingError::InvalidBeneficiary = {}\n",
             VestingError::AlreadyInitialized as u32,
             VestingError::NotInitialized as u32,
             VestingError::NotAuthorized as u32,
@@ -96,9 +98,13 @@ VestingError::RevocationDelayNotElapsed = {}\n",
             VestingError::ArithmeticError as u32,
             VestingError::ScheduleIrrevocable as u32,
             VestingError::BeneficiaryAlreadyExists as u32,
-            VestingError::RevocationPending as u32,
-            VestingError::RevocationNotPending as u32,
-            VestingError::RevocationDelayNotElapsed as u32,
+            VestingError::RevocationNotDue as u32,
+            VestingError::MilestoneAlreadyReleased as u32,
+            VestingError::ClaimBelowMinimum as u32,
+            VestingError::RotationNotFound as u32,
+            VestingError::RotationPending as u32,
+            VestingError::RotationTimelockActive as u32,
+            VestingError::InvalidBeneficiary as u32,
         )
     }
 
