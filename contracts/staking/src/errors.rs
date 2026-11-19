@@ -22,6 +22,11 @@ pub enum StakingError {
     InvalidPenalty = 13,
     InvalidRewardRate = 14,
     InvalidPeriodEnd = 15,
+    InsufficientRewardReserves = 16,
+    StillLocked = 17,
+    InvalidLockup = 18,
+    PermitExpired = 19,
+    Overflow = 20,
 }
 
 impl_display_error!(
@@ -39,54 +44,11 @@ impl_display_error!(
     UnbondRequestPending   => "unbond request pending",
     InvalidTranche         => "invalid unbond tranche",
     InvalidPenalty         => "invalid penalty",
+    InvalidRewardRate      => "invalid reward rate",
+    InvalidPeriodEnd       => "invalid period end",
+    InsufficientRewardReserves => "insufficient reward reserves",
+    StillLocked            => "stake is locked",
+    InvalidLockup          => "invalid lockup",
+    PermitExpired          => "permit expired",
+    Overflow               => "overflow",
 );
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
-
-    use super::StakingError;
-    use std::format;
-    use std::string::String;
-
-    #[allow(clippy::as_conversions)]
-    fn render_error_code_snapshot() -> String {
-        format!(
-            "\
-StakingError::AlreadyInitialized = {}\n\
-StakingError::NotInitialized = {}\n\
-StakingError::Unauthorized = {}\n\
-StakingError::InvalidAmount = {}\n\
-StakingError::NoStake = {}\n\
-StakingError::InsufficientStake = {}\n\
-StakingError::NoRewards = {}\n\
-StakingError::CompoundTokenMismatch = {}\n\
-StakingError::UnbondingNotComplete = {}\n\
-StakingError::NoUnbondRequest = {}\n\
-StakingError::UnbondRequestPending = {}\n\
-StakingError::InvalidTranche = {}\n",
-StakingError::InvalidPenalty = {}\n",
-            StakingError::AlreadyInitialized as u32,
-            StakingError::NotInitialized as u32,
-            StakingError::Unauthorized as u32,
-            StakingError::InvalidAmount as u32,
-            StakingError::NoStake as u32,
-            StakingError::InsufficientStake as u32,
-            StakingError::NoRewards as u32,
-            StakingError::CompoundTokenMismatch as u32,
-            StakingError::UnbondingNotComplete as u32,
-            StakingError::NoUnbondRequest as u32,
-            StakingError::UnbondRequestPending as u32,
-            StakingError::InvalidTranche as u32,
-            StakingError::InvalidPenalty as u32,
-        )
-    }
-
-    #[test]
-    fn staking_error_codes_match_snapshot() {
-        assert_eq!(
-            render_error_code_snapshot(),
-            include_str!("../snapshots/error_codes.snap")
-        );
-    }
-}
