@@ -522,3 +522,29 @@ fn test_subscribe_with_zero_trial_ledgers_skips_trial() {
     assert_eq!(token_client.balance(&provider), 100);
     assert_eq!(token_client.balance(&subscriber), 400);
 }
+#[test]
+fn revenue_accumulates_in_escrow_and_is_withdrawn_at_threshold() {
+    let env = setup_env();
+    let (client, contract_addr, provider, token) = setup(&env);
+    let plan = Symbol::new(&env, "plan");
+    client.register_plan(&plan, &100, &10, &0, &0);
+    let subscriber = Address::generate(&env);
+    approve_and_subscribe(&env, &client, &contract_addr, &token, &subscriber, &plan, 1_000, None);
+    client.set_min_payout_threshold(&provider, &150);
+
+    client.charge(&subscriber, &plan);
+    assert_eq!(client.get_provider_revenue(&provider), 100);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 100);
+    assert_eq!(
+        client.try_withdraw_provider_revenue(&provider),
+        Err(Ok(SubscriptionError::BelowPayoutThreshold))
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.charge(&subscriber, &plan);
+    assert_eq!(client.get_provider_revenue(&provider), 200);
+    assert_eq!(client.withdraw_provider_revenue(&provider), 200);
+    assert_eq!(client.get_provider_revenue(&provider), 0);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&provider), 200);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 0);
+}

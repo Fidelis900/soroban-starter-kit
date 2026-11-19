@@ -117,14 +117,22 @@ fn charge_one(
     // `try_` isolates a failed transfer (insufficient allowance or balance) so
     // it can be recorded as a delinquency instead of aborting the transaction.
     // Soroban forbids contract re-entrancy, so writing state after the call is safe.
+    // Revenue is accumulated in contract escrow instead of being paid out on
+    // every charge, avoiding a micro-transfer per billing cycle.
     let transfer = token_client.try_transfer_from(
         &env.current_contract_address(),
         subscriber,
-        provider,
+        &env.current_contract_address(),
         &info.amount,
     );
 
     if matches!(transfer, Ok(Ok(()))) {
+        let revenue_key = DataKey::ProviderRevenue(provider.clone());
+        let accumulated: i128 = env.storage().persistent().get(&revenue_key).unwrap_or(0);
+        env.storage().persistent().set(
+            &revenue_key,
+            &accumulated.saturating_add(info.amount),
+        );
         info.last_charged_ledger = current_ledger;
         info.failed_charges_count = 0;
         info.delinquent_since_ledger = None;
@@ -1053,6 +1061,64 @@ mod contract {
         /// Return the grace period (in ledgers) applied to delinquent subscriptions.
         pub fn get_grace_period(env: Env) -> u32 {
             grace_period(&env)
+        }
+
+        /// Set the minimum accumulated revenue required before the provider
+        /// may withdraw. Provider-only.
+        pub fn set_min_payout_threshold(
+            env: Env,
+            provider: Address,
+            threshold: i128,
+        ) -> Result<(), SubscriptionError> {
+            provider.require_auth();
+            if threshold <= 0 {
+                return Err(SubscriptionError::InvalidPayoutThreshold);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::MinPayoutThreshold(provider), &threshold);
+            Ok(())
+        }
+
+        /// Withdraw all accumulated provider revenue in a single payout once
+        /// the configured threshold has been reached.
+        pub fn withdraw_provider_revenue(
+            env: Env,
+            provider: Address,
+        ) -> Result<i128, SubscriptionError> {
+            provider.require_auth();
+            let threshold: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MinPayoutThreshold(provider.clone()))
+                .ok_or(SubscriptionError::PayoutThresholdNotSet)?;
+            let revenue_key = DataKey::ProviderRevenue(provider.clone());
+            let revenue: i128 = env.storage().persistent().get(&revenue_key).unwrap_or(0);
+            if revenue < threshold {
+                return Err(SubscriptionError::BelowPayoutThreshold);
+            }
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            if revenue > 0 {
+                token::Client::new(&env, &token_addr).transfer(
+                    &env.current_contract_address(),
+                    &provider,
+                    &revenue,
+                );
+            }
+            env.storage().persistent().set(&revenue_key, &0i128);
+            Ok(revenue)
+        }
+
+        /// Return the provider's currently accumulated (unpaid) revenue.
+        pub fn get_provider_revenue(env: Env, provider: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ProviderRevenue(provider))
+                .unwrap_or(0)
         }
     }
 }
