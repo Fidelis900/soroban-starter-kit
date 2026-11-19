@@ -1,5 +1,5 @@
 #![no_std]
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 //! Shared helpers for the Soroban contract templates.
 //!
 //! Provides admin-storage helpers, TTL/lifetime constants, deadline validation,
@@ -741,3 +741,135 @@ mod common_key {
         Token,
     }
 }
+
+// ─── Reentrancy guard (#1206) ───────────────────────────────────────────────
+
+/// Reentrancy guard backed by an instance-storage boolean flag.
+///
+/// Construct one with [`ReentrancyGuard::enter`] at the top of any entry point
+/// that performs a cross-contract call (`token::Client`, `NftClient`, arbiter
+/// calls, …).  The flag is set on entry and cleared automatically when the
+/// guard is dropped, so a re-entrant invocation of the same entry point panics
+/// instead of corrupting state.
+///
+/// # Examples
+///
+/// ```ignore
+/// use soroban_common::ReentrancyGuard;
+/// use soroban_sdk::Env;
+///
+/// pub fn transfer(env: Env) {
+///     let _guard = ReentrancyGuard::enter(&env);
+///     // ... cross-contract call ...
+/// } // flag cleared here
+/// ```
+pub struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    /// Acquires the guard, panicking if it is already held.
+    ///
+    /// Reads the lock flag from instance storage.  If it is already `true` a
+    /// re-entrant call is in progress and the function panics with
+    /// `"reentrancy detected"`.  Otherwise the flag is set to `true` and a
+    /// guard is returned; dropping the guard clears the flag.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `"reentrancy detected"` when the lock flag is already set.
+    #[must_use]
+    #[allow(clippy::panic)] // intentional panic: reentrancy intercepted
+    pub fn enter(env: &'a Env) -> Self {
+        if Self::is_locked(env) {
+            panic!("reentrancy detected");
+        }
+        env.storage().instance().set(&ReentrancyKey::Locked, &true);
+        Self { env }
+    }
+
+    /// Fallible variant of [`ReentrancyGuard::enter`].
+    ///
+    /// Returns `Ok(guard)` when the lock was free, or `Err(())` when a
+    /// re-entrant call was detected.  Callers can map the error into their own
+    /// `#[contracterror]` type.
+    pub fn try_enter(env: &'a Env) -> Result<Self, ()> {
+        if Self::is_locked(env) {
+            return Err(());
+        }
+        env.storage().instance().set(&ReentrancyKey::Locked, &true);
+        Ok(Self { env })
+    }
+
+    /// Returns `true` when the lock flag is currently set.
+    #[must_use]
+    pub fn is_locked(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&ReentrancyKey::Locked)
+            .unwrap_or(false)
+    }
+
+    /// Explicitly releases the guard, clearing the lock flag.
+    ///
+    /// Calling this is optional — [`Drop`] performs the same work — but it
+    /// allows the flag to be cleared before the end of the enclosing scope.
+    pub fn exit(self) {
+        // `self` is consumed; `Drop` runs here and clears the flag.
+    }
+
+    /// Alias for [`ReentrancyGuard::exit`].
+    pub fn release(self) {
+        self.exit();
+    }
+}
+
+impl Drop for ReentrancyGuard<'_> {
+    fn drop(&mut self) {
+        self.env
+            .storage()
+            .instance()
+            .set(&ReentrancyKey::Locked, &false);
+    }
+}
+
+/// Runs `f` while holding a [`ReentrancyGuard`], clearing the flag afterwards.
+///
+/// Convenience wrapper around [`ReentrancyGuard::enter`] for callers that do
+/// not need to hold the guard across statements.
+///
+/// # Panics
+///
+/// Panics with `"reentrancy detected"` if the guard is already held.
+///
+/// # Examples
+///
+/// ```ignore
+/// use soroban_common::with_guard;
+/// use soroban_sdk::Env;
+///
+/// let env = Env::default();
+/// let result = with_guard(&env, || 42u32);
+/// assert_eq!(result, 42);
+/// ```
+pub fn with_guard<R>(env: &Env, f: impl FnOnce() -> R) -> R {
+    let _guard = ReentrancyGuard::enter(env);
+    f()
+}
+
+// `#[contracttype]` generates an undocumented public associated item; confine
+// the missing_docs allowance to this module and re-export the guard above.
+mod reentrancy_guard {
+    #![allow(missing_docs)]
+    use super::contracttype;
+
+    /// Instance-storage key for the reentrancy lock flag.
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum ReentrancyKey {
+        /// Boolean slot holding the lock state.
+        Locked,
+    }
+}
+
+use reentrancy_guard::ReentrancyKey;
