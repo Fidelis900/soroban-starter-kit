@@ -330,3 +330,51 @@ fn prop_reward_pool_never_insolvent() {
         }
     }
 }
+
+// ── #1454 emergency unstake ──────────────────────────────────────────────────
+
+#[test]
+fn emergency_unstake_during_pause_with_penalty() {
+    let c = setup(0);
+    at(&c, 10);
+    fund_rewards(&c, 10_000);
+    let u = user(&c, 1000);
+    c.client.stake(&u, &1000);
+    c.client.set_reward_rate(&1, &1000);
+    
+    at(&c, 110); // accrue 100 ledgers of rewards
+    assert!(c.client.pending_rewards(&u) > 0);
+    
+    // Cannot emergency unstake when not paused
+    assert_eq!(
+        c.client.try_emergency_unstake(&u),
+        Err(Ok(StakingError::ContractNotPaused))
+    );
+    
+    // Pause contract and set 10% penalty
+    c.client.pause();
+    c.client.set_emergency_penalty(&1000); // 10% = 1000 bps
+    assert!(c.client.is_paused());
+    
+    // Emergency unstake forfeits rewards and applies penalty
+    let returned = c.client.emergency_unstake(&u);
+    
+    // Should return 900 (1000 - 10% penalty), 100 burned
+    assert_eq!(returned, 900);
+    assert_eq!(c.client.stake_of(&u), 0);
+    assert_eq!(c.client.pending_rewards(&u), 0); // rewards forfeited
+    assert_eq!(TokenClient::new(&c.env, &c.stake_token).balance(&u), 900);
+}
+
+#[test]
+fn emergency_unstake_requires_pause() {
+    let c = setup(0);
+    let u = user(&c, 1000);
+    c.client.stake(&u, &1000);
+    
+    assert_eq!(
+        c.client.try_emergency_unstake(&u),
+        Err(Ok(StakingError::ContractNotPaused))
+    );
+}
+

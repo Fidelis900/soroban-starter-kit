@@ -31,6 +31,7 @@ pub enum StakingError {
     UnauthorizedSlasher = 22,
     NoPendingUnbond = 23,
     InvalidSaturationConfig = 24,
+    ContractNotPaused = 25,
 }
 
 impl_display_error!(
@@ -59,4 +60,5 @@ impl_display_error!(
     UnauthorizedSlasher    => "unauthorized slasher",
     NoPendingUnbond        => "no pending unbond request",
     InvalidSaturationConfig => "invalid saturation config",
+    ContractNotPaused      => "contract not paused",
 );

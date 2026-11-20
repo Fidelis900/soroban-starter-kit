@@ -196,6 +196,10 @@ fn validate_bounds(start: u32, cliff: u32, end: u32, now: u32) -> Result<(), Ves
     if start < now || cliff < start || end <= cliff {
         return Err(VestingError::InvalidScheduleBounds);
     }
+    // Additional validation: start_ledger <= cliff_ledger <= end_ledger
+    if start > cliff || cliff > end {
+        return Err(VestingError::InvalidScheduleTimeline);
+    }
     Ok(())
 }
 
@@ -743,6 +747,31 @@ mod contract {
             }
             schedule.revocation_pending = false;
             Self::apply_revocation(&env, &beneficiary, schedule, finalize)
+        }
+
+        /// Revoke a grant immediately, calculating vested tokens up to current ledger.
+        /// Distributes vested amount to beneficiary and returns unvested to treasury.
+        /// Only works for grants flagged as revocable.
+        ///
+        /// Returns `(vested_paid_to_beneficiary, unvested_returned_to_treasury)`.
+        ///
+        /// # Errors
+        /// - [`VestingError::ScheduleIrrevocable`] if not revocable.
+        /// - [`VestingError::AlreadyRevoked`] if already revoked.
+        pub fn revoke_grant(
+            env: Env,
+            grant_id: Address,
+        ) -> Result<(i128, i128), VestingError> {
+            get_admin(&env)?.require_auth();
+            let schedule = load_schedule(&env, &grant_id)?;
+            if !schedule.is_revocable {
+                return Err(VestingError::ScheduleIrrevocable);
+            }
+            if schedule.revoked {
+                return Err(VestingError::AlreadyRevoked);
+            }
+            let now = env.ledger().sequence();
+            Self::apply_revocation(&env, &grant_id, schedule, now)
         }
 
         /// Admin emergency release of all remaining tokens to the beneficiary.
