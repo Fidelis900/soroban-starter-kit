@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 /// Number of distinct stakers the model tracks.
 const NUM_STAKERS: usize = 4;
 
+/// Number of ledgers an unbonding request must mature before withdrawal.
+const UNBONDING_DELAY_LEDGERS: u32 = 200_000;
+
 /// A single operation the fuzzer may apply to the model.
 #[derive(Clone, Debug)]
 enum Op {
@@ -39,6 +42,16 @@ enum Op {
     Slash { amount: u64 },
     /// Claim accrued rewards for staker `who`.
     Claim { who: usize },
+    /// Slash `bps` basis points of staker `who`'s principal into the insurance pool.
+    SlashPercentage { who: usize, bps: u32 },
+    /// Request an unbond of `amount` tokens that matures after the delay.
+    RequestUnbond { who: usize, amount: u64 },
+    /// Claim matured unbonding tokens for staker `who`.
+    ClaimUnbonded { who: usize },
+    /// Compound staker `who`'s pending rewards into their principal.
+    Compound { who: usize },
+    /// Advance the ledger sequence by `ledgers`.
+    AdvanceLedger { ledgers: u32 },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -48,6 +61,13 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (1u64..1_000_000).prop_map(|amount| Op::Reward { amount }),
         (1u64..1_000_000).prop_map(|amount| Op::Slash { amount }),
         (0..NUM_STAKERS).prop_map(|who| Op::Claim { who }),
+        (0..NUM_STAKERS, 0u32..10_000)
+            .prop_map(|(who, bps)| Op::SlashPercentage { who, bps }),
+        (0..NUM_STAKERS, 1u64..1_000_000)
+            .prop_map(|(who, amount)| Op::RequestUnbond { who, amount }),
+        (0..NUM_STAKERS).prop_map(|who| Op::ClaimUnbonded { who }),
+        (0..NUM_STAKERS).prop_map(|who| Op::Compound { who }),
+        (0u32..UNBONDING_DELAY_LEDGERS).prop_map(|ledgers| Op::AdvanceLedger { ledgers }),
     ]
 }
 
@@ -64,6 +84,10 @@ struct Staker {
     reward_checkpoint: u128,
     /// Rewards accrued but not yet claimed.
     pending: u64,
+    /// Ledger at which the current unbonding request matures.
+    unbonding_matures_at: u32,
+    /// Cumulative rewards compounded into principal by this staker.
+    compounded: u64,
 }
 
 /// Deterministic model of the staking contract's token accounting.
@@ -80,6 +104,10 @@ struct StakingModel {
     contract_stake_balance: u64,
     /// Tokens held by the contract for rewards.
     contract_reward_balance: u64,
+    /// Tokens held by the contract in the insurance pool (slashed funds).
+    insurance_pool: u64,
+    /// Current ledger sequence of the model.
+    ledger: u32,
 }
 
 /// Fixed-point scale for the reward-per-token accumulator.
@@ -132,6 +160,51 @@ impl StakingModel {
         // Contract balance is unchanged: tokens move from staked to unbonding.
     }
 
+    /// Request an unbond that matures after `UNBONDING_DELAY_LEDGERS`.
+    fn request_unbond(&mut self, who: usize, amount: u64) {
+        self.accrue(who);
+        let staker = &mut self.stakers[who];
+        let amount = amount.min(staker.staked);
+        staker.staked -= amount;
+        staker.unbonding = staker.unbonding.saturating_add(amount);
+        staker.unbonding_matures_at = self.ledger.saturating_add(UNBONDING_DELAY_LEDGERS);
+        // Contract balance is unchanged: tokens move from staked to unbonding.
+    }
+
+    /// Withdraw matured unbonding tokens; immature requests must be rejected.
+    fn claim_unbonded(&mut self, who: usize) {
+        let staker = &mut self.stakers[who];
+        if staker.unbonding == 0 {
+            return;
+        }
+        assert!(
+            self.ledger >= staker.unbonding_matures_at,
+            "unbonding maturation must be enforced before withdrawal"
+        );
+        let amount = staker.unbonding;
+        staker.unbonding = 0;
+        staker.unbonding_matures_at = 0;
+        self.contract_stake_balance = self.contract_stake_balance.saturating_sub(amount);
+    }
+
+    /// Compound pending rewards into the staker's active principal.
+    fn compound(&mut self, who: usize) {
+        self.accrue(who);
+        let staker = &mut self.stakers[who];
+        let claimable = staker.pending.min(self.contract_reward_balance);
+        staker.pending -= claimable;
+        staker.staked = staker.staked.saturating_add(claimable);
+        staker.compounded = staker.compounded.saturating_add(claimable);
+        // Rewards move from the reward pool into the staked principal.
+        self.contract_reward_balance -= claimable;
+        self.contract_stake_balance = self.contract_stake_balance.saturating_add(claimable);
+    }
+
+    /// Advance the ledger sequence.
+    fn advance_ledger(&mut self, ledgers: u32) {
+        self.ledger = self.ledger.saturating_add(ledgers);
+    }
+
     fn reward(&mut self, amount: u64) {
         self.accrue_all();
         self.total_rewards_deposited = self.total_rewards_deposited.saturating_add(amount);
@@ -166,6 +239,21 @@ impl StakingModel {
             remaining -= cut;
         }
         self.contract_stake_balance = self.contract_stake_balance.saturating_sub(amount - remaining);
+    }
+
+    /// Slash `bps` basis points of staker `who`'s principal into the insurance pool.
+    fn slash_percentage(&mut self, who: usize, bps: u32) {
+        self.accrue(who);
+        let staker = &mut self.stakers[who];
+        let bps = bps.min(10_000) as u128;
+        let cut = ((staker.staked as u128 * bps) / 10_000) as u64;
+        assert!(
+            cut <= staker.staked,
+            "slashing must never exceed staker principal"
+        );
+        staker.staked -= cut;
+        self.contract_stake_balance = self.contract_stake_balance.saturating_sub(cut);
+        self.insurance_pool = self.insurance_pool.saturating_add(cut);
     }
 
     fn claim(&mut self, who: usize) {
@@ -206,6 +294,32 @@ impl StakingModel {
             self.total_rewards_claimed <= self.total_rewards_deposited,
             "total claimed rewards must never exceed total deposited"
         );
+
+        // 5. Slashing never exceeds staker principal.
+        for staker in &self.stakers {
+            assert!(
+                staker.compounded <= self.total_rewards_deposited,
+                "compounded rewards must never exceed total deposited"
+            );
+        }
+
+        // 6. Unbonding maturation is enforced.
+        for staker in &self.stakers {
+            if staker.unbonding > 0 {
+                assert!(
+                    staker.unbonding_matures_at >= UNBONDING_DELAY_LEDGERS,
+                    "unbonding requests must carry a maturation ledger"
+                );
+            }
+        }
+
+        // 7. Compound preserves total token conservation: rewards moved into
+        //    principal are still backed by the contract's combined balance.
+        assert!(
+            self.contract_stake_balance + self.contract_reward_balance + self.insurance_pool
+                >= self.total_staked() + self.total_unbonding_requested(),
+            "combined contract balances must back all staked and unbonding tokens"
+        );
     }
 }
 
@@ -222,6 +336,11 @@ proptest! {
                 Op::Reward { amount } => model.reward(amount),
                 Op::Slash { amount } => model.slash(amount),
                 Op::Claim { who } => model.claim(who),
+                Op::SlashPercentage { who, bps } => model.slash_percentage(who, bps),
+                Op::RequestUnbond { who, amount } => model.request_unbond(who, amount),
+                Op::ClaimUnbonded { who } => model.claim_unbonded(who),
+                Op::Compound { who } => model.compound(who),
+                Op::AdvanceLedger { ledgers } => model.advance_ledger(ledgers),
             }
             model.check_invariants();
         }

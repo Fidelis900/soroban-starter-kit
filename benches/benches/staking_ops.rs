@@ -171,6 +171,122 @@ fn bench_add_rewards(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_slash(c: &mut Criterion) {
+    let mut group = c.benchmark_group("staking_slash");
+
+    group.bench_function("slash", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let reward_token = deploy_token(&env, &admin);
+            let staking_token = deploy_token(&env, &admin);
+
+            client.initialize(&admin, &staking_token, &reward_token);
+
+            let staker = Address::generate(&env);
+            mint(&env, &staking_token, &staker, 1_000_000);
+
+            client.stake(&staker, &100_000);
+
+            // Slash 10% of the staker's principal.
+            client.slash(&admin, &staker, &1_000);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_request_unbond(c: &mut Criterion) {
+    let mut group = c.benchmark_group("staking_request_unbond");
+
+    group.bench_function("request_unbond", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let reward_token = deploy_token(&env, &admin);
+            let staking_token = deploy_token(&env, &admin);
+
+            client.initialize(&admin, &staking_token, &reward_token);
+
+            let staker = Address::generate(&env);
+            mint(&env, &staking_token, &staker, 1_000_000);
+
+            client.stake(&staker, &100_000);
+
+            client.request_unbond(&staker, &100_000);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_claim_unbonded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("staking_claim_unbonded");
+
+    group.bench_function("claim_unbonded", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let reward_token = deploy_token(&env, &admin);
+            let staking_token = deploy_token(&env, &admin);
+
+            client.initialize(&admin, &staking_token, &reward_token);
+
+            let staker = Address::generate(&env);
+            mint(&env, &staking_token, &staker, 1_000_000);
+
+            client.stake(&staker, &100_000);
+            client.request_unbond(&staker, &100_000);
+
+            // Advance the ledger past the unbonding maturation delay.
+            env.ledger().with_mut(|li| {
+                li.sequence_number += 200_000;
+                li.timestamp += 200_000;
+            });
+
+            client.claim_unbonded(&staker);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_compound(c: &mut Criterion) {
+    let mut group = c.benchmark_group("staking_compound");
+
+    group.bench_function("compound", |b| {
+        b.iter(|| {
+            let (env, client, admin) = setup();
+            let reward_token = deploy_token(&env, &admin);
+            let staking_token = deploy_token(&env, &admin);
+
+            client.initialize(&admin, &staking_token, &reward_token);
+
+            let staker = Address::generate(&env);
+            mint(&env, &staking_token, &staker, 1_000_000);
+            mint(&env, &reward_token, &admin, 1_000_000);
+
+            client.stake(&staker, &100_000);
+            client.add_rewards(&admin, &50_000);
+
+            // Advance the ledger so rewards accrue before compounding.
+            env.ledger().with_mut(|li| {
+                li.sequence_number += 1_000;
+                li.timestamp += 1_000;
+            });
+
+            client.compound(&staker);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_initialize,
@@ -178,5 +294,9 @@ criterion_group!(
     bench_unstake,
     bench_claim_rewards,
     bench_add_rewards,
+    bench_slash,
+    bench_request_unbond,
+    bench_claim_unbonded,
+    bench_compound,
 );
 criterion_main!(benches);
