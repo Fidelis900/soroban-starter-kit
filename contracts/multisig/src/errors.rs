@@ -38,6 +38,14 @@ pub enum MultisigError {
     SpendingLimitExceeded = 14,
     /// Invalid spending limit configuration.
     InvalidSpendingLimit = 15,
+    /// Duplicate signatures from the same signer were provided.
+    DuplicateSignature = 16,
+    /// The new signer is already an existing signer.
+    SignerAlreadyExists = 17,
+    /// The signer to replace does not exist.
+    SignerNotFound = 18,
+    /// The batch of proposals is empty.
+    BatchEmpty = 19,
 }
 
 impl_display_error!(
@@ -57,4 +65,8 @@ impl_display_error!(
     NotYetExpired        => "not yet expired",
     SpendingLimitExceeded => "spending limit exceeded",
     InvalidSpendingLimit  => "invalid spending limit",
+    DuplicateSignature    => "duplicate signature",
+    SignerAlreadyExists   => "signer already exists",
+    SignerNotFound        => "signer not found",
+    BatchEmpty            => "batch empty",
 );

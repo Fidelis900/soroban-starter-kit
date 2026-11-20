@@ -1,8 +1,9 @@
 //! Criterion benchmarks for the Multisig contract.
 //!
 //! Measures CPU instruction cost for the primary state-changing entry points:
-//! `initialize`, `submit_transaction`, `confirm_transaction`, and
-//! `execute_transaction`.
+//! `initialize`, `submit_transaction`, `confirm_transaction`,
+//! `execute_transaction`, and `execute_batch` (compared against executing the
+//! same number of proposals individually).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -107,6 +108,59 @@ fn bench_confirm_transaction(c: &mut Criterion) {
     group.finish();
 }
 
+/// Number of proposals executed in the batch benchmark scenarios.
+const BATCH_SIZE: u32 = 3;
+
+/// Submits and confirms `count` transactions, returning their ids.
+fn prepare_approved_transactions(
+    env: &Env,
+    client: &MultisigContractClient,
+    owners: &Vec<Address>,
+    count: u32,
+) -> Vec<u64> {
+    let mut tx_ids = Vec::new(env);
+    for _ in 0..count {
+        let target = Address::generate(env);
+        let payload = BytesN::from_array(env, &[0u8; 32]);
+        let tx_id = client.submit_transaction(&owners.get(0).unwrap(), &target, &payload);
+        client.confirm_transaction(&owners.get(1).unwrap(), &tx_id);
+        tx_ids.push_back(tx_id);
+    }
+    tx_ids
+}
+
+/// Benchmarks `execute_batch` against executing the same number of proposals
+/// individually, to quantify the gas savings from batched execution.
+fn bench_execute_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multisig_execute_batch");
+
+    group.bench_function("execute_batch", |b| {
+        b.iter(|| {
+            let (env, client, owners) = setup();
+            let tx_ids = prepare_approved_transactions(&env, &client, &owners, BATCH_SIZE);
+
+            client.execute_batch(&owners.get(0).unwrap(), &tx_ids);
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.bench_function("execute_individually", |b| {
+        b.iter(|| {
+            let (env, client, owners) = setup();
+            let tx_ids = prepare_approved_transactions(&env, &client, &owners, BATCH_SIZE);
+
+            for tx_id in tx_ids.iter() {
+                client.execute_transaction(&owners.get(0).unwrap(), &tx_id);
+            }
+
+            env.budget().cpu_instruction_cost()
+        });
+    });
+
+    group.finish();
+}
+
 /// Benchmarks `execute_transaction` once the threshold has been reached.
 fn bench_execute_transaction(c: &mut Criterion) {
     let mut group = c.benchmark_group("multisig_execute_transaction");
@@ -136,5 +190,6 @@ criterion_group!(
     bench_submit_transaction,
     bench_confirm_transaction,
     bench_execute_transaction,
+    bench_execute_batch,
 );
 criterion_main!(benches);

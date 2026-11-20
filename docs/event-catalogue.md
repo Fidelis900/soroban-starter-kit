@@ -99,7 +99,9 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Signer Change Proposed | `signer_change_proposed` | `(Symbol, Address)` → event name, proposer | `u64` → signer proposal ID | `propose_signer_change()` called |
 | Signer Change Signed | `signer_change_signed` | `(Symbol, Address, u64)` → event name, signer, proposal ID | `u32` → signature count | `sign_signer_change()` called |
 | Signer Change Executed | `signer_change_executed` | `(Symbol, u64)` → event name, proposal ID | `()` | `execute_signer_change()` called |
-| Batch Executed | `batch_executed` | `(Symbol,)` → event name | `(Vec<u64>, u32)` → executed IDs, skipped count | `execute_batch()` called |
+| Signer Replaced | `signer_replaced` | `(Symbol, Address, Address)` → event name, old signer, new signer | `u32` → new configuration nonce | `replace_signer()` called (threshold met; pending transactions signed by the old key are invalidated) |
+| Proposal Expired | `proposal_expired` | `(Symbol, u64)` → event name, tx ID | `u32` → expiration ledger | `cleanup_expired()` called (garbage collection of stale unexecuted proposals) |
+| Batch Executed | `batch_executed` | `(Symbol,)` → event name | `(Vec<u64>, u32)` → executed IDs, skipped count | `execute_batch()` called (atomic sequential execution of approved proposals) |
 
 ---
 
