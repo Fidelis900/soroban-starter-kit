@@ -22,6 +22,10 @@ pub enum DataKey {
     ClaimWindow,
     Milestones,
     MilestoneVotes(u32, Address),
+    /// Weighted approval power (sum of approving pledges) for a milestone.
+    MilestoneApprovalPower(u32),
+    /// Set when the creator submits a milestone release proposal.
+    MilestoneRequested(u32),
     MilestoneReleased(u32),
     WhitelistedTokens,
     TokenPledge(Address, Address), // (pledger, token)

@@ -30,6 +30,14 @@ pub enum SubscriptionError {
     PaymentOverdue = 15,
     /// An arithmetic operation overflowed.
     ArithmeticOverflow = 16,
+    /// Provider has not configured a minimum payout threshold.
+    PayoutThresholdNotSet = 20,
+    /// Accumulated revenue is below the provider's minimum payout threshold.
+    BelowPayoutThreshold = 21,
+    /// Payout threshold must be positive.
+    InvalidPayoutThreshold = 22,
+    /// A fixed-term subscription must allow at least one billing cycle.
+    InvalidMaxBillingCycles = 23,
 }
 
 impl_display_error!(
@@ -47,6 +55,10 @@ impl_display_error!(
     PlanAlreadyExists      => "plan already exists",
     PlanNotFound           => "plan not found",
     PlanInactive           => "plan inactive",
+    PayoutThresholdNotSet  => "payout threshold not set",
+    BelowPayoutThreshold   => "accumulated revenue is below payout threshold",
+    InvalidPayoutThreshold => "payout threshold must be positive",
+    InvalidMaxBillingCycles => "max billing cycles must be at least one",
 );
 
 #[cfg(test)]

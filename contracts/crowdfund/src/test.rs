@@ -385,3 +385,58 @@ fn test_refund_batch_on_cancelled_campaign() {
     assert_eq!(client.get_pledge(&c2), 0);
 }
 
+
+#[test]
+fn milestone_release_requires_majority_of_pledged_voting_power() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, c2, token) = setup(&env);
+    let deadline = env.ledger().sequence() + 100;
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.pledge(&c1, &6_000, &None);
+    client.pledge(&c2, &4_000, &None);
+
+    let milestones = soroban_sdk::vec![
+        &env,
+        super::storage::Milestone {
+            milestone_id: 1,
+            amount: 3_000,
+            description: soroban_sdk::String::from_str(&env, "deliverable"),
+            votes_required: 1,
+        }
+    ];
+    client.set_milestones(&milestones);
+    client.request_milestone_release(&1);
+
+    // No votes: the creator cannot release the tranche.
+    assert_eq!(
+        client.try_release_milestone(&1),
+        Err(Ok(CrowdfundError::MilestoneApprovalThresholdNotMet))
+    );
+
+    // 40% approval is still not a majority.
+    client.vote_milestone(&c2, &1, &true);
+    assert_eq!(
+        client.try_release_milestone(&1),
+        Err(Ok(CrowdfundError::MilestoneApprovalThresholdNotMet))
+    );
+
+    // 60% approval crosses the >50% threshold and releases exactly one tranche.
+    client.vote_milestone(&c1, &1, &true);
+    client.release_milestone(&1);
+    assert_eq!(
+        token::Client::new(&env, &token).balance(&creator),
+        3_000
+    );
+    assert_eq!(
+        client.try_release_milestone(&1),
+        Err(Ok(CrowdfundError::MilestoneAlreadyReleased))
+    );
+
+    // A milestone campaign cannot be claimed wholesale to bypass governance.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    assert_eq!(
+        client.try_claim(),
+        Err(Ok(CrowdfundError::MilestoneNotReady))
+    );
+}
