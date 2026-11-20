@@ -36,6 +36,35 @@ proptest! {
     }
 
     #[test]
+    fn prop_threshold_change_requires_valid_range_and_quorum(signer_count in 1u32..=10, new_threshold in 0u32..=12) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = signer_vec(&env, signer_count);
+        let contract_address = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_address);
+        client.initialize(&signers, &1, &None);
+
+        let proposer = signers.get(0).unwrap();
+        let result = client.try_propose_threshold_change(&proposer, &new_threshold);
+
+        if new_threshold >= 1 && new_threshold <= signer_count {
+            prop_assert!(result.is_ok());
+
+            // Execution must fail until the current threshold (1) approves.
+            let no_approvals = soroban_sdk::Vec::new(&env);
+            prop_assert!(client.try_execute_threshold_change(&no_approvals).is_err());
+
+            let approvals = vec![&env, proposer.clone()];
+            let exec = client.try_execute_threshold_change(&approvals);
+            prop_assert!(exec.is_ok());
+            prop_assert_eq!(client.get_threshold(), Some(new_threshold));
+        } else {
+            prop_assert!(result.is_err());
+            prop_assert_eq!(client.get_threshold(), Some(1));
+        }
+    }
+
+    #[test]
     fn prop_duplicate_approvals_never_satisfy_threshold(extra_signers in 0u32..=6) {
         let env = Env::default();
         env.mock_all_auths();

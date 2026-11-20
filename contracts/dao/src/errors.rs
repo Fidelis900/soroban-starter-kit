@@ -57,6 +57,19 @@ pub enum DaoError {
     /// Too many non-circulating holder addresses supplied for the dynamic
     /// quorum configuration (issue #1440).
     TooManyNonCirculatingHolders = 23,
+    /// Requested vote weight exceeds the voter's snapshotted balance at
+    /// proposal creation ledger (issue #1442).
+    VoteWeightExceedsSnapshot = 24,
+    /// No balance snapshot recorded for this voter/proposal combination
+    /// (issue #1442).
+    SnapshotMissing = 25,
+    /// Guardian veto requested but no guardian is configured (issue #1444).
+    GuardianNotConfigured = 26,
+    /// Caller is not the configured guardian (issue #1444).
+    UnauthorizedGuardian = 27,
+    /// Veto attempted after the timelock expired or the proposal was already
+    /// executed (issue #1444).
+    VetoWindowClosed = 28,
 }
 
 impl_display_error!(
@@ -90,6 +103,11 @@ impl_display_error!(
     VotingAlreadyStarted    => "voting has already started; proposal cannot be cancelled",
     VotingNotStarted        => "voting has not started yet",
     TooManyNonCirculatingHolders => "too many non-circulating holder addresses",
+    VoteWeightExceedsSnapshot => "vote weight exceeds snapshotted balance",
+    SnapshotMissing         => "no balance snapshot recorded for this voter and proposal",
+    GuardianNotConfigured   => "no guardian configured",
+    UnauthorizedGuardian    => "caller is not the guardian",
+    VetoWindowClosed        => "veto window is closed",
 );
 
 #[cfg(test)]
@@ -130,7 +148,13 @@ DaoError::InvalidVotingType = {}\n",
 DaoError::MissingSecurityCouncil = {}\n\
 DaoError::UnauthorizedCouncil = {}\n\
 DaoError::NotProposer = {}\n\
-DaoError::VotingAlreadyStarted = {}\n",
+DaoError::VotingAlreadyStarted = {}\n\
+DaoError::TooManyNonCirculatingHolders = {}\n\
+DaoError::VoteWeightExceedsSnapshot = {}\n\
+DaoError::SnapshotMissing = {}\n\
+DaoError::GuardianNotConfigured = {}\n\
+DaoError::UnauthorizedGuardian = {}\n\
+DaoError::VetoWindowClosed = {}\n",
             DaoError::NotAuthorized as u32,
             DaoError::AlreadyInitialized as u32,
             DaoError::NotInitialized as u32,
@@ -158,6 +182,12 @@ DaoError::VotingAlreadyStarted = {}\n",
             DaoError::UnauthorizedCouncil as u32,
             DaoError::NotProposer as u32,
             DaoError::VotingAlreadyStarted as u32,
+            DaoError::TooManyNonCirculatingHolders as u32,
+            DaoError::VoteWeightExceedsSnapshot as u32,
+            DaoError::SnapshotMissing as u32,
+            DaoError::GuardianNotConfigured as u32,
+            DaoError::UnauthorizedGuardian as u32,
+            DaoError::VetoWindowClosed as u32,
         )
     }
 

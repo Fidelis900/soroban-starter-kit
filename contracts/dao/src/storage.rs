@@ -2,7 +2,6 @@
 #![allow(missing_docs)]
 
 use soroban_sdk::{Address, BytesN, String, Symbol, Val, Vec, contracttype};
-use soroban_sdk::{Address, String, Symbol, Val, Vec, contracttype};
 
 /// Instance-storage keys (contract-level state).
 #[contracttype]
@@ -56,6 +55,12 @@ pub enum DataKey {
     /// computing the dynamic quorum, e.g. staking pools, treasuries, or vesting
     /// vaults (`Vec<Address>`, issue #1440).
     NonCirculatingHolders,
+    /// Configured multi-sig guardian address allowed to veto pending proposals
+    /// during the timelock window (issue #1444).
+    Guardian,
+    /// Minimum timelock delay (in ledgers) between a proposal passing and its
+    /// execution. Defaults to 17_280 ledgers (~48h at 5s/ledger) (issue #1443).
+    TimelockDelay,
 }
 
 /// Persistent-storage keys (per-proposal and per-vote data).
@@ -70,6 +75,19 @@ pub enum ProposalKey {
     /// quorum, computed from the circulating supply at creation (`i128`,
     /// issue #1440). Absent when dynamic quorum was disabled at creation.
     DynamicQuorumSnapshot(u32),
+    /// Ledger at which the proposal was created, used as the historical
+    /// balance snapshot for vote-weight calculation (`u32`, issue #1442).
+    ProposalSnapshot(u32),
+}
+
+/// Key for a voter's token balance snapshotted at proposal creation, used to
+/// compute voting power and prevent token recycling between votes
+/// (issue #1442). Stored in persistent storage.
+#[contracttype]
+#[derive(Clone)]
+pub struct VoteSnapshotKey {
+    pub proposal_id: u32,
+    pub voter: Address,
 }
 
 /// Composite key for vote deduplication.
@@ -143,6 +161,8 @@ pub enum ProposalState {
     Executed = 2,
     /// Cancelled by the admin, a security-council veto, or the original proposer.
     Cancelled = 3,
+    /// Vetoed by the guardian during the timelock window (issue #1444).
+    Vetoed = 4,
 }
 
 impl core::fmt::Display for ProposalState {
@@ -152,6 +172,7 @@ impl core::fmt::Display for ProposalState {
             ProposalState::Queued => "queued",
             ProposalState::Executed => "executed",
             ProposalState::Cancelled => "cancelled",
+            ProposalState::Vetoed => "vetoed",
         })
     }
 }
@@ -208,6 +229,11 @@ pub struct Proposal {
     /// Ledger at which voting opens. The proposer may cancel the proposal
     /// strictly before this ledger (issue #1321).
     pub voting_start: u32,
+    // ── Vote-weight snapshot (issue #1442) ───────────────────────────────────
+    /// Ledger at which voter token balances are snapshotted for vote-weight
+    /// calculation. Set to the creation ledger; balances are evaluated as of
+    /// this ledger so tokens cannot be recycled into duplicate votes.
+    pub snapshot_ledger: u32,
 }
 
 /// One page of results from `get_proposals` (#1110).

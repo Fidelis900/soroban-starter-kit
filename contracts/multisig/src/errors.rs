@@ -38,6 +38,14 @@ pub enum MultisigError {
     SpendingLimitExceeded = 14,
     /// Invalid spending limit configuration.
     InvalidSpendingLimit = 15,
+    /// The proposed threshold is outside the range `1..=total_signers`.
+    InvalidNewThreshold = 16,
+    /// The threshold-change proposal does not exist.
+    ThresholdChangeNotFound = 17,
+    /// The threshold-change proposal has already been executed.
+    ThresholdChangeAlreadyExecuted = 18,
+    /// The signer has already approved the threshold-change proposal.
+    AlreadyApprovedThresholdChange = 19,
 }
 
 impl_display_error!(
@@ -57,4 +65,8 @@ impl_display_error!(
     NotYetExpired        => "not yet expired",
     SpendingLimitExceeded => "spending limit exceeded",
     InvalidSpendingLimit  => "invalid spending limit",
+    InvalidNewThreshold   => "invalid new threshold",
+    ThresholdChangeNotFound => "threshold change not found",
+    ThresholdChangeAlreadyExecuted => "threshold change already executed",
+    AlreadyApprovedThresholdChange => "already approved threshold change",
 );

@@ -93,6 +93,9 @@ pub fn allowance_spent(env: &Env, operator: &Address, to: &Address, amount: i128
     env.events().publish(
         (Symbol::new(env, "allowance_spent"), operator.clone(), to.clone()),
         (amount, spent),
+    );
+}
+
 /// Emitted when the original proposer cancels a pending transaction (#1113).
 pub fn transaction_cancelled(env: &Env, tx_id: u64, proposer: &Address) {
     env.events()

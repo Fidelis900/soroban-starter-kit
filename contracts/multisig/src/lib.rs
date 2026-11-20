@@ -32,6 +32,7 @@ use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Symbol, Val, Vec, contract, 
 mod errors;
 mod events;
 mod storage;
+mod threshold;
 
 #[cfg(test)]
 mod prop_test;
@@ -39,7 +40,8 @@ mod prop_test;
 mod test;
 
 pub use errors::MultisigError;
-pub use storage::{DataKey, SignerWeight, TokenSpendingLimit, Transaction};
+pub use storage::{DataKey, SignerWeight, ThresholdChange, TokenSpendingLimit, Transaction};
+pub use threshold::ThresholdChangeProposal;
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
 
@@ -868,6 +870,204 @@ mod contract {
             env.storage()
                 .instance()
                 .get(&DataKey::SpendingLimits(token))
+        }
+
+        // ── Threshold change proposals (#1445) ────────────────────────────────
+
+        /// Propose a change to the signer threshold.
+        ///
+        /// The `proposer` must be a current signer and is recorded as the first
+        /// approval. `new_threshold` must satisfy `1 <= new_threshold <= total`,
+        /// where `total` is the sum of all current signer weights (equal to the
+        /// signer count for un-weighted wallets).
+        ///
+        /// Returns the new proposal ID.
+        pub fn propose_threshold_change(
+            env: Env,
+            proposer: Address,
+            new_threshold: u32,
+        ) -> Result<u64, MultisigError> {
+            Self::require_signer(&env, &proposer)?;
+            proposer.require_auth();
+
+            let signers = Self::get_required_signers(&env)?;
+            let weights_map: Option<Map<Address, u32>> =
+                env.storage().instance().get(&DataKey::Weights);
+            let total = match weights_map {
+                Some(ref m) => total_weight(&signers, m),
+                None => signers.len(),
+            };
+            validate_threshold(new_threshold, total)?;
+
+            let proposal_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextThresholdChangeId)
+                .unwrap_or(0u64);
+
+            let mut approvals = Vec::new(&env);
+            approvals.push_back(proposer.clone());
+
+            let proposal = ThresholdChange {
+                id: proposal_id,
+                proposer: proposer.clone(),
+                new_threshold,
+                approvals,
+                executed: false,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::ThresholdChange(proposal_id), &proposal);
+            env.storage()
+                .instance()
+                .set(&DataKey::NextThresholdChangeId, &(proposal_id + 1));
+            bump_instance(&env);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ThresholdChange(proposal_id),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+
+            events::threshold_change_proposed(&env, proposal_id, &proposer, new_threshold);
+            Ok(proposal_id)
+        }
+
+        /// Approve a pending threshold-change proposal.
+        ///
+        /// The `signer` must be a current signer and must not have already
+        /// approved the proposal.
+        pub fn approve_threshold_change(
+            env: Env,
+            signer: Address,
+            proposal_id: u64,
+        ) -> Result<(), MultisigError> {
+            Self::require_signer(&env, &signer)?;
+            signer.require_auth();
+
+            let mut proposal = Self::get_required_threshold_change(&env, proposal_id)?;
+            if proposal.executed {
+                return Err(MultisigError::AlreadyExecuted);
+            }
+            if contains(&proposal.approvals, &signer) {
+                return Err(MultisigError::AlreadySigned);
+            }
+
+            proposal.approvals.push_back(signer.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::ThresholdChange(proposal_id), &proposal);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ThresholdChange(proposal_id),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+
+            events::threshold_change_approved(&env, proposal_id, &signer);
+            Ok(())
+        }
+
+        /// Execute a threshold-change proposal once enough current signers
+        /// have approved it.
+        ///
+        /// The accumulated approval weight must meet the **current** threshold.
+        /// On success the new threshold is applied and the proposal is marked
+        /// executed.
+        pub fn execute_threshold_change(
+            env: Env,
+            proposal_id: u64,
+        ) -> Result<(), MultisigError> {
+            let mut proposal = Self::get_required_threshold_change(&env, proposal_id)?;
+            if proposal.executed {
+                return Err(MultisigError::AlreadyExecuted);
+            }
+
+            let signers = Self::get_required_signers(&env)?;
+            let current_threshold: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Threshold)
+                .ok_or(MultisigError::NotInitialized)?;
+            let weights_map: Option<Map<Address, u32>> =
+                env.storage().instance().get(&DataKey::Weights);
+
+            let mut accumulated: u32 = 0;
+            for approver in proposal.approvals.iter() {
+                if !contains(&signers, &approver) {
+                    continue;
+                }
+                let w = weights_map
+                    .as_ref()
+                    .and_then(|m| m.get(approver.clone()))
+                    .unwrap_or(1u32);
+                accumulated = accumulated.saturating_add(w);
+            }
+
+            if accumulated < current_threshold {
+                return Err(MultisigError::InsufficientApprovals);
+            }
+
+            // Re-validate against the current signer set before applying.
+            let total = match weights_map {
+                Some(ref m) => total_weight(&signers, m),
+                None => signers.len(),
+            };
+            validate_threshold(proposal.new_threshold, total)?;
+
+            proposal.executed = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::ThresholdChange(proposal_id), &proposal);
+            env.storage()
+                .instance()
+                .set(&DataKey::Threshold, &proposal.new_threshold);
+            bump_instance(&env);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ThresholdChange(proposal_id),
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+
+            events::threshold_change_applied(&env, proposal_id, proposal.new_threshold);
+            Ok(())
+        }
+
+        /// Fetch a threshold-change proposal by ID, refreshing its TTL.
+        pub fn get_threshold_change(
+            env: Env,
+            proposal_id: u64,
+        ) -> Option<ThresholdChange> {
+            let proposal = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ThresholdChange(proposal_id));
+            if proposal.is_some() {
+                env.storage().persistent().extend_ttl(
+                    &DataKey::ThresholdChange(proposal_id),
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
+            }
+            proposal
+        }
+
+        /// Return the next threshold-change proposal ID.
+        pub fn get_next_threshold_change_id(env: Env) -> u64 {
+            env.storage()
+                .instance()
+                .get(&DataKey::NextThresholdChangeId)
+                .unwrap_or(0u64)
+        }
+
+        #[inline]
+        fn get_required_threshold_change(
+            env: &Env,
+            proposal_id: u64,
+        ) -> Result<ThresholdChange, MultisigError> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ThresholdChange(proposal_id))
+                .ok_or(MultisigError::TransactionNotFound)
         }
     }
 }

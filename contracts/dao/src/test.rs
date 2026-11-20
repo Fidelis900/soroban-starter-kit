@@ -1872,3 +1872,209 @@ fn test_set_dynamic_quorum_non_admin_fails() {
     let stranger = Address::generate(&env);
     client.set_dynamic_quorum(&stranger, &2_000, &Vec::new(&env));
 }
+
+// ---------------------------------------------------------------------------
+// #1442 — Snapshot voter balances at proposal creation
+// ---------------------------------------------------------------------------
+
+/// A voter's weight is fixed at the balance they held when the proposal was
+/// created. Transferring tokens afterwards cannot let the recipient cast a
+/// second vote with the same economic stake.
+#[test]
+fn test_snapshot_prevents_token_recycling_duplicate_vote() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, 0);
+
+    // Snapshot supply = 1_000, all held by voter_a at creation time.
+    let voter_a = Address::generate(&env);
+    let voter_b = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter_a, 1_000);
+    let id = create_plain_proposal(&client, &env, &voter_a);
+
+    // voter_a votes with the full snapshotted balance.
+    client.vote(&voter_a, &id, &true);
+    assert_eq!(client.get_proposal(&id).yes_votes, 1_000);
+
+    // voter_a recycles the same tokens to voter_b after voting.
+    soroban_sdk::token::Client::new(&env, &token).transfer(&voter_a, &voter_b, &1_000);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&env, &token).balance(&voter_b),
+        1_000
+    );
+
+    // voter_b held nothing at the snapshot ledger, so their weight is zero and
+    // the duplicate vote is rejected.
+    let result = client.try_vote(&voter_b, &id, &true);
+    assert!(result.is_err(), "recycled tokens must not grant a second vote");
+
+    // The tally is unchanged: the stake counted exactly once.
+    let proposal = client.get_proposal(&id);
+    assert_eq!(proposal.yes_votes, 1_000);
+    assert_eq!(proposal.no_votes, 0);
+}
+
+/// Vote weight equals the snapshotted balance even if the voter's live
+/// balance changes (in either direction) before they cast their vote.
+#[test]
+fn test_vote_weight_uses_snapshot_balance_not_live_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, 0);
+
+    let voter = Address::generate(&env);
+    let other = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 400);
+    mint_tokens(&env, &token, &admin, &other, 600);
+    // Snapshot: voter = 400.
+    let id = create_plain_proposal(&client, &env, &voter);
+
+    // Live balance shrinks to 100 before voting — weight must stay 400.
+    soroban_sdk::token::Client::new(&env, &token).transfer(&voter, &other, &300);
+    client.vote(&voter, &id, &true);
+    assert_eq!(client.get_proposal(&id).yes_votes, 400);
+
+    // A second proposal snapshots the reduced balance (100).
+    let id2 = client.create_proposal(
+        &voter,
+        &String::from_str(&env, "P2"),
+        &String::from_str(&env, "D2"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    // Live balance grows again before voting — weight must stay 100.
+    mint_tokens(&env, &token, &admin, &voter, 900);
+    client.vote(&voter, &id2, &true);
+    assert_eq!(client.get_proposal(&id2).yes_votes, 100);
+}
+
+// ---------------------------------------------------------------------------
+// #1443 — 48h timelock between passage and execution
+// ---------------------------------------------------------------------------
+
+/// With a 48h (17_280 ledger) timelock, execution is rejected before
+/// `executable_at` and succeeds once it has elapsed.
+#[test]
+fn test_48h_timelock_blocks_early_execution_and_allows_after() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let timelock: u32 = 17_280; // 48 hours at 5s ledgers.
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, timelock);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 600);
+    client.vote(&voter, &id, &true);
+
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+
+    let executable_at = client.get_proposal(&id).execution_eta;
+    assert_eq!(executable_at, deadline + timelock);
+
+    // One ledger before expiry: rejected with TimelockNotExpired (#14).
+    env.ledger().with_mut(|l| l.sequence_number = executable_at - 1);
+    let early = client.try_execute_proposal(&id);
+    assert!(early.is_err(), "execution must be rejected during timelock");
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Queued);
+
+    // At expiry: execution succeeds.
+    env.ledger().with_mut(|l| l.sequence_number = executable_at);
+    client.execute_proposal(&id);
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Executed);
+}
+
+// ---------------------------------------------------------------------------
+// #1444 — Emergency guardian veto
+// ---------------------------------------------------------------------------
+
+/// Only the configured guardian may veto a pending proposal.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_guardian_veto_non_guardian_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, 50);
+
+    let guardian = Address::generate(&env);
+    client.set_guardian(&admin, &Some(guardian.clone()));
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 600);
+    client.vote(&voter, &id, &true);
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+
+    let impostor = Address::generate(&env);
+    client.guardian_veto(&impostor, &id);
+}
+
+/// The guardian cancels a queued malicious proposal during the timelock, and
+/// it can no longer be executed.
+#[test]
+fn test_guardian_veto_cancels_malicious_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, 50);
+
+    let guardian = Address::generate(&env);
+    client.set_guardian(&admin, &Some(guardian.clone()));
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 600);
+    client.vote(&voter, &id, &true);
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+
+    // Guardian vetoes while the timelock is still ticking.
+    client.guardian_veto(&guardian, &id);
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Cancelled);
+
+    // Execution after the timelock would have expired still fails.
+    let executable_at = deadline + 50;
+    env.ledger().with_mut(|l| l.sequence_number = executable_at);
+    let result = client.try_execute_proposal(&id);
+    assert!(result.is_err(), "vetoed proposal must not execute");
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Cancelled);
+}
+
+/// The guardian cannot veto once the timelock has expired.
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_guardian_veto_after_timelock_expiry_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 100, 0, 50);
+
+    let guardian = Address::generate(&env);
+    client.set_guardian(&admin, &Some(guardian.clone()));
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 600);
+    client.vote(&voter, &id, &true);
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+
+    let executable_at = client.get_proposal(&id).execution_eta;
+    env.ledger().with_mut(|l| l.sequence_number = executable_at);
+    client.guardian_veto(&guardian, &id);
+}
