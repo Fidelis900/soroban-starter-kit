@@ -1,4 +1,10 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
+)]
 #![cfg(test)]
 
 use soroban_sdk::{
@@ -8,7 +14,383 @@ use soroban_sdk::{
     vec,
 };
 
-use crate::{ScheduleParams, VestingContract, VestingContractClient, VestingError};
+use crate::{
+    DEFAULT_ROTATION_DELAY, ScheduleParams, VestingContract, VestingContractClient, VestingError,
+};
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const AMOUNT: i128 = 1_000;
+
+struct T<'a> {
+    env: Env,
+    client: VestingContractClient<'a>,
+    admin: Address,
+    beneficiary: Address,
+    token: Address,
+    cliff: u32,
+    end: u32,
+}
+
+impl T<'_> {
+    fn balance(&self, who: &Address) -> i128 {
+        TokenClient::new(&self.env, &self.token).balance(who)
+    }
+    fn goto(&self, ledger: u32) {
+        self.env.ledger().with_mut(|l| l.sequence_number = ledger);
+    }
+}
+
+/// Linear schedule: cliff at 110, fully vested at 210 (1_000 tokens).
+fn setup(env: &Env) -> T<'_> {
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+
+    let admin = Address::generate(env);
+    let beneficiary = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    StellarAssetClient::new(env, &token).mint(&admin, &(AMOUNT * 10));
+
+    let client = VestingContractClient::new(env, &env.register(VestingContract, ()));
+    client.initialize(&admin, &token);
+    let cliff = 110;
+    let end = 210;
+    client.create_schedule(&beneficiary, &cliff, &cliff, &end, &AMOUNT, &true);
+
+    T {
+        env: env.clone(),
+        client,
+        admin,
+        beneficiary,
+        token,
+        cliff,
+        end,
+    }
+}
+
+// ── core behaviour ───────────────────────────────────────────────────────────
+
+#[test]
+fn initialize_and_create_schedule() {
+    let env = Env::default();
+    let t = setup(&env);
+    let info = t.client.get_info(&t.beneficiary).unwrap();
+    assert_eq!(
+        (info.amount, info.cliff_ledger, info.end_ledger),
+        (AMOUNT, t.cliff, t.end)
+    );
+    assert_eq!(info.claimed, 0);
+    assert_eq!(
+        t.client.try_initialize(&t.admin, &t.token),
+        Err(Ok(VestingError::AlreadyInitialized))
+    );
+    assert_eq!(
+        t.client
+            .try_create_schedule(&t.beneficiary, &t.cliff, &t.cliff, &t.end, &AMOUNT, &true),
+        Err(Ok(VestingError::ScheduleAlreadyExists))
+    );
+}
+
+#[test]
+fn invalid_schedules_rejected() {
+    let env = Env::default();
+    let t = setup(&env);
+    let other = Address::generate(&env);
+    assert_eq!(
+        t.client
+            .try_create_schedule(&other, &200, &200, &150, &AMOUNT, &true),
+        Err(Ok(VestingError::InvalidScheduleBounds))
+    );
+    assert_eq!(
+        t.client
+            .try_create_schedule(&other, &110, &110, &200, &0, &true),
+        Err(Ok(VestingError::InvalidAmount))
+    );
+}
+
+#[test]
+fn linear_claims() {
+    let env = Env::default();
+    let t = setup(&env);
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::NothingToClaim))
+    );
+
+    t.goto(t.cliff + 50);
+    assert_eq!(t.client.claim(&t.beneficiary), AMOUNT / 2);
+
+    t.goto(t.end + 10);
+    assert_eq!(t.client.claim(&t.beneficiary), AMOUNT / 2);
+    assert_eq!(t.balance(&t.beneficiary), AMOUNT);
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::NothingToClaim))
+    );
+}
+
+#[test]
+fn revoke_pays_vested_and_returns_unvested() {
+    let env = Env::default();
+    let t = setup(&env);
+    let admin_before = t.balance(&t.admin);
+
+    t.goto(t.cliff + 25);
+    assert_eq!(t.client.revoke(&t.beneficiary), (250, 750));
+    assert_eq!(t.balance(&t.admin), admin_before + 750);
+    assert_eq!(t.balance(&t.beneficiary), 250);
+
+    t.goto(t.end);
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::NothingToClaim))
+    );
+    assert_eq!(
+        t.client.try_revoke(&t.beneficiary),
+        Err(Ok(VestingError::AlreadyRevoked))
+    );
+}
+
+#[test]
+fn revoke_with_grace_period_caps_vesting_at_finalize() {
+    let env = Env::default();
+    let t = setup(&env);
+    t.client.set_revocation_delay(&25);
+
+    t.goto(t.cliff + 25);
+    assert_eq!(t.client.revoke(&t.beneficiary), (0, 0));
+    assert_eq!(
+        t.client.try_finalize_revocation(&t.beneficiary),
+        Err(Ok(VestingError::RevocationNotDue))
+    );
+
+    // Vesting keeps accruing during the grace period.
+    t.goto(t.cliff + 40);
+    assert_eq!(t.client.claim(&t.beneficiary), 400);
+
+    // Finalized late: vesting is capped at the end of the grace period.
+    t.goto(t.end);
+    assert_eq!(t.client.finalize_revocation(&t.beneficiary), (100, 500));
+    assert_eq!(t.balance(&t.beneficiary), 500);
+    assert_eq!(t.balance(&t.client.address), 0);
+}
+
+#[test]
+fn irrevocable_schedule_cannot_be_revoked() {
+    let env = Env::default();
+    let t = setup(&env);
+    let b = Address::generate(&env);
+    t.client
+        .create_schedule(&b, &t.cliff, &t.cliff, &t.end, &AMOUNT, &false);
+    assert_eq!(
+        t.client.try_revoke(&b),
+        Err(Ok(VestingError::ScheduleIrrevocable))
+    );
+}
+
+#[test]
+fn tranche_schedule_vests_in_steps() {
+    let env = Env::default();
+    let t = setup(&env);
+    let b = Address::generate(&env);
+    t.client
+        .create_tranche_schedule(&b, &vec![&env, (120, 2_500), (150, 7_500)], &AMOUNT, &true);
+
+    t.goto(130);
+    assert_eq!(t.client.claim(&b), 250);
+    t.goto(150);
+    assert_eq!(t.client.claim(&b), 750);
+}
+
+// ── #1345: minimum claim threshold ───────────────────────────────────────────
+
+#[test]
+fn dust_claim_below_minimum_rejected() {
+    let env = Env::default();
+    let t = setup(&env);
+    t.client.set_min_claim_amount(&Some(100));
+    assert_eq!(t.client.min_claim_amount(), Some(100));
+
+    // 1 ledger after the cliff only 10 tokens are vested: a dust claim.
+    t.goto(t.cliff + 1);
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::ClaimBelowMinimum))
+    );
+    assert_eq!(t.client.get_info(&t.beneficiary).unwrap().claimed, 0);
+
+    // Once enough has accrued the claim goes through.
+    t.goto(t.cliff + 10);
+    assert_eq!(t.client.claim(&t.beneficiary), 100);
+}
+
+#[test]
+fn final_remainder_below_minimum_allowed() {
+    let env = Env::default();
+    let t = setup(&env);
+    t.client.set_min_claim_amount(&Some(100));
+
+    t.goto(t.cliff + 95);
+    assert_eq!(t.client.claim(&t.beneficiary), 950);
+
+    // Remaining 50 is below the threshold but completes the schedule.
+    t.goto(t.end);
+    assert_eq!(t.client.claim(&t.beneficiary), 50);
+    assert_eq!(t.balance(&t.beneficiary), AMOUNT);
+}
+
+#[test]
+fn min_claim_amount_validation_and_disable() {
+    let env = Env::default();
+    let t = setup(&env);
+    assert_eq!(
+        t.client.try_set_min_claim_amount(&Some(0)),
+        Err(Ok(VestingError::InvalidAmount))
+    );
+    t.client.set_min_claim_amount(&Some(500));
+    t.client.set_min_claim_amount(&None);
+    assert_eq!(t.client.min_claim_amount(), None);
+    t.goto(t.cliff + 1);
+    assert_eq!(t.client.claim(&t.beneficiary), 10);
+}
+
+// ── #1344: beneficiary key rotation ──────────────────────────────────────────
+
+#[test]
+fn beneficiary_rotation_after_timelock() {
+    let env = Env::default();
+    let t = setup(&env);
+    let new_key = Address::generate(&env);
+
+    t.goto(t.cliff + 20);
+    t.client.claim(&t.beneficiary); // 200 already claimed under the old key
+
+    let eta = t
+        .client
+        .propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &new_key);
+    assert_eq!(eta, t.cliff + 20 + DEFAULT_ROTATION_DELAY);
+
+    // Timelock protects the rotation.
+    assert_eq!(
+        t.client.try_accept_beneficiary_rotation(&t.beneficiary),
+        Err(Ok(VestingError::RotationTimelockActive))
+    );
+
+    t.goto(eta);
+    t.client.accept_beneficiary_rotation(&t.beneficiary);
+
+    assert_eq!(t.client.get_info(&t.beneficiary), None);
+    assert_eq!(t.client.get_pending_rotation(&t.beneficiary), None);
+    let info = t.client.get_info(&new_key).unwrap();
+    assert_eq!((info.amount, info.claimed), (AMOUNT, 200));
+
+    // Old key can no longer claim; new key receives the rest.
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::ScheduleNotFound))
+    );
+    assert_eq!(t.client.claim(&new_key), 800);
+    assert_eq!(t.balance(&new_key), 800);
+}
+
+#[test]
+fn admin_rotation_freezes_claims_and_cannot_be_overridden_by_beneficiary() {
+    let env = Env::default();
+    let t = setup(&env);
+    let safe = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    t.client.set_rotation_delay(&50);
+
+    t.client
+        .propose_beneficiary_rotation(&t.admin, &t.beneficiary, &safe);
+
+    // A compromised beneficiary key cannot drain, redirect, or cancel.
+    t.goto(t.end);
+    assert_eq!(
+        t.client.try_claim(&t.beneficiary),
+        Err(Ok(VestingError::RotationPending))
+    );
+    assert_eq!(
+        t.client
+            .try_propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &attacker),
+        Err(Ok(VestingError::RotationPending))
+    );
+    assert_eq!(
+        t.client
+            .try_cancel_beneficiary_rotation(&t.beneficiary, &t.beneficiary),
+        Err(Ok(VestingError::NotAuthorized))
+    );
+
+    t.client.accept_beneficiary_rotation(&t.beneficiary);
+    assert_eq!(t.client.claim(&safe), AMOUNT);
+}
+
+#[test]
+fn rotation_rejects_unauthorized_and_invalid_targets() {
+    let env = Env::default();
+    let t = setup(&env);
+    let stranger = Address::generate(&env);
+    let other = Address::generate(&env);
+    t.client
+        .create_schedule(&other, &t.cliff, &t.cliff, &t.end, &AMOUNT, &true);
+
+    assert_eq!(
+        t.client
+            .try_propose_beneficiary_rotation(&stranger, &t.beneficiary, &stranger),
+        Err(Ok(VestingError::NotAuthorized))
+    );
+    assert_eq!(
+        t.client
+            .try_propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &t.beneficiary),
+        Err(Ok(VestingError::InvalidBeneficiary))
+    );
+    assert_eq!(
+        t.client
+            .try_propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &other),
+        Err(Ok(VestingError::BeneficiaryAlreadyExists))
+    );
+    assert_eq!(
+        t.client.try_accept_beneficiary_rotation(&t.beneficiary),
+        Err(Ok(VestingError::RotationNotFound))
+    );
+}
+
+#[test]
+fn admin_can_cancel_rotation() {
+    let env = Env::default();
+    let t = setup(&env);
+    let new_key = Address::generate(&env);
+    t.client
+        .propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &new_key);
+    t.client
+        .cancel_beneficiary_rotation(&t.admin, &t.beneficiary);
+
+    t.goto(t.end + DEFAULT_ROTATION_DELAY);
+    assert_eq!(
+        t.client.try_accept_beneficiary_rotation(&t.beneficiary),
+        Err(Ok(VestingError::RotationNotFound))
+    );
+    assert_eq!(t.client.claim(&t.beneficiary), AMOUNT);
+}
+
+#[test]
+fn rotation_requires_new_beneficiary_auth() {
+    let env = Env::default();
+    let t = setup(&env);
+    let new_key = Address::generate(&env);
+    t.client.set_rotation_delay(&0);
+    t.client
+        .propose_beneficiary_rotation(&t.beneficiary, &t.beneficiary, &new_key);
+
+    t.client.accept_beneficiary_rotation(&t.beneficiary);
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, new_key);
+}
+
+// ── #1340–#1343: bounds, milestones, batch creation, revocation math ─────────
 
 struct Ctx<'a> {
     env: Env,
@@ -17,7 +399,7 @@ struct Ctx<'a> {
     token: Address,
 }
 
-fn setup<'a>() -> Ctx<'a> {
+fn setup_ctx<'a>() -> Ctx<'a> {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.sequence_number = 100);
@@ -28,7 +410,12 @@ fn setup<'a>() -> Ctx<'a> {
     let id = env.register(VestingContract, ());
     let client = VestingContractClient::new(&env, &id);
     client.initialize(&admin, &token);
-    Ctx { env, client, admin, token }
+    Ctx {
+        env,
+        client,
+        admin,
+        token,
+    }
 }
 
 fn bal(c: &Ctx, a: &Address) -> i128 {
@@ -43,7 +430,7 @@ fn at(c: &Ctx, seq: u32) {
 
 #[test]
 fn bounds_valid_and_edges() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     // start == now, start == cliff allowed
     c.client.create_schedule(&b, &100, &100, &200, &1000, &true);
@@ -52,7 +439,7 @@ fn bounds_valid_and_edges() {
 
 #[test]
 fn bounds_invalid_rejected() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     let bad = [
         (99, 150, 200),  // start in the past
@@ -62,7 +449,11 @@ fn bounds_invalid_rejected() {
     ];
     for (s, cl, e) in bad {
         let r = c.client.try_create_schedule(&b, &s, &cl, &e, &1000, &true);
-        assert_eq!(r, Err(Ok(VestingError::InvalidScheduleBounds)), "{s} {cl} {e}");
+        assert_eq!(
+            r,
+            Err(Ok(VestingError::InvalidScheduleBounds)),
+            "{s} {cl} {e}"
+        );
     }
 }
 
@@ -81,7 +472,7 @@ fn params(c: &Ctx, amount: i128) -> ScheduleParams {
 
 #[test]
 fn batch_creates_all_and_funds_once() {
-    let c = setup();
+    let c = setup_ctx();
     let p: Vec<ScheduleParams> = vec![&c.env, params(&c, 100), params(&c, 250), params(&c, 50)];
     let before = bal(&c, &c.admin);
     c.client.create_schedules_batch(&c.admin, &p);
@@ -94,7 +485,7 @@ fn batch_creates_all_and_funds_once() {
 
 #[test]
 fn batch_is_atomic_on_invalid_entry() {
-    let c = setup();
+    let c = setup_ctx();
     let mut bad = params(&c, 100);
     bad.end_ledger = 100;
     let good = params(&c, 100);
@@ -106,7 +497,7 @@ fn batch_is_atomic_on_invalid_entry() {
 
 #[test]
 fn batch_requires_admin_and_nonempty() {
-    let c = setup();
+    let c = setup_ctx();
     let p = vec![&c.env, params(&c, 10)];
     let other = Address::generate(&c.env);
     assert_eq!(
@@ -114,7 +505,8 @@ fn batch_requires_admin_and_nonempty() {
         Err(Ok(VestingError::NotAuthorized))
     );
     assert_eq!(
-        c.client.try_create_schedules_batch(&c.admin, &Vec::new(&c.env)),
+        c.client
+            .try_create_schedules_batch(&c.admin, &Vec::new(&c.env)),
         Err(Ok(VestingError::InvalidSchedule))
     );
 }
@@ -123,13 +515,17 @@ fn batch_requires_admin_and_nonempty() {
 
 #[test]
 fn milestone_unlocks_on_approval() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     let v = Address::generate(&c.env);
     let ms = vec![&c.env, (1u32, 3000u32), (2, 3000), (3, 4000)];
-    c.client.create_milestone_schedule(&b, &v, &ms, &1000, &true);
+    c.client
+        .create_milestone_schedule(&b, &v, &ms, &1000, &true);
 
-    assert_eq!(c.client.try_claim(&b), Err(Ok(VestingError::NothingToClaim)));
+    assert_eq!(
+        c.client.try_claim(&b),
+        Err(Ok(VestingError::NothingToClaim))
+    );
     c.client.approve_milestone(&b, &1);
     assert_eq!(c.client.claim(&b), 300);
     c.client.approve_milestone(&b, &3);
@@ -141,12 +537,16 @@ fn milestone_unlocks_on_approval() {
 
 #[test]
 fn milestone_errors() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     let v = Address::generate(&c.env);
     let ms = vec![&c.env, (1u32, 5000u32), (2, 5000)];
-    c.client.create_milestone_schedule(&b, &v, &ms, &1000, &true);
-    assert_eq!(c.client.try_approve_milestone(&b, &9), Err(Ok(VestingError::MilestoneNotFound)));
+    c.client
+        .create_milestone_schedule(&b, &v, &ms, &1000, &true);
+    assert_eq!(
+        c.client.try_approve_milestone(&b, &9),
+        Err(Ok(VestingError::MilestoneNotFound))
+    );
     c.client.approve_milestone(&b, &1);
     assert_eq!(
         c.client.try_approve_milestone(&b, &1),
@@ -156,7 +556,8 @@ fn milestone_errors() {
     let b2 = Address::generate(&c.env);
     let bad = vec![&c.env, (1u32, 5000u32)];
     assert_eq!(
-        c.client.try_create_milestone_schedule(&b2, &v, &bad, &1000, &true),
+        c.client
+            .try_create_milestone_schedule(&b2, &v, &bad, &1000, &true),
         Err(Ok(VestingError::InvalidSchedule))
     );
     // linear schedule has no verifier
@@ -170,11 +571,12 @@ fn milestone_errors() {
 
 #[test]
 fn milestone_approval_needs_verifier_auth() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     let v = Address::generate(&c.env);
     let ms = vec![&c.env, (1u32, 10_000u32)];
-    c.client.create_milestone_schedule(&b, &v, &ms, &500, &false);
+    c.client
+        .create_milestone_schedule(&b, &v, &ms, &500, &false);
     c.client.approve_milestone(&b, &1);
     let auths = c.env.auths();
     assert_eq!(auths.last().unwrap().0, v);
@@ -185,7 +587,7 @@ fn milestone_approval_needs_verifier_auth() {
 /// Revoke at `seq` for a 1000-token schedule (start 100, cliff 150, end 250)
 /// and assert exact conservation.
 fn check_revoke(seq: u32, claim_first_at: Option<u32>) -> (i128, i128) {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     c.client.create_schedule(&b, &100, &150, &250, &1000, &true);
     let admin_start = bal(&c, &c.admin);
@@ -226,24 +628,36 @@ fn revoke_after_end_and_after_partial_claim() {
 
 #[test]
 fn revoke_guards() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
-    c.client.create_schedule(&b, &100, &150, &250, &1000, &false);
-    assert_eq!(c.client.try_revoke(&b), Err(Ok(VestingError::ScheduleIrrevocable)));
+    c.client
+        .create_schedule(&b, &100, &150, &250, &1000, &false);
+    assert_eq!(
+        c.client.try_revoke(&b),
+        Err(Ok(VestingError::ScheduleIrrevocable))
+    );
     let b2 = Address::generate(&c.env);
-    c.client.create_schedule(&b2, &100, &150, &250, &1000, &true);
+    c.client
+        .create_schedule(&b2, &100, &150, &250, &1000, &true);
     c.client.revoke(&b2);
-    assert_eq!(c.client.try_revoke(&b2), Err(Ok(VestingError::AlreadyRevoked)));
-    assert_eq!(c.client.try_claim(&b2), Err(Ok(VestingError::NothingToClaim)));
+    assert_eq!(
+        c.client.try_revoke(&b2),
+        Err(Ok(VestingError::AlreadyRevoked))
+    );
+    assert_eq!(
+        c.client.try_claim(&b2),
+        Err(Ok(VestingError::NothingToClaim))
+    );
 }
 
 #[test]
 fn milestone_revoke_conserves() {
-    let c = setup();
+    let c = setup_ctx();
     let b = Address::generate(&c.env);
     let v = Address::generate(&c.env);
     let ms = vec![&c.env, (1u32, 3333u32), (2, 6667)];
-    c.client.create_milestone_schedule(&b, &v, &ms, &1001, &true);
+    c.client
+        .create_milestone_schedule(&b, &v, &ms, &1001, &true);
     c.client.approve_milestone(&b, &1);
     let (pay, claw) = c.client.revoke(&b);
     assert_eq!(pay + claw, 1001);

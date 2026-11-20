@@ -26,6 +26,14 @@ pub enum DataKey {
     /// Subscriber-approved amount for a (subscriber, plan) pair when a provider
     /// increases plan pricing and explicit consent is required.
     ApprovedAmount(Address, Symbol),
+    /// Accumulated provider revenue held in contract escrow.
+    ProviderRevenue(Address),
+    /// Minimum accumulated revenue required before a payout is allowed.
+    MinPayoutThreshold(Address),
+    /// Number of ledgers before the due date that subscriptions are reported.
+    NotificationWindow,
+    /// Index of all (subscriber, plan) pairs for keeper queries.
+    SubscriptionIndex,
 }
 
 /// Plan configuration that can be registered by the admin.
@@ -44,6 +52,14 @@ pub struct Plan {
     pub prepay_discount_bps: u32,
     /// Whether the plan is active and can be subscribed to.
     pub active: bool,
+}
+
+/// Lifecycle status of a fixed-term subscription.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    Active,
+    Expired,
 }
 
 /// Subscription configuration and state for a single (subscriber, plan) pair.
@@ -84,6 +100,12 @@ pub struct SubscriptionInfo {
     pub failed_charges_count: u32,
     /// Ledger of the first failed charge attempt in the current delinquency, if any.
     pub delinquent_since_ledger: Option<u32>,
+    /// Number of successfully completed billing cycles.
+    pub billing_cycles: u32,
+    /// Terminal cycle limit for fixed-term subscriptions (`None` = open-ended).
+    pub max_billing_cycles: Option<u32>,
+    /// Whether the subscription is still active or has reached its term end.
+    pub status: SubscriptionStatus,
 }
 
 /// Result of a single charge attempt that did not abort with an error.
