@@ -27,6 +27,10 @@ pub enum StakingError {
     InvalidLockup = 18,
     PermitExpired = 19,
     Overflow = 20,
+    InvalidSlashPercentage = 21,
+    UnauthorizedSlasher = 22,
+    NoPendingUnbond = 23,
+    InvalidSaturationConfig = 24,
 }
 
 impl_display_error!(
@@ -51,4 +55,8 @@ impl_display_error!(
     InvalidLockup          => "invalid lockup",
     PermitExpired          => "permit expired",
     Overflow               => "overflow",
+    InvalidSlashPercentage => "invalid slash percentage",
+    UnauthorizedSlasher    => "unauthorized slasher",
+    NoPendingUnbond        => "no pending unbond request",
+    InvalidSaturationConfig => "invalid saturation config",
 );
