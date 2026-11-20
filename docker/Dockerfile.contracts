@@ -1,11 +1,21 @@
-# Stage 1: build
+# syntax=docker/dockerfile:1.7
+
+# Stage 1: builder — pinned Rust toolchain, soroban-cli, and build deps.
+# This stage is heavy (toolchain + CLI + cargo registry) and is intentionally
+# kept out of the final image. Cargo cache mounts keep rebuilds reproducible
+# and fast without baking the registry into any layer.
 FROM rust:1.78-slim AS builder
+
+# Pin the stellar-cli (soroban-cli) version so WASM output stays reproducible.
+ARG STELLAR_CLI_VERSION=21.6.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev binaryen \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install --locked stellar-cli --features opt
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo install --locked stellar-cli --version "${STELLAR_CLI_VERSION}" --features opt
 
 WORKDIR /contracts
 # Build context is the repository root (see docker/docker-compose.yml's
@@ -19,7 +29,10 @@ COPY benches/ ./benches/
 COPY tests/ ./tests/
 COPY fuzz/ ./fuzz/
 
-RUN for dir in contracts/*/; do \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/contracts/target \
+    for dir in contracts/*/; do \
       [ -f "$dir/Cargo.toml" ] && stellar contract build --manifest-path "$dir/Cargo.toml"; \
     done
 
@@ -34,8 +47,20 @@ RUN echo "=== wasm-opt size reduction ===" && \
       echo "  $(basename $wasm): ${before}B → ${after}B (-${pct}%)"; \
     done
 
-# Stage 2: runtime — only .wasm artifacts
+# Stage 2: runtime — only .wasm artifacts and verification scripts.
+# No Rust toolchain, cargo registry, or build deps are copied here, keeping
+# the final image minimal (well under half the size of the builder image).
 FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /wasm
 COPY --from=builder /contracts/target/wasm32-unknown-unknown/release/*.wasm ./
+
+# Verification scripts for checking artifacts and reproducibility.
+COPY scripts/verify-wasm.sh scripts/verify-reproducible-wasm.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/verify-wasm.sh /usr/local/bin/verify-reproducible-wasm.sh
+
+ENTRYPOINT ["/usr/local/bin/verify-wasm.sh"]
