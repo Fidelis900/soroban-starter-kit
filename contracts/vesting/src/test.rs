@@ -663,3 +663,166 @@ fn milestone_revoke_conserves() {
     assert_eq!(pay + claw, 1001);
     assert_eq!(pay, 333); // 1001*3333/10000 rounded down
 }
+
+// ── #1455 revoke_grant ───────────────────────────────────────────────────────
+
+#[test]
+fn revoke_grant_returns_unvested_to_treasury() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &true);
+    
+    // At ledger 200, halfway through vesting period (150 to 250)
+    at(&c, 200);
+    let admin_bal_before = bal(&c, &c.admin);
+    let (paid, returned) = c.client.revoke_grant(&b);
+    
+    // Should have vested 500 tokens (50% of 150->250 range)
+    assert_eq!(paid, 500);
+    assert_eq!(returned, 500);
+    assert_eq!(bal(&c, &b), 500);
+    assert_eq!(bal(&c, &c.admin), admin_bal_before + 500);
+}
+
+#[test]
+fn revoke_grant_calculates_vested_correctly() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &true);
+    
+    // Beneficiary claims 200 tokens first
+    at(&c, 170);
+    let claimed = c.client.claim(&b);
+    assert_eq!(claimed, 200); // 20% vested
+    
+    // Admin revokes at ledger 200
+    at(&c, 200);
+    let admin_bal_before = bal(&c, &c.admin);
+    let (paid, returned) = c.client.revoke_grant(&b);
+    
+    // Total vested = 500, already claimed = 200, so paid = 300
+    assert_eq!(paid, 300);
+    assert_eq!(returned, 500); // 1000 - 500 vested
+    assert_eq!(bal(&c, &b), 200 + 300);
+    assert_eq!(bal(&c, &c.admin), admin_bal_before + 500);
+}
+
+#[test]
+fn revoke_grant_irrevocable_fails() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &false); // irrevocable
+    
+    at(&c, 200);
+    assert_eq!(
+        c.client.try_revoke_grant(&b),
+        Err(Ok(VestingError::ScheduleIrrevocable))
+    );
+}
+
+// ── #1456 validate_bounds ────────────────────────────────────────────────────
+
+#[test]
+fn cliff_after_end_rejected() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    at(&c, 100);
+    
+    // cliff_ledger > end_ledger should fail
+    assert_eq!(
+        c.client.try_create_schedule(&b, &100, &300, &250, &1000, &true),
+        Err(Ok(VestingError::InvalidScheduleBounds))
+    );
+}
+
+#[test]
+fn start_after_cliff_rejected() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    at(&c, 100);
+    
+    // start_ledger > cliff_ledger should fail
+    assert_eq!(
+        c.client.try_create_schedule(&b, &200, &150, &250, &1000, &true),
+        Err(Ok(VestingError::InvalidScheduleTimeline))
+    );
+}
+
+// ── #1457 batch vesting ──────────────────────────────────────────────────────
+
+#[test]
+fn create_schedules_batch_single_transfer() {
+    let c = setup_ctx();
+    let b1 = Address::generate(&c.env);
+    let b2 = Address::generate(&c.env);
+    let b3 = Address::generate(&c.env);
+    
+    let schedules = vec![
+        &c.env,
+        ScheduleParams {
+            beneficiary: b1.clone(),
+            start_ledger: 110,
+            cliff_ledger: 110,
+            end_ledger: 210,
+            amount: 1000,
+            is_revocable: true,
+        },
+        ScheduleParams {
+            beneficiary: b2.clone(),
+            start_ledger: 110,
+            cliff_ledger: 110,
+            end_ledger: 210,
+            amount: 2000,
+            is_revocable: true,
+        },
+        ScheduleParams {
+            beneficiary: b3.clone(),
+            start_ledger: 110,
+            cliff_ledger: 110,
+            end_ledger: 210,
+            amount: 3000,
+            is_revocable: false,
+        },
+    ];
+    
+    let admin_bal_before = bal(&c, &c.admin);
+    c.client.create_schedules_batch(&c.admin, &schedules);
+    
+    // Total of 6000 tokens should have been transferred once
+    assert_eq!(bal(&c, &c.admin), admin_bal_before - 6000);
+    
+    // Verify all schedules created
+    assert_eq!(c.client.get_info(&b1).unwrap().amount, 1000);
+    assert_eq!(c.client.get_info(&b2).unwrap().amount, 2000);
+    assert_eq!(c.client.get_info(&b3).unwrap().amount, 3000);
+    assert_eq!(c.client.get_info(&b3).unwrap().is_revocable, false);
+}
+
+#[test]
+fn batch_creation_matches_individual() {
+    let c = setup_ctx();
+    let b1 = Address::generate(&c.env);
+    let b2 = Address::generate(&c.env);
+    
+    // Create first schedule individually
+    c.client.create_schedule(&b1, &110, &110, &210, &1000, &true);
+    
+    // Create second via batch
+    let schedules = vec![
+        &c.env,
+        ScheduleParams {
+            beneficiary: b2.clone(),
+            start_ledger: 110,
+            cliff_ledger: 110,
+            end_ledger: 210,
+            amount: 1000,
+            is_revocable: true,
+        },
+    ];
+    c.client.create_schedules_batch(&c.admin, &schedules);
+    
+    // Both should have identical schedules
+    at(&c, 160);
+    assert_eq!(c.client.claimable(&b1), c.client.claimable(&b2));
+}
+

@@ -86,6 +86,10 @@ pub enum DataKey {
     DecayFactorBps,
     /// Per-staker: queue of pending unbond requests (`Vec<UnbondRequest>`).
     PendingUnbonds(Address),
+    /// Contract paused state (`bool`).
+    Paused,
+    /// Emergency unstake penalty in basis points (`i128`).
+    EmergencyPenaltyBps,
 }
 
 /// Boost denominator: 10_000 basis points = 1x.

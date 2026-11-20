@@ -31,6 +31,7 @@ pub enum VestingError {
     RotationPending = 22,
     RotationTimelockActive = 23,
     InvalidBeneficiary = 24,
+    InvalidScheduleTimeline = 25,
 }
 
 impl_display_error!(
@@ -59,6 +60,7 @@ impl_display_error!(
     RotationPending          => "rotation pending",
     RotationTimelockActive   => "rotation timelock active",
     InvalidBeneficiary       => "invalid beneficiary",
+    InvalidScheduleTimeline  => "invalid schedule timeline",
 );
 
 #[cfg(test)]
@@ -96,7 +98,8 @@ VestingError::ClaimBelowMinimum = {}\n\
 VestingError::RotationNotFound = {}\n\
 VestingError::RotationPending = {}\n\
 VestingError::RotationTimelockActive = {}\n\
-VestingError::InvalidBeneficiary = {}\n",
+VestingError::InvalidBeneficiary = {}\n\
+VestingError::InvalidScheduleTimeline = {}\n",
             VestingError::AlreadyInitialized as u32,
             VestingError::NotInitialized as u32,
             VestingError::NotAuthorized as u32,
@@ -121,6 +124,7 @@ VestingError::InvalidBeneficiary = {}\n",
             VestingError::RotationPending as u32,
             VestingError::RotationTimelockActive as u32,
             VestingError::InvalidBeneficiary as u32,
+            VestingError::InvalidScheduleTimeline as u32,
         )
     }
 

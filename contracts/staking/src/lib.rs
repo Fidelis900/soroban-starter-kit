@@ -918,5 +918,114 @@ mod contract {
         pub fn reward_per_token_stored(env: Env) -> i128 {
             reward_per_token(&env)
         }
+
+        /// Pause the contract (admin only).
+        pub fn pause(env: Env) -> Result<(), StakingError> {
+            let admin = get_admin(&env)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Paused, &true);
+            bump(&env);
+            Ok(())
+        }
+
+        /// Unpause the contract (admin only).
+        pub fn unpause(env: Env) -> Result<(), StakingError> {
+            let admin = get_admin(&env)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Paused, &false);
+            bump(&env);
+            Ok(())
+        }
+
+        /// Check if the contract is paused.
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false)
+        }
+
+        /// Set the emergency unstake penalty in basis points (admin only).
+        ///
+        /// # Errors
+        /// - [`StakingError::InvalidPenalty`] if penalty exceeds 10_000 bps.
+        pub fn set_emergency_penalty(env: Env, penalty_bps: i128) -> Result<(), StakingError> {
+            let admin = get_admin(&env)?;
+            admin.require_auth();
+            if penalty_bps < 0 || penalty_bps > BPS_DENOMINATOR {
+                return Err(StakingError::InvalidPenalty);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::EmergencyPenaltyBps, &penalty_bps);
+            bump(&env);
+            Ok(())
+        }
+
+        /// Emergency unstake available only when the contract is paused.
+        /// Forfeits all pending rewards and applies a penalty fee (burned).
+        ///
+        /// # Errors
+        /// - [`StakingError::ContractNotPaused`] if the contract is not paused.
+        /// - [`StakingError::InsufficientStake`] if the staker has no active stake.
+        pub fn emergency_unstake(env: Env, staker: Address) -> Result<i128, StakingError> {
+            staker.require_auth();
+            if !Self::is_paused(env.clone()) {
+                return Err(StakingError::ContractNotPaused);
+            }
+
+            let stake = stake_of(&env, &staker);
+            if stake <= 0 {
+                return Err(StakingError::InsufficientStake);
+            }
+
+            // Forfeit all pending rewards
+            env.storage()
+                .persistent()
+                .set(&DataKey::Rewards(staker.clone()), &0i128);
+
+            // Apply penalty
+            let penalty_bps: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::EmergencyPenaltyBps)
+                .unwrap_or(0);
+            let penalty_amount = mul_div(stake, penalty_bps, BPS_DENOMINATOR)
+                .map_err(|_| StakingError::Overflow)?;
+            let return_amount = stake
+                .checked_sub(penalty_amount)
+                .ok_or(StakingError::Overflow)?;
+
+            // Update stake tracking
+            let total = get_total_staked_internal(&env)?
+                .checked_sub(stake)
+                .ok_or(StakingError::Overflow)?;
+            let old_weight = get_p_i128(&env, &DataKey::Weight(staker.clone()));
+            let weight_total = total_weight(&env)
+                .checked_sub(old_weight)
+                .ok_or(StakingError::Overflow)?;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(staker.clone()), &0i128);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Weight(staker.clone()), &0i128);
+            env.storage().instance().set(&DataKey::TotalStaked, &total);
+            env.storage().instance().set(&DataKey::TotalWeight, &weight_total);
+
+            // Transfer return amount to staker, penalty is burned (stays in contract)
+            if return_amount > 0 {
+                let stake_token = get_stake_token(&env)?;
+                token::Client::new(&env, &stake_token).transfer(
+                    &env.current_contract_address(),
+                    &staker,
+                    &return_amount,
+                );
+            }
+
+            bump(&env);
+            Ok(return_amount)
+        }
     }
 }
