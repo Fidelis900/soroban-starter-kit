@@ -195,6 +195,44 @@ fn test_pledge_after_deadline_fails() {
 }
 
 #[test]
+fn test_pledge_after_deadline_returns_campaign_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 10;
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+
+    // Advance the ledger past the campaign deadline.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    assert_eq!(
+        client.try_pledge(&c1, &500, &None),
+        Err(Ok(CrowdfundError::CampaignExpired))
+    );
+    // No funds were accepted into the expired campaign.
+    assert_eq!(client.get_pledge(&c1), 0);
+    assert_eq!(client.get_info().total_pledged, 0);
+}
+
+#[test]
+fn test_pledge_just_before_deadline_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 10;
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+
+    // Last ledger before the deadline still accepts pledges.
+    env.ledger().with_mut(|l| l.sequence_number = deadline - 1);
+    client.pledge(&c1, &500, &None);
+
+    assert_eq!(client.get_pledge(&c1), 500);
+    assert_eq!(client.get_info().total_pledged, 500);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_claim_before_deadline_fails() {
     let env = Env::default();

@@ -64,6 +64,13 @@ pub fn milestone_voted(env: &Env, milestone_id: u32, voter: &Address, approve: b
     );
 }
 
+pub fn milestone_approved(env: &Env, milestone_id: u32, approvals: i128, quorum: i128) {
+    env.events().publish(
+        (Symbol::new(env, "milestone_approved"), milestone_id),
+        (approvals, quorum),
+    );
+}
+
 pub fn project_update(env: &Env, creator: &Address, update_hash: &soroban_sdk::BytesN<32>, uri: &soroban_sdk::String) {
     env.events().publish(
         (Symbol::new(env, "project_update"), creator.clone()),
