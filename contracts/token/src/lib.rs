@@ -161,7 +161,7 @@ mod contract {
                     .get::<DataKey, i128>(&DataKey::MaxSupply)
                 {
                     if supply.checked_add(amount).ok_or(TokenError::Overflow)? > cap {
-                        return Err(TokenError::InvalidAmount);
+                        return Err(TokenError::MaxSupplyExceeded);
                     }
                 }
             }
@@ -217,7 +217,7 @@ mod contract {
                         .ok_or(TokenError::Overflow)?
                         > cap
                     {
-                        return Err(TokenError::InvalidAmount);
+                        return Err(TokenError::MaxSupplyExceeded);
                     }
                 }
             }
@@ -615,6 +615,45 @@ mod contract {
                 signature,
             )
         }
+
+        /// SEP-41 / EIP-2612 style `permit`: grant `spender` an allowance of
+        /// `value` over `owner`'s tokens using an off-chain ed25519 signature,
+        /// so the owner never has to submit (or pay for) the approval
+        /// transaction themselves.
+        ///
+        /// The signed payload is
+        /// `(contract_address, owner, spender, value, nonce, deadline)`,
+        /// XDR-serialized and verified against the key registered with
+        /// [`Self::set_permit_signer`]. `nonce` must equal
+        /// [`Self::permit_nonce`] for `owner` and is incremented on success, so
+        /// nonces are strictly sequential and a signature can never be
+        /// replayed. `deadline` is the last ledger sequence at which the permit
+        /// may be submitted and becomes the resulting allowance's expiration.
+        ///
+        /// # Errors
+        /// - [`TokenError::PermitExpired`] if the current ledger is past `deadline`.
+        /// - [`TokenError::InvalidNonce`] if `nonce` is not the owner's next
+        ///   sequential nonce, or has been cancelled.
+        /// - [`TokenError::PermitSignerNotSet`] if `owner` never registered a key.
+        ///
+        /// # Panics
+        /// If `signature` is not a valid ed25519 signature over the payload.
+        pub fn permit(
+            env: Env,
+            owner: Address,
+            spender: Address,
+            value: i128,
+            nonce: u32,
+            deadline: u32,
+            signature: BytesN<64>,
+        ) -> Result<(), TokenError> {
+            if value < 0 {
+                return Err(TokenError::InvalidAmount);
+            }
+            permit::approve_with_signature(
+                env, owner, spender, value, nonce, deadline, signature,
+            )
+        }
     }
 
     /// Pause / unpause — only compiled when the `pausable` feature is enabled.
@@ -814,6 +853,12 @@ mod contract {
     #[cfg(feature = "capped-supply")]
     #[contractimpl]
     impl TokenContract {
+        /// Return the immutable maximum supply set at initialization, if any.
+        ///
+        /// The cap can only be set once in `initialize`; no entry point exists
+        /// to change it afterwards. `mint` and `batch_mint` reject any call that
+        /// would push `total_supply` above it with
+        /// [`TokenError::MaxSupplyExceeded`].
         #[must_use]
         pub fn max_supply(env: Env) -> Option<i128> {
             env.storage().instance().get(&DataKey::MaxSupply)
@@ -884,11 +929,14 @@ mod contract {
             to: Address,
             amount: i128,
         ) -> Result<(), TokenError> {
+            // Reject zero/negative amounts before anything else (including the
+            // self-transfer shortcut) so no-op transfers can't be used to spam
+            // events or indexers.
+            if amount <= 0 {
+                return Err(TokenError::ZeroAmount);
+            }
             if from == to {
                 return Ok(());
-            }
-            if amount <= 0 {
-                return Err(TokenError::InvalidAmount);
             }
             require_not_locked(env, &from)?;
             Self::update_balance(env, &from, -amount)?;

@@ -86,6 +86,9 @@ pub fn balance(env: Env, id: Address) -> i128 {
 
 pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
     from.require_auth();
+    if amount <= 0 {
+        panic_with_error!(&env, TokenError::ZeroAmount);
+    }
     #[cfg(feature = "pausable")]
     if let Err(e) = require_not_paused(&env) {
         panic_with_error!(&env, e);
@@ -98,7 +101,7 @@ pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
     if let Err(e) = require_not_blacklisted(&env, &from) {
         panic_with_error!(&env, e);
     }
-    if require_not_locked(&env, &from) {
+    if require_not_locked(&env, &from).is_err() {
         panic_with_error!(&env, TokenError::AccountLocked);
     }
     let to_address: Address = to.address();
@@ -109,6 +112,11 @@ pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
 
 pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
     spender.require_auth();
+    // Reject before touching the allowance so a zero/negative call can never
+    // emit events or mutate state.
+    if amount <= 0 {
+        panic_with_error!(&env, TokenError::ZeroAmount);
+    }
     #[cfg(feature = "pausable")]
     if let Err(e) = require_not_paused(&env) {
         panic_with_error!(&env, e);
@@ -121,7 +129,7 @@ pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amo
     if let Err(e) = require_not_blacklisted(&env, &from) {
         panic_with_error!(&env, e);
     }
-    if require_not_locked(&env, &from) {
+    if require_not_locked(&env, &from).is_err() {
         panic_with_error!(&env, TokenError::AccountLocked);
     }
     if let Err(e) = validate_and_deduct_allowance(&env, from.clone(), spender.clone(), amount) {
@@ -182,6 +190,20 @@ pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
     if let Err(e) = require_not_blacklisted(&env, &from) {
         panic_with_error!(&env, e);
     }
+    if amount <= 0 {
+        panic_with_error!(&env, TokenError::InvalidAmount);
+    }
+    // Allowance check first: an unauthorized spender must fail with
+    // `InsufficientAllowance` regardless of the owner's balance.
+    if get_allowance(&env, from.clone(), spender.clone()) < amount {
+        panic_with_error!(&env, TokenError::InsufficientAllowance);
+    }
+    // Explicit balance validation before any state is written.
+    if balance(env.clone(), from.clone()) < amount {
+        panic_with_error!(&env, TokenError::InsufficientBalance);
+    }
+    // Owner balance, spender allowance and total supply are all updated in
+    // this single invocation; any failure below reverts all of them.
     if let Err(e) = validate_and_deduct_allowance(&env, from.clone(), spender.clone(), amount) {
         panic_with_error!(&env, e);
     }
