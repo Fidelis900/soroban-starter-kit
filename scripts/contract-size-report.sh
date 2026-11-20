@@ -1,92 +1,117 @@
 #!/usr/bin/env bash
-# scripts/contract-size-report.sh — Build each contract's optimised WASM and report its size.
-#
-# Usage:
-#   ./scripts/contract-size-report.sh [--check <limit_kb>]
-#
-# Options:
-#   --check <limit_kb>   Exit non-zero if any contract exceeds <limit_kb> KB (default: no limit).
-#
-# Soroban imposes resource limits sensitive to contract size, so tracking WASM
-# sizes in CI makes size regressions immediately visible.
-
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-log()  { echo -e "\033[1;34m[size-report]\033[0m $*"; }
-ok()   { echo -e "\033[1;32m[ok]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[warn]\033[0m $*"; }
-die()  { echo -e "\033[1;31m[error]\033[0m $*" >&2; exit 1; }
-
-# ── Argument parsing ──────────────────────────────────────────────────────────
-LIMIT_KB=""
+LIMIT_BYTES=65536
+JSON_OUT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --check)
-      shift
-      [[ $# -gt 0 ]] || die "--check requires a numeric KB argument"
-      LIMIT_KB="$1"
-      ;;
-    *) warn "Unknown argument: $1" ;;
+    --limit-bytes) [[ $# -ge 2 ]] || { echo "--limit-bytes requires a value" >&2; exit 2; }; LIMIT_BYTES="$2"; shift 2 ;;
+    --json-out) [[ $# -ge 2 ]] || { echo "--json-out requires a path" >&2; exit 2; }; JSON_OUT="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
-  shift
 done
 
-# ── Prerequisite checks ───────────────────────────────────────────────────────
-command -v stellar &>/dev/null || die "stellar-cli not found — run ./scripts/setup.sh first"
-rustup target list --installed | grep -q "wasm32-unknown-unknown" \
-  || die "wasm32-unknown-unknown target not installed — run: rustup target add wasm32-unknown-unknown"
-
-# ── Build & measure ───────────────────────────────────────────────────────────
-CONTRACTS_DIR="$ROOT/contracts"
-RELEASE_DIR="$ROOT/target/wasm32-unknown-unknown/release"
-
-exceeded=()
-printf "\n%-30s %10s\n" "CONTRACT" "SIZE"
-printf "%-30s %10s\n" "--------" "----"
-
-for manifest in "$CONTRACTS_DIR"/*/Cargo.toml; do
-  contract_dir="$(dirname "$manifest")"
-  contract_name="$(basename "$contract_dir")"
-
-  log "Building $contract_name..."
-  stellar contract build --manifest-path "$manifest" --quiet 2>/dev/null \
-    || { warn "Build failed for $contract_name — skipping"; continue; }
-
-  # Resolve WASM file — stellar-cli uses underscores in the output filename
-  wasm_name="${contract_name//-/_}.wasm"
-  wasm_path="$RELEASE_DIR/$wasm_name"
-
-  # Fallback: find the most recently modified wasm matching the contract
-  if [[ ! -f "$wasm_path" ]]; then
-    wasm_path="$(ls -t "$RELEASE_DIR"/*"${contract_name//-/_}"*.wasm 2>/dev/null | head -n1 || true)"
-  fi
-
-  if [[ -z "$wasm_path" || ! -f "$wasm_path" ]]; then
-    warn "Could not locate WASM for $contract_name — skipping"
-    continue
-  fi
-
-  size_bytes="$(wc -c < "$wasm_path")"
-  size_kb="$(echo "scale=2; $size_bytes / 1024" | bc)"
-
-  printf "%-30s %7s KB\n" "$contract_name" "$size_kb"
-
-  if [[ -n "$LIMIT_KB" ]] && (( $(echo "$size_kb > $LIMIT_KB" | bc -l) )); then
-    exceeded+=("$contract_name (${size_kb} KB > ${LIMIT_KB} KB limit)")
-  fi
+[[ "$LIMIT_BYTES" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid byte limit: $LIMIT_BYTES" >&2; exit 2; }
+for tool in stellar cargo rustup python3; do
+  command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }
 done
 
-printf "\n"
+TARGET="wasm32v1-none"
+installed_targets="$(rustup target list --installed)"
+grep -Fxq "$TARGET" <<< "$installed_targets" || {
+  echo "Rust target $TARGET is not installed" >&2
+  exit 1
+}
 
-if [[ ${#exceeded[@]} -gt 0 ]]; then
-  warn "The following contracts exceed the ${LIMIT_KB} KB limit:"
-  for entry in "${exceeded[@]}"; do
-    echo "  ❌  $entry"
-  done
+metadata="$(cargo metadata --format-version 1 --no-deps)"
+mapfile -t contracts < <(python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+root = data["workspace_root"] + "/contracts/"
+for package in sorted(data["packages"], key=lambda p: p["name"]):
+    if not package["manifest_path"].startswith(root):
+        continue
+    target = next((t for t in package["targets"] if "cdylib" in t["crate_types"]), None)
+    if target:
+        print(package["manifest_path"] + "\t" + target["name"] + "\t" + package["name"])
+' <<< "$metadata")
+
+if (( ${#contracts[@]} == 0 )); then
+  echo "No contract cdylib targets found under contracts/" >&2
   exit 1
 fi
 
-ok "Size report complete."
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+results="$tmpdir/results.tsv"
+: > "$results"
+failed=0
+
+printf '%-32s %12s %12s\n' "PACKAGE" "OPTIMIZED" "BUDGET"
+for entry in "${contracts[@]}"; do
+  IFS=$'\t' read -r manifest target package <<< "$entry"
+  echo "::group::Build and optimize $package"
+  if ! stellar contract build --manifest-path "$manifest"; then
+    echo "ERROR: contract build failed for $package" >&2
+    failed=1
+    echo "::endgroup::"
+    continue
+  fi
+
+  wasm="$ROOT/target/$TARGET/release/$target.wasm"
+  if [[ ! -s "$wasm" ]]; then
+    echo "ERROR: expected WASM artifact missing or empty: $wasm" >&2
+    failed=1
+    echo "::endgroup::"
+    continue
+  fi
+
+  optimized="$tmpdir/$target.optimized.wasm"
+  if ! stellar contract optimize --wasm "$wasm" --wasm-out "$optimized"; then
+    echo "ERROR: WASM optimization failed for $package" >&2
+    failed=1
+    echo "::endgroup::"
+    continue
+  fi
+  if [[ ! -s "$optimized" ]]; then
+    echo "ERROR: optimizer produced no artifact for $package" >&2
+    failed=1
+    echo "::endgroup::"
+    continue
+  fi
+
+  bytes="$(wc -c < "$optimized" | tr -d ' ')"
+  printf '%s\t%s\n' "$package" "$bytes" >> "$results"
+  printf '%-32s %9s B %9s B\n' "$package" "$bytes" "$LIMIT_BYTES"
+  if (( bytes > LIMIT_BYTES )); then
+    echo "ERROR: $package optimized WASM is $bytes bytes; maximum is $LIMIT_BYTES bytes" >&2
+    failed=1
+  fi
+  echo "::endgroup::"
+done
+
+if [[ -n "$JSON_OUT" ]]; then
+  python3 - "$JSON_OUT" "$LIMIT_BYTES" "$results" <<'PY'
+import json
+import sys
+path, limit, result_path = sys.argv[1:]
+contracts = {}
+with open(result_path, encoding="utf-8") as source:
+    for line in source:
+        name, size = line.rstrip("\n").split("\t")
+        contracts[name] = int(size)
+with open(path, "w", encoding="utf-8") as output:
+    json.dump({"limit_bytes": int(limit), "contracts": contracts}, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+fi
+
+if (( failed != 0 )); then
+  echo "Contract size check failed." >&2
+  exit 1
+fi
+
+echo "All ${#contracts[@]} optimized contract artifacts are within the ${LIMIT_BYTES}-byte budget."
