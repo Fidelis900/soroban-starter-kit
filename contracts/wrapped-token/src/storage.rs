@@ -50,6 +50,22 @@ pub enum DataKey {
     /// Instance storage – optional minimum amount (`i128`) accepted by `wrap`
     /// and `unwrap`. Absent means no minimum is enforced.
     MinAmount,
+    /// Instance storage – reentrancy lock (`bool`) held for the duration of
+    /// `wrap`, `unwrap` and their batch variants (#1435). Absent means unlocked.
+    ReentrancyLock,
+}
+
+/// Proof-of-reserve snapshot returned by
+/// [`WrappedTokenContract::get_reserve_status`](crate::WrappedTokenContract::get_reserve_status) (#1436).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReserveStatus {
+    /// Wrapped-token supply tracked by the contract.
+    pub total_wrapped: i128,
+    /// Underlying collateral actually held by the contract.
+    pub total_locked: i128,
+    /// `true` when `total_wrapped <= total_locked`, i.e. the 1:1 backing holds.
+    pub is_fully_backed: bool,
 }
 
 #[cfg(test)]
@@ -77,12 +93,13 @@ mod discriminant_tests {
             DataKey::WrapFeeBps => 9,
             DataKey::UnwrapFeeBps => 10,
             DataKey::FeeRecipient => 11,
-            DataKey::UnwrapRateLimit => 7,
-            DataKey::UnwrapRateWindow => 8,
-            DataKey::UnwrapRateUsage => 9,
-            DataKey::UnwrapRateLimitPaused => 10,
-            DataKey::PorOracle => 11,
-            DataKey::MinAmount => 12,
+            DataKey::UnwrapRateLimit => 12,
+            DataKey::UnwrapRateWindow => 13,
+            DataKey::UnwrapRateUsage => 14,
+            DataKey::UnwrapRateLimitPaused => 15,
+            DataKey::PorOracle => 16,
+            DataKey::MinAmount => 17,
+            DataKey::ReentrancyLock => 18,
         }
     }
 
@@ -97,18 +114,18 @@ mod discriminant_tests {
         assert_eq!(wrapped_token_data_key_index(&DataKey::TotalWrapped), 3);
         assert_eq!(wrapped_token_data_key_index(&DataKey::Paused), 4);
         assert_eq!(wrapped_token_data_key_index(&DataKey::MaxWrapPerAddress), 5);
-        assert_eq!(
-            wrapped_token_data_key_index(&DataKey::WrappedByAddress(addr)),
-            6
-        );
-        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateLimit), 7);
-        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateWindow), 8);
-        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateUsage), 9);
-        assert_eq!(
-            wrapped_token_data_key_index(&DataKey::UnwrapRateLimitPaused),
-            10
-        );
-        assert_eq!(wrapped_token_data_key_index(&DataKey::PorOracle), 11);
-        assert_eq!(wrapped_token_data_key_index(&DataKey::MinAmount), 12);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::WrappedByAddress(addr)), 6);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::WrapPaused), 7);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapPaused), 8);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::WrapFeeBps), 9);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapFeeBps), 10);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::FeeRecipient), 11);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateLimit), 12);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateWindow), 13);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateUsage), 14);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::UnwrapRateLimitPaused), 15);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::PorOracle), 16);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::MinAmount), 17);
+        assert_eq!(wrapped_token_data_key_index(&DataKey::ReentrancyLock), 18);
     }
 }

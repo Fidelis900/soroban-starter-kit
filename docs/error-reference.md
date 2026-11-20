@@ -216,7 +216,7 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 **Common cause:** Invoking `wrap`, `unwrap`, or `get_reserve_balance` before `initialize` has been called.
 
-**Resolution:** Call `initialize` with the admin, wrapped token, underlying token, optional per-address cap and optional wrap/unwrap fee configuration before any other interaction.
+**Resolution:** Call `initialize` with the admin, wrapped token, underlying token, optional per-address cap and optional minimum amount before any other interaction. Fees are configured afterwards with `set_fees`.
 
 ---
 
@@ -282,7 +282,7 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 ### `InvalidFee` (code 9)
 
-**Description:** `initialize` was given a `wrap_fee_bps` or `unwrap_fee_bps` above 10_000, or a non-zero fee without a `fee_recipient`.
+**Description:** `set_fees` was given a `wrap_fee_bps` or `unwrap_fee_bps` above 10_000, or a non-zero fee without a `fee_recipient`.
 
 **Common cause:** Passing a percentage instead of basis points, or omitting the fee recipient.
 
@@ -295,6 +295,42 @@ Comprehensive reference for all error codes returned by the contracts in this re
 **Description:** `wrap_batch` or `unwrap_batch` was called with an empty recipient list.
 
 **Resolution:** Pass at least one `(recipient, amount)` pair.
+
+---
+
+### `RateLimitExceeded` (code 11)
+
+**Description:** The aggregate amount unwrapped in the current ledger window would exceed the cap set with `set_unwrap_rate_limit`.
+
+**Resolution:** Retry after the window rolls over, or split the unwrap across windows.
+
+---
+
+### `AmountTooLow` (code 12)
+
+**Description:** A `wrap`/`unwrap` amount is below the configured minimum (`min_amount()`).
+
+**Resolution:** Use an amount at or above `min_amount()`.
+
+---
+
+### `Reentrancy` (code 13)
+
+**Description:** `wrap`, `unwrap` or a batch variant was invoked while another wrap/unwrap was still executing on the same contract (for example from a malicious underlying token's `transfer` hook).
+
+**Common cause:** A token contract attempting a cross-contract re-entrancy attack.
+
+**Resolution:** None for honest callers — the nested call is rejected and the outer operation is unaffected.
+
+---
+
+### `UnderlyingTransferFailed` (code 14)
+
+**Description:** The underlying asset transfer during `unwrap` (or a fee payout) reverted, or completed without moving exactly the expected amount out of the reserve. The whole operation, including the wrapped-token burn, was rolled back — no balance was lost.
+
+**Common cause:** The underlying token is frozen/paused, the recipient is blocked by the asset issuer, or the underlying token is non-compliant.
+
+**Resolution:** Retry once the underlying asset accepts transfers again, or unwrap to a different recipient with `unwrap_batch`.
 
 ---
 
