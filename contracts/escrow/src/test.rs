@@ -2011,3 +2011,334 @@ fn test_multi_arbiter_non_committee_approval_rejected() {
     let outsider = Address::generate(&env);
     client.approve_dispute(&outsider, &true);
 }
+
+// ---------------------------------------------------------------------------
+// Staged percentage milestones with per-milestone dispute windows (#1437)
+// ---------------------------------------------------------------------------
+
+mod staged_milestones {
+    use super::*;
+    use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+    struct Staged<'a> {
+        client: EscrowContractClient<'a>,
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        token: TokenClient<'a>,
+    }
+
+    fn stages(env: &Env, spec: &[(u32, u32)]) -> Vec<MilestoneStage> {
+        let mut v = Vec::new(env);
+        for (percentage_bps, dispute_window_ledgers) in spec {
+            v.push_back(MilestoneStage {
+                percentage_bps: *percentage_bps,
+                dispute_window_ledgers: *dispute_window_ledgers,
+            });
+        }
+        v
+    }
+
+    /// Register a staged escrow backed by a real Stellar Asset Contract so
+    /// balances can be asserted, then fund it with `total`.
+    fn setup<'a>(env: &'a Env, total: i128, spec: &[(u32, u32)]) -> Staged<'a> {
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let arbiter = Address::generate(env);
+
+        let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_addr = sac.address();
+        StellarAssetClient::new(env, &token_addr).mint(&buyer, &total);
+
+        let (client, _) = create_escrow_contract(env);
+        client.initialize_with_milestone_schedule(
+            &admin,
+            &buyer,
+            &seller,
+            &arbiter,
+            &token_addr,
+            &total,
+            &stages(env, spec),
+            &(env.ledger().sequence() + 10_000),
+            &None,
+        );
+        client.fund();
+
+        Staged {
+            client,
+            buyer,
+            seller,
+            arbiter,
+            token: TokenClient::new(env, &token_addr),
+        }
+    }
+
+    fn set_ledger(env: &Env, seq: u32) {
+        env.ledger().with_mut(|l| l.sequence_number = seq);
+    }
+
+    #[test]
+    fn schedule_splits_total_by_percentage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(3_000, 10), (3_000, 10), (4_000, 10)]);
+
+        let schedule = s.client.get_staged_milestones();
+        assert_eq!(schedule.len(), 3);
+        assert_eq!(schedule.get(0).unwrap().amount, 300);
+        assert_eq!(schedule.get(1).unwrap().amount, 300);
+        assert_eq!(schedule.get(2).unwrap().amount, 400);
+        for m in schedule.iter() {
+            assert_eq!(m.status, MilestoneStatus::Pending);
+        }
+        assert_eq!(s.token.balance(&s.client.address), 1_000);
+    }
+
+    #[test]
+    fn last_stage_absorbs_rounding_remainder() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(3_333, 10), (3_333, 10), (3_334, 10)]);
+
+        let schedule = s.client.get_staged_milestones();
+        let total: i128 = schedule.iter().map(|m| m.amount).sum();
+        assert_eq!(total, 1_000);
+        assert_eq!(schedule.get(0).unwrap().amount, 333);
+        assert_eq!(schedule.get(1).unwrap().amount, 333);
+        assert_eq!(schedule.get(2).unwrap().amount, 334);
+    }
+
+    #[test]
+    fn multi_stage_disbursement_releases_fractional_amounts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(3_000, 20), (3_000, 20), (4_000, 20)]);
+
+        // Stage 0: seller submits, buyer approves immediately.
+        s.client.submit_milestone(&0);
+        s.client.approve_milestone(&0);
+        assert_eq!(s.token.balance(&s.seller), 300);
+        assert_eq!(s.client.get_escrow_info().amount, 700);
+        assert_eq!(s.client.get_state(), Some(EscrowState::Funded));
+
+        // Stage 1: seller submits, window lapses, seller claims automatically.
+        s.client.submit_milestone(&1);
+        set_ledger(&env, env.ledger().sequence() + 21);
+        s.client.claim_milestone(&1);
+        assert_eq!(s.token.balance(&s.seller), 600);
+        assert_eq!(s.client.get_escrow_info().amount, 400);
+
+        // Stage 2: buyer disputes in-window, arbiter releases to seller.
+        s.client.submit_milestone(&2);
+        s.client.dispute_milestone(&2);
+        assert_eq!(
+            s.client.get_staged_milestones().get(2).unwrap().status,
+            MilestoneStatus::Disputed
+        );
+        s.client.resolve_milestone_dispute(&s.arbiter, &2, &true);
+
+        assert_eq!(s.token.balance(&s.seller), 1_000);
+        assert_eq!(s.token.balance(&s.client.address), 0);
+        assert_eq!(s.client.get_escrow_info().amount, 0);
+        assert_eq!(s.client.get_state(), Some(EscrowState::Completed));
+        for m in s.client.get_staged_milestones().iter() {
+            assert_eq!(m.status, MilestoneStatus::Released);
+        }
+    }
+
+    #[test]
+    fn disputed_stage_can_be_refunded_to_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(5_000, 10), (5_000, 10)]);
+
+        s.client.submit_milestone(&0);
+        // Dispute on the last in-window ledger is still accepted.
+        set_ledger(&env, env.ledger().sequence() + 10);
+        s.client.dispute_milestone(&0);
+        s.client.resolve_milestone_dispute(&s.arbiter, &0, &false);
+
+        assert_eq!(s.token.balance(&s.buyer), 500);
+        assert_eq!(s.token.balance(&s.seller), 0);
+        assert_eq!(s.client.get_escrow_info().amount, 500);
+        assert_eq!(
+            s.client.get_staged_milestones().get(0).unwrap().status,
+            MilestoneStatus::Refunded
+        );
+        // Escrow stays open for the remaining stage.
+        assert_eq!(s.client.get_state(), Some(EscrowState::Funded));
+
+        s.client.approve_milestone(&1);
+        assert_eq!(s.token.balance(&s.seller), 500);
+        assert_eq!(s.client.get_state(), Some(EscrowState::Completed));
+    }
+
+    #[test]
+    fn all_stages_refunded_marks_escrow_refunded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(10_000, 5)]);
+
+        s.client.submit_milestone(&0);
+        s.client.dispute_milestone(&0);
+        s.client.resolve_milestone_dispute(&s.arbiter, &0, &false);
+
+        assert_eq!(s.token.balance(&s.buyer), 1_000);
+        assert_eq!(s.client.get_state(), Some(EscrowState::Refunded));
+    }
+
+    #[test]
+    fn dispute_after_window_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(5_000, 10), (5_000, 10)]);
+
+        s.client.submit_milestone(&0);
+        set_ledger(&env, env.ledger().sequence() + 11);
+        assert!(matches!(
+            s.client.try_dispute_milestone(&0),
+            Err(Ok(EscrowError::DisputeWindowClosed))
+        ));
+        // Window lapsed: seller can claim.
+        s.client.claim_milestone(&0);
+        assert_eq!(s.token.balance(&s.seller), 500);
+    }
+
+    #[test]
+    fn claim_before_window_elapses_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(5_000, 10), (5_000, 10)]);
+
+        s.client.submit_milestone(&0);
+        set_ledger(&env, env.ledger().sequence() + 10);
+        assert!(matches!(
+            s.client.try_claim_milestone(&0),
+            Err(Ok(EscrowError::DisputeWindowOpen))
+        ));
+        assert_eq!(s.token.balance(&s.seller), 0);
+    }
+
+    #[test]
+    fn dispute_windows_are_per_milestone() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(5_000, 10), (5_000, 100)]);
+
+        s.client.submit_milestone(&0);
+        s.client.submit_milestone(&1);
+        set_ledger(&env, env.ledger().sequence() + 50);
+
+        // Stage 0's short window has closed; stage 1's long window is open.
+        assert!(matches!(
+            s.client.try_dispute_milestone(&0),
+            Err(Ok(EscrowError::DisputeWindowClosed))
+        ));
+        s.client.dispute_milestone(&1);
+        assert!(matches!(
+            s.client.try_claim_milestone(&1),
+            Err(Ok(EscrowError::InvalidState))
+        ));
+    }
+
+    #[test]
+    fn disputed_stage_cannot_be_approved_or_claimed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(10_000, 5)]);
+
+        s.client.submit_milestone(&0);
+        s.client.dispute_milestone(&0);
+        set_ledger(&env, env.ledger().sequence() + 6);
+        assert!(s.client.try_approve_milestone(&0).is_err());
+        assert!(s.client.try_claim_milestone(&0).is_err());
+        assert_eq!(s.token.balance(&s.client.address), 1_000);
+    }
+
+    #[test]
+    fn only_arbiter_can_resolve_milestone_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(10_000, 5)]);
+
+        s.client.submit_milestone(&0);
+        s.client.dispute_milestone(&0);
+        let outsider = Address::generate(&env);
+        assert!(matches!(
+            s.client.try_resolve_milestone_dispute(&outsider, &0, &true),
+            Err(Ok(EscrowError::NotAuthorized))
+        ));
+        assert!(matches!(
+            s.client.try_resolve_milestone_dispute(&s.buyer, &0, &false),
+            Err(Ok(EscrowError::NotAuthorized))
+        ));
+    }
+
+    #[test]
+    fn settled_stage_cannot_be_released_twice() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let s = setup(&env, 1_000, &[(5_000, 5), (5_000, 5)]);
+
+        s.client.approve_milestone(&0);
+        assert!(s.client.try_approve_milestone(&0).is_err());
+        assert!(s.client.try_submit_milestone(&0).is_err());
+        assert!(matches!(
+            s.client.try_approve_milestone(&9),
+            Err(Ok(EscrowError::MilestoneNotFound))
+        ));
+        assert_eq!(s.token.balance(&s.seller), 500);
+    }
+
+    #[test]
+    fn invalid_schedules_are_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let deadline = env.ledger().sequence() + 1_000;
+
+        let cases: [&[(u32, u32)]; 4] = [
+            &[],                       // empty
+            &[(5_000, 10), (4_000, 10)], // sums to 9 000
+            &[(10_000, 10), (0, 10)],  // zero share
+            &[(10_000, 0)],            // zero dispute window
+        ];
+        for spec in cases {
+            let (client, _) = create_escrow_contract(&env);
+            let res = client.try_initialize_with_milestone_schedule(
+                &admin,
+                &buyer,
+                &seller,
+                &arbiter,
+                &token,
+                &1_000,
+                &stages(&env, spec),
+                &deadline,
+                &None,
+            );
+            assert!(matches!(res, Err(Ok(EscrowError::InvalidMilestoneSchedule))));
+        }
+
+        // A stage that would round down to zero funds is rejected too.
+        let (client, _) = create_escrow_contract(&env);
+        let res = client.try_initialize_with_milestone_schedule(
+            &admin,
+            &buyer,
+            &seller,
+            &arbiter,
+            &token,
+            &3,
+            &stages(&env, &[(1, 10), (9_999, 10)]),
+            &deadline,
+            &None,
+        );
+        assert!(matches!(res, Err(Ok(EscrowError::InvalidMilestoneSchedule))));
+    }
+}

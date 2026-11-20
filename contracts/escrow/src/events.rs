@@ -214,3 +214,47 @@ pub fn dispute_resolved(env: &Env, arbiter: &Address, release_to_seller: bool) {
         release_to_seller,
     );
 }
+
+// ─── Staged (percentage-based) milestones (#1437) ────────────────────────────
+
+/// Emitted when the seller submits a staged milestone, opening its dispute window.
+/// Topics: (Symbol, Address, u32) — event name, seller, milestone_index
+/// Data: dispute_deadline — last ledger on which the buyer may dispute.
+pub fn milestone_submitted(env: &Env, seller: &Address, index: u32, dispute_deadline: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "milestone_submitted"),
+            seller.clone(),
+            index,
+        ),
+        dispute_deadline,
+    );
+}
+
+/// Emitted when the buyer escalates a dispute on a staged milestone.
+/// Topics: (Symbol, Address, u32) — event name, buyer, milestone_index
+/// Data: amount — funds allocated to the disputed milestone.
+pub fn milestone_disputed(env: &Env, buyer: &Address, index: u32, amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "milestone_disputed"),
+            buyer.clone(),
+            index,
+        ),
+        amount,
+    );
+}
+
+/// Emitted when a disputed staged milestone is refunded to the buyer by the arbiter.
+/// Topics: (Symbol, Address, u32) — event name, buyer, milestone_index
+/// Data: amount — funds returned to the buyer.
+pub fn milestone_refunded(env: &Env, buyer: &Address, index: u32, amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "milestone_refunded"),
+            buyer.clone(),
+            index,
+        ),
+        amount,
+    );
+}

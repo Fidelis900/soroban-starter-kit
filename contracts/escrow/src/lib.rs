@@ -16,10 +16,13 @@ mod errors;
 mod events;
 mod lifecycle;
 mod queries;
+mod staged;
 mod storage;
 
 pub use errors::EscrowError;
-pub use storage::{DataKey, EscrowInfo, EscrowState, Milestone};
+pub use storage::{
+    DataKey, EscrowInfo, EscrowState, Milestone, MilestoneStage, MilestoneStatus, StagedMilestone,
+};
 
 #[cfg(feature = "pausable")]
 use admin::require_admin;
@@ -301,6 +304,99 @@ mod contract {
         #[must_use]
         pub fn get_milestones(env: Env) -> soroban_sdk::Vec<Milestone> {
             lifecycle::get_milestones(env)
+        }
+
+        // ── Staged percentage milestones with dispute windows (#1437) ─────
+
+        /// Initialize an escrow whose `total_amount` is released in fractional
+        /// stages instead of a single lump sum.
+        ///
+        /// Each [`MilestoneStage`] carries a basis-point share of the total and
+        /// its own dispute window in ledgers. Shares must be non-zero and sum to
+        /// exactly 10 000; the final stage absorbs any rounding remainder. The
+        /// buyer funds the full total with [`Self::fund`].
+        ///
+        /// # Errors
+        /// - [`EscrowError::AlreadyInitialized`] if already initialized.
+        /// - [`EscrowError::InvalidAmount`] if `total_amount <= 0`.
+        /// - [`EscrowError::InvalidMilestoneSchedule`] if the schedule is empty,
+        ///   a share or window is zero, shares do not sum to 10 000, or a stage
+        ///   would receive no funds.
+        /// - [`EscrowError::InvalidParties`] / [`EscrowError::DeadlinePassed`]
+        ///   as for [`Self::initialize`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn initialize_with_milestone_schedule(
+            env: Env,
+            admin: Address,
+            buyer: Address,
+            seller: Address,
+            arbiter: Address,
+            token_contract: Address,
+            total_amount: i128,
+            stages: soroban_sdk::Vec<MilestoneStage>,
+            deadline_ledger: u32,
+            metadata_hash: Option<soroban_sdk::BytesN<32>>,
+        ) -> Result<(), EscrowError> {
+            staged::initialize_with_milestone_schedule(
+                env,
+                admin,
+                buyer,
+                seller,
+                arbiter,
+                token_contract,
+                total_amount,
+                stages,
+                deadline_ledger,
+                metadata_hash,
+            )
+        }
+
+        /// Seller submits the deliverable for stage `index`, opening its
+        /// dispute window. Requires seller auth and a `Funded` escrow.
+        pub fn submit_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::submit_milestone(env, index)
+        }
+
+        /// Buyer approves stage `index` (pending or submitted), releasing its
+        /// allocation to the seller net of any configured fee.
+        pub fn approve_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::approve_milestone(env, index)
+        }
+
+        /// Buyer escalates submitted stage `index` to the arbiter.
+        ///
+        /// # Errors
+        /// - [`EscrowError::DisputeWindowClosed`] if the stage's dispute window
+        ///   has elapsed.
+        pub fn dispute_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::dispute_milestone(env, index)
+        }
+
+        /// Seller claims submitted stage `index` after its dispute window
+        /// elapsed without a dispute (automatic timeout release).
+        ///
+        /// # Errors
+        /// - [`EscrowError::DisputeWindowOpen`] if the window has not elapsed.
+        pub fn claim_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::claim_milestone(env, index)
+        }
+
+        /// Arbiter settles disputed stage `index`: `release_to_seller = true`
+        /// pays the seller, `false` refunds the buyer.
+        pub fn resolve_milestone_dispute(
+            env: Env,
+            caller: Address,
+            index: u32,
+            release_to_seller: bool,
+        ) -> Result<(), EscrowError> {
+            staged::resolve_milestone_dispute(env, caller, index, release_to_seller)
+        }
+
+        /// Return the staged milestone schedule, or an empty list if this
+        /// escrow was not initialized with one.
+        #[must_use]
+        pub fn get_staged_milestones(env: Env) -> soroban_sdk::Vec<StagedMilestone> {
+            staged::get_staged_milestones(env)
         }
 
         // ── Multi-token entry points (#1192) ──────────────────────────────

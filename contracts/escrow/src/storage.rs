@@ -77,6 +77,11 @@ pub enum DataKey {
     /// (`Vec<Address>`).  Each arbiter may approve at most once per direction;
     /// once the configured threshold is reached the dispute can be resolved.
     DisputeApprovals,
+    /// Percentage-based staged milestone schedule (`Vec<StagedMilestone>`) with
+    /// a per-milestone dispute window (#1437). Only present when the escrow was
+    /// initialized with
+    /// [`EscrowContract::initialize_with_milestone_schedule`](crate::EscrowContract::initialize_with_milestone_schedule).
+    StagedMilestones,
 }
 
 /// Lifecycle states of an escrow.
@@ -314,10 +319,6 @@ mod discriminant_tests {
             DataKey::MetadataHash => 14,
             DataKey::DisputeTimeoutLedgers => 15,
             DataKey::DisputeRaisedAt => 16,
-            DataKey::Milestones => 17,
-            DataKey::FeeBps => 18,
-            DataKey::Treasury => 19,
-            DataKey::AbandonmentBuffer => 20,
             DataKey::GracePeriodLedgers => 17,
             DataKey::DeliveryMarkedAt => 18,
             DataKey::Milestones => 19,
@@ -326,8 +327,10 @@ mod discriminant_tests {
             DataKey::Locked => 22,
             DataKey::TokenContracts => 23,
             DataKey::TokenAmounts => 24,
-            DataKey::ArbiterFeeBps => 25,
-            DataKey::DisputeApprovals => 26,
+            DataKey::AbandonmentBuffer => 25,
+            DataKey::ArbiterFeeBps => 26,
+            DataKey::DisputeApprovals => 27,
+            DataKey::StagedMilestones => 28,
         }
     }
 
@@ -350,10 +353,6 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::MetadataHash), 14);
         assert_eq!(escrow_data_key_index(&DataKey::DisputeTimeoutLedgers), 15);
         assert_eq!(escrow_data_key_index(&DataKey::DisputeRaisedAt), 16);
-        assert_eq!(escrow_data_key_index(&DataKey::Milestones), 17);
-        assert_eq!(escrow_data_key_index(&DataKey::FeeBps), 18);
-        assert_eq!(escrow_data_key_index(&DataKey::Treasury), 19);
-        assert_eq!(escrow_data_key_index(&DataKey::AbandonmentBuffer), 20);
         assert_eq!(escrow_data_key_index(&DataKey::GracePeriodLedgers), 17);
         assert_eq!(escrow_data_key_index(&DataKey::DeliveryMarkedAt), 18);
         assert_eq!(escrow_data_key_index(&DataKey::Milestones), 19);
@@ -362,8 +361,10 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::Locked), 22);
         assert_eq!(escrow_data_key_index(&DataKey::TokenContracts), 23);
         assert_eq!(escrow_data_key_index(&DataKey::TokenAmounts), 24);
-        assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 25);
-        assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 26);
+        assert_eq!(escrow_data_key_index(&DataKey::AbandonmentBuffer), 25);
+        assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 26);
+        assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 27);
+        assert_eq!(escrow_data_key_index(&DataKey::StagedMilestones), 28);
     }
 }
 
@@ -434,4 +435,70 @@ pub struct EscrowInfo {
     /// Number of distinct arbiter approvals required to resolve a dispute
     /// (`u32`). Zero when the escrow uses the single-arbiter model.
     pub threshold: u32,
+}
+
+// ─── Staged (percentage-based) milestones (#1437) ────────────────────────────
+
+/// Input describing one stage of a percentage-based milestone schedule.
+///
+/// Passed to
+/// [`EscrowContract::initialize_with_milestone_schedule`](crate::EscrowContract::initialize_with_milestone_schedule).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneStage {
+    /// Share of the total escrow amount allocated to this stage, in basis
+    /// points (1–10 000). All stages must sum to exactly 10 000.
+    pub percentage_bps: u32,
+    /// Number of ledgers after the seller submits this stage during which the
+    /// buyer may escalate a dispute. Once the window elapses without a dispute
+    /// the stage can be claimed by the seller automatically. Must be non-zero.
+    pub dispute_window_ledgers: u32,
+}
+
+/// Lifecycle of a single staged milestone.
+///
+/// `Pending → Submitted → (Released | Disputed → (Released | Refunded))`.
+/// The buyer may also approve a `Pending` stage directly.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MilestoneStatus {
+    /// Work not yet submitted by the seller.
+    Pending = 0,
+    /// Seller submitted the deliverable; the dispute window is running.
+    Submitted = 1,
+    /// Buyer escalated a dispute within the window; awaiting the arbiter.
+    Disputed = 2,
+    /// Funds for this stage were paid to the seller.
+    Released = 3,
+    /// Funds for this stage were returned to the buyer by the arbiter.
+    Refunded = 4,
+}
+
+/// One stage of a percentage-based milestone schedule as stored on-chain.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedMilestone {
+    /// Share of the total escrow amount, in basis points.
+    pub percentage_bps: u32,
+    /// Token amount allocated to this stage, derived from `percentage_bps`.
+    /// The final stage absorbs any integer-division remainder so the stage
+    /// amounts always sum to the escrowed total.
+    pub amount: i128,
+    /// Dispute window for this stage, in ledgers.
+    pub dispute_window_ledgers: u32,
+    /// Current status of the stage.
+    pub status: MilestoneStatus,
+    /// Ledger sequence at which the seller submitted the stage (0 if never).
+    pub submitted_at: u32,
+}
+
+impl StagedMilestone {
+    /// Returns `true` once the stage has been paid out to either party.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        matches!(
+            self.status,
+            MilestoneStatus::Released | MilestoneStatus::Refunded
+        )
+    }
 }

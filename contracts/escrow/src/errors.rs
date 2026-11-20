@@ -64,6 +64,13 @@ pub enum EscrowError {
     InvalidPartialAmount = 21,
     /// Mutual cancellation is not allowed in the escrow's current state.
     MutualCancelNotAllowed = 22,
+    /// A milestone dispute was raised after the milestone's dispute window closed.
+    DisputeWindowClosed = 23,
+    /// A milestone was claimed while its dispute window is still open.
+    DisputeWindowOpen = 24,
+    /// The staged milestone schedule is empty, has a zero share or window, or
+    /// its percentages do not sum to exactly 10 000 bps.
+    InvalidMilestoneSchedule = 25,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -102,6 +109,9 @@ impl_display_error!(
     DuplicateArbiterApproval  => "duplicate arbiter approval",
     InvalidPartialAmount      => "invalid partial release amount",
     MutualCancelNotAllowed    => "mutual cancellation not allowed",
+    DisputeWindowClosed       => "milestone dispute window closed",
+    DisputeWindowOpen         => "milestone dispute window still open",
+    InvalidMilestoneSchedule  => "invalid milestone schedule",
 );
 
 #[cfg(test)]
@@ -137,7 +147,10 @@ EscrowError::InvalidThreshold = {}\n\
 EscrowError::InsufficientArbiterApprovals = {}\n\
 EscrowError::DuplicateArbiterApproval = {}\n\
 EscrowError::InvalidPartialAmount = {}\n\
-EscrowError::MutualCancelNotAllowed = {}\n",
+EscrowError::MutualCancelNotAllowed = {}\n\
+EscrowError::DisputeWindowClosed = {}\n\
+EscrowError::DisputeWindowOpen = {}\n\
+EscrowError::InvalidMilestoneSchedule = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -160,6 +173,9 @@ EscrowError::MutualCancelNotAllowed = {}\n",
             EscrowError::DuplicateArbiterApproval as u32,
             EscrowError::InvalidPartialAmount as u32,
             EscrowError::MutualCancelNotAllowed as u32,
+            EscrowError::DisputeWindowClosed as u32,
+            EscrowError::DisputeWindowOpen as u32,
+            EscrowError::InvalidMilestoneSchedule as u32,
         )
     }
 
