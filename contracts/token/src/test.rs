@@ -221,7 +221,7 @@ fn test_mint_zero_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_transfer_zero_amount() {
     let env = Env::default();
     env.mock_all_auths();
@@ -234,7 +234,7 @@ fn test_transfer_zero_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_transfer_negative_amount() {
     let env = Env::default();
     env.mock_all_auths();
@@ -258,7 +258,7 @@ fn test_transfer_zero_amount_returns_invalid_amount() {
 
     assert_eq!(
         client.try_transfer(&user, &other, &0i128),
-        Err(Ok(TokenError::InvalidAmount))
+        Err(Ok(TokenError::ZeroAmount))
     );
     // Balances untouched
     assert_eq!(client.balance(&user), 1000i128);
@@ -277,7 +277,7 @@ fn test_transfer_negative_amount_returns_invalid_amount() {
 
     assert_eq!(
         client.try_transfer(&user, &other, &-1i128),
-        Err(Ok(TokenError::InvalidAmount))
+        Err(Ok(TokenError::ZeroAmount))
     );
     assert_eq!(client.balance(&user), 1000i128);
     assert_eq!(client.balance(&other), 0i128);
@@ -298,7 +298,7 @@ fn test_transfer_from_zero_amount_returns_invalid_amount() {
 
     assert_eq!(
         client.try_transfer_from(&spender, &owner, &recipient, &0i128),
-        Err(Ok(TokenError::InvalidAmount))
+        Err(Ok(TokenError::ZeroAmount))
     );
     // Allowance and balances untouched
     assert_eq!(client.allowance(&owner, &spender), 500i128);
@@ -321,7 +321,7 @@ fn test_transfer_from_negative_amount_returns_invalid_amount() {
 
     assert_eq!(
         client.try_transfer_from(&spender, &owner, &recipient, &-1i128),
-        Err(Ok(TokenError::InvalidAmount))
+        Err(Ok(TokenError::ZeroAmount))
     );
     assert_eq!(client.allowance(&owner, &spender), 500i128);
     assert_eq!(client.balance(&owner), 1000i128);
