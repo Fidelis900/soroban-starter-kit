@@ -66,16 +66,78 @@ fn validate_parties_multi(
     Ok(())
 }
 
-/// Maximum arbiter fee, in basis points (20 %).
-const MAX_ARBITER_FEE_BPS: u32 = 2_000;
+/// Hardcoded ceiling on the arbiter fee, in basis points (10 %).
+///
+/// This cap cannot be raised by any initialization parameter: it is checked
+/// when the fee is configured and again when a dispute is settled, so a
+/// malicious or compromised arbiter can never seize more than 10 % of the
+/// disputed funds (issue #1439).
+pub(crate) const MAX_ARBITER_FEE_BPS: u32 = 1_000;
 
-fn validate_arbiter_fee(fee_bps: Option<u32>) -> Result<(), EscrowError> {
+/// Reject arbiter fees above [`MAX_ARBITER_FEE_BPS`].
+pub(crate) fn validate_arbiter_fee(fee_bps: Option<u32>) -> Result<(), EscrowError> {
     if let Some(bps) = fee_bps {
         if bps > MAX_ARBITER_FEE_BPS {
-            return Err(EscrowError::FeeTooHigh);
+            return Err(EscrowError::ArbiterFeeTooHigh);
         }
     }
     Ok(())
+}
+
+// ─── Buyer lockup (#1438) ─────────────────────────────────────────────────────
+
+/// Ensure the configured lockup timestamp (if any) has elapsed.
+///
+/// Every path that moves escrowed funds to the seller calls this before
+/// touching state, so out-of-order or early release signatures cannot
+/// withdraw funds while the minimum holding period is still active.
+///
+/// # Errors
+/// Returns [`EscrowError::LockupPeriodActive`] when
+/// `env.ledger().timestamp() < lockup_deadline`.
+pub(crate) fn require_lockup_elapsed(env: &Env) -> Result<(), EscrowError> {
+    if let Some(lockup_deadline) = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::LockupDeadline)
+    {
+        if env.ledger().timestamp() < lockup_deadline {
+            return Err(EscrowError::LockupPeriodActive);
+        }
+    }
+    Ok(())
+}
+
+/// Configure the minimum holding period for the escrowed funds.
+///
+/// Must be called by the buyer while the escrow is still in `Created` state
+/// (before any funds move), so the lockup cannot be imposed on or removed
+/// from an escrow that is already funded.  `lockup_deadline` is a ledger
+/// timestamp (seconds) that must lie in the future.
+pub fn set_lockup_deadline(env: Env, lockup_deadline: u64) -> Result<(), EscrowError> {
+    #[cfg(feature = "pausable")]
+    crate::EscrowContract::require_not_paused(&env)?;
+
+    let buyer: Address = get_required(&env, &Buyer)?;
+    buyer.require_auth();
+
+    require_state(&env, EscrowState::Created)?;
+
+    if lockup_deadline <= env.ledger().timestamp() {
+        return Err(EscrowError::InvalidState);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::LockupDeadline, &lockup_deadline);
+    extend_ttl(&env);
+    events::lockup_set(&env, &buyer, lockup_deadline);
+    Ok(())
+}
+
+/// Return the configured lockup timestamp, or `None` if no lockup is set.
+pub fn get_lockup_deadline(env: Env) -> Option<u64> {
+    env.storage().instance().get(&DataKey::LockupDeadline)
 }
 
 fn store_arbiter_fee(env: &Env, fee_bps: Option<u32>) {
@@ -236,6 +298,7 @@ pub fn initialize_with_arbiters(
     required_signatures: u32,
     dispute_timeout_ledgers: u32,
     metadata_hash: Option<soroban_sdk::BytesN<32>>,
+    arbiter_fee_bps: Option<u32>,
 ) -> Result<(), EscrowError> {
     if env.storage().instance().has(&State) {
         return Err(EscrowError::AlreadyInitialized);
@@ -243,6 +306,7 @@ pub fn initialize_with_arbiters(
     validate_amount(amount)?;
     validate_parties_multi(&buyer, &seller, &arbiters, required_signatures)?;
     validate_deadline::<EscrowError>(&env, deadline_ledger)?;
+    validate_arbiter_fee(arbiter_fee_bps)?;
     token::Client::new(&env, &token_contract).decimals();
     env.storage()
         .instance()
@@ -262,6 +326,7 @@ pub fn initialize_with_arbiters(
         0,
     );
     env.storage().instance().set(&Arbiters, &arbiters);
+    store_arbiter_fee(&env, arbiter_fee_bps);
     if let Some(hash) = metadata_hash {
         env.storage().instance().set(&DataKey::MetadataHash, &hash);
     }
@@ -379,6 +444,8 @@ pub fn release_partial(env: Env, amount: i128) -> Result<(), EscrowError> {
     if amount <= 0 {
         return Err(EscrowError::InvalidAmount);
     }
+
+    require_lockup_elapsed(&env)?;
 
     let stored_amount: i128 = get_required(&env, &Amount)?;
     if amount > stored_amount {
@@ -583,6 +650,8 @@ pub fn approve_milestone_partial(
         return Err(EscrowError::InvalidAmount);
     }
 
+    require_lockup_elapsed(&env)?;
+
     let mut milestones: Vec<Milestone> = env
         .storage()
         .instance()
@@ -739,6 +808,7 @@ fn mark_all_milestones_released(env: &Env) {
 
 pub fn release_to_seller(env: Env) -> Result<(), EscrowError> {
     require_state(&env, EscrowState::Delivered)?;
+    require_lockup_elapsed(&env)?;
 
     let seller: Address = get_required(&env, &Seller)?;
     // Only redistribute unreleased remainder (issue #1189).
@@ -961,6 +1031,8 @@ pub fn release_milestone(
     if state != EscrowState::Funded {
         return Err(EscrowError::InvalidState);
     }
+
+    require_lockup_elapsed(&env)?;
 
     let mut milestones: Vec<Milestone> = env
         .storage()
@@ -1189,6 +1261,7 @@ pub fn release_multi_token(env: Env) -> Result<(), EscrowError> {
     match (token_contracts, token_amounts) {
         (Some(contracts), Some(amounts)) => {
             require_state(&env, EscrowState::Delivered)?;
+            require_lockup_elapsed(&env)?;
             let seller: Address = get_required(&env, &DataKey::Seller)?;
 
             // CEI: finalise state before transfers.

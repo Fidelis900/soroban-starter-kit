@@ -52,6 +52,11 @@ pub enum DaoError {
     NotProposer = 20,
     /// Proposal cancellation rejected because voting has already started.
     VotingAlreadyStarted = 21,
+    /// A vote was cast before the proposal's voting window opened (issue #1441).
+    VotingNotStarted = 22,
+    /// Too many non-circulating holder addresses supplied for the dynamic
+    /// quorum configuration (issue #1440).
+    TooManyNonCirculatingHolders = 23,
 }
 
 impl_display_error!(
@@ -83,6 +88,8 @@ impl_display_error!(
     UnauthorizedCouncil     => "caller is not the security council",
     NotProposer             => "caller is not the proposal proposer",
     VotingAlreadyStarted    => "voting has already started; proposal cannot be cancelled",
+    VotingNotStarted        => "voting has not started yet",
+    TooManyNonCirculatingHolders => "too many non-circulating holder addresses",
 );
 
 #[cfg(test)]

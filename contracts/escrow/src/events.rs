@@ -257,4 +257,10 @@ pub fn milestone_refunded(env: &Env, buyer: &Address, index: u32, amount: i128) 
         ),
         amount,
     );
+/// Emitted when the buyer configures a lockup deadline (issue #1438).
+/// Topics: (Symbol, Address) — event name, buyer
+/// Data: `u64` — ledger timestamp before which releases are rejected
+pub fn lockup_set(env: &Env, buyer: &Address, lockup_deadline: u64) {
+    env.events()
+        .publish((Symbol::new(env, "lockup_set"), buyer.clone()), lockup_deadline);
 }

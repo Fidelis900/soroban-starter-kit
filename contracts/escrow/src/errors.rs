@@ -52,7 +52,7 @@ pub enum EscrowError {
     EmptyTokenList = 15,
     /// Token lists and amount lists must have the same length.
     TokenListMismatch = 16,
-    /// The arbiter fee in basis points exceeds the maximum allowed (2 000).
+    /// The arbiter fee in basis points exceeds the hardcoded ceiling (1 000 = 10 %).
     ArbiterFeeTooHigh = 17,
     /// The arbiter threshold is zero or exceeds the number of configured arbiters.
     InvalidThreshold = 18,
@@ -71,6 +71,8 @@ pub enum EscrowError {
     /// The staged milestone schedule is empty, has a zero share or window, or
     /// its percentages do not sum to exactly 10 000 bps.
     InvalidMilestoneSchedule = 25,
+    /// A release was attempted before the configured lockup timestamp elapsed.
+    LockupPeriodActive = 23,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -103,7 +105,7 @@ impl_display_error!(
     Reentrancy                => "reentrant call detected",
     EmptyTokenList            => "token list must not be empty",
     TokenListMismatch         => "token and amount lists must have the same length",
-    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (2 000 bps)",
+    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (1 000 bps)",
     InvalidThreshold          => "invalid arbiter threshold",
     InsufficientArbiterApprovals => "insufficient arbiter approvals",
     DuplicateArbiterApproval  => "duplicate arbiter approval",
@@ -112,6 +114,7 @@ impl_display_error!(
     DisputeWindowClosed       => "milestone dispute window closed",
     DisputeWindowOpen         => "milestone dispute window still open",
     InvalidMilestoneSchedule  => "invalid milestone schedule",
+    LockupPeriodActive        => "lockup period has not elapsed",
 );
 
 #[cfg(test)]
@@ -151,6 +154,7 @@ EscrowError::MutualCancelNotAllowed = {}\n\
 EscrowError::DisputeWindowClosed = {}\n\
 EscrowError::DisputeWindowOpen = {}\n\
 EscrowError::InvalidMilestoneSchedule = {}\n",
+EscrowError::LockupPeriodActive = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -176,6 +180,7 @@ EscrowError::InvalidMilestoneSchedule = {}\n",
             EscrowError::DisputeWindowClosed as u32,
             EscrowError::DisputeWindowOpen as u32,
             EscrowError::InvalidMilestoneSchedule as u32,
+            EscrowError::LockupPeriodActive as u32,
         )
     }
 

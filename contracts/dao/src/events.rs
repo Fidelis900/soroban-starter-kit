@@ -153,3 +153,35 @@ pub fn proposal_cancelled_by_proposer(env: &Env, proposer: &Address, proposal_id
         proposal_id,
     );
 }
+
+/// Emitted when the admin updates the voting delay (issue #1441).
+pub fn voting_delay_set(env: &Env, admin: &Address, voting_delay: u32) {
+    env.events().publish(
+        (Symbol::new(env, "voting_delay_set"), admin.clone()),
+        voting_delay,
+    );
+}
+
+/// Emitted when the admin updates the dynamic quorum configuration (issue #1440).
+/// Data: `(quorum_bps, number_of_excluded_holders)`.
+pub fn dynamic_quorum_set(env: &Env, admin: &Address, quorum_bps: u32, excluded: u32) {
+    env.events().publish(
+        (Symbol::new(env, "dynamic_quorum_set"), admin.clone()),
+        (quorum_bps, excluded),
+    );
+}
+
+/// Emitted when a proposal's dynamic quorum threshold is snapshotted at
+/// creation (issue #1440).
+/// Data: `(circulating_supply, required_votes)`.
+pub fn dynamic_quorum_snapshot(
+    env: &Env,
+    proposal_id: u32,
+    circulating_supply: i128,
+    required_votes: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "dynamic_quorum_snapshot"), proposal_id),
+        (circulating_supply, required_votes),
+    );
+}
