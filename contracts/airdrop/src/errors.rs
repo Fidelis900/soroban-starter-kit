@@ -36,6 +36,10 @@ pub enum AirdropError {
     ArithmeticOverflow = 14,
     /// `claim_batch` was called with no entries.
     EmptyBatch = 15,
+    /// Claims are temporarily paused by the admin.
+    Paused = 16,
+    /// Decay parameters are out of range.
+    InvalidDecayConfig = 17,
 }
 
 #[cfg(test)]

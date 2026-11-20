@@ -31,6 +31,8 @@ pub enum SubscriptionError {
     PaymentOverdue = 15,
     /// An arithmetic operation overflowed.
     ArithmeticOverflow = 16,
+    /// Referral voucher discount is outside 0..=10_000 basis points.
+    InvalidVoucher = 17,
     /// Provider has not configured a minimum payout threshold.
     PayoutThresholdNotSet = 20,
     /// Accumulated revenue is below the provider's minimum payout threshold.

@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, Symbol, Vec, contracttype};
+use soroban_sdk::{Address, Bytes, Symbol, Vec, contracttype};
 
 /// Default grace period applied when the provider has not configured one:
 /// ~7 days at ~5 seconds per ledger.
@@ -23,6 +23,10 @@ pub enum DataKey {
     /// Number of ledgers a delinquent subscription is tolerated before it is
     /// suspended (instance storage).
     GracePeriod,
+    /// Discount in basis points attached to a referral voucher code (persistent).
+    Voucher(Address, Bytes),
+    /// The voucher earmarked for a subscriber's next recurring charge (persistent).
+    ActiveVoucher(Address),
     /// Subscriber-approved amount for a (subscriber, plan) pair when a provider
     /// increases plan pricing and explicit consent is required.
     ApprovedAmount(Address, Symbol),

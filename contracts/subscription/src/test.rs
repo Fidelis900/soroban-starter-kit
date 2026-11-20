@@ -524,6 +524,51 @@ fn test_subscribe_with_zero_trial_ledgers_skips_trial() {
     assert_eq!(token_client.balance(&provider), 100);
     assert_eq!(token_client.balance(&subscriber), 400);
 }
+// ── issue #1353: referral credit vouchers ────────────────────────────────────
+
+#[test]
+fn test_referral_voucher_discounts_only_next_charge() {
+    let env = setup_env();
+    let (client, addr, provider, token) = setup(&env);
+    let subscriber = Address::generate(&env);
+    let plan_id = Symbol::new(&env, "pro");
+    client.register_plan(&plan_id, &1_000, &10, &0, &0);
+
+    StellarAssetClient::new(&env, &token).mint(&subscriber, &10_000);
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    token_client.approve(&subscriber, &addr, &10_000, &1_000_000);
+    client.subscribe(&subscriber, &plan_id, &None, &None);
+
+    let code = soroban_sdk::Bytes::from_slice(&env, b"REFERRAL25");
+    client.apply_voucher(&subscriber, &code, &2_500);
+    assert_eq!(client.get_voucher(&subscriber, &code), Some(2_500));
+    assert_eq!(client.get_active_voucher(&subscriber), Some((code.clone(), 2_500)));
+
+    // First invoice after the voucher is discounted by 25%.
+    env.ledger().with_mut(|li| li.sequence_number = 11);
+    assert_eq!(
+        client.charge(&subscriber, &plan_id),
+        Ok(crate::ChargeOutcome::Charged)
+    );
+    assert_eq!(token_client.balance(&provider), 750);
+    assert!(client.get_active_voucher(&subscriber).is_none());
+
+    // The voucher is consumed: the following invoice is back to full price.
+    env.ledger().with_mut(|li| li.sequence_number = 21);
+    client.charge(&subscriber, &plan_id);
+    assert_eq!(token_client.balance(&provider), 1_750);
+}
+
+#[test]
+fn test_referral_voucher_rejects_invalid_discount() {
+    let env = setup_env();
+    let (_client, _addr, _provider, _token) = setup(&env);
+    let subscriber = Address::generate(&env);
+    let client = _client;
+    let code = soroban_sdk::Bytes::from_slice(&env, b"BAD");
+    assert_eq!(
+        client.try_apply_voucher(&subscriber, &code, &10_001),
+        Err(Ok(SubscriptionError::InvalidVoucher))
 #[test]
 fn revenue_accumulates_in_escrow_and_is_withdrawn_at_threshold() {
     let env = setup_env();

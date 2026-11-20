@@ -342,3 +342,164 @@ fn relayer_batch_without_recipient_auth_is_rejected() {
     assert!(!t.client.is_claimed(&t.alice, &t.token));
     assert!(!t.client.is_claimed(&t.bob, &t.token));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1348: emergency pause / resume
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_rejects_claims_and_resume_restores_them() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+
+    let proof = Vec::<BytesN<32>>::new(&env);
+    assert!(!client.is_paused());
+
+    client.set_paused(&true);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::Paused))
+    );
+
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+    // With claims resumed the pause error is gone (the root is not set yet).
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::RootNotSet))
+    );
+}
+
+#[test]
+fn pause_state_defaults_to_false() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    assert!(!client.is_paused());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1349: expiring claim windows with variable reward decay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decayed_payout_and_treasury_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+
+    let config = DecayConfig {
+        start_ledger: 0,
+        full_window_ledgers: 100,
+        decay_step_ledgers: 10,
+        decay_bps_per_step: 1_000,
+        floor_bps: 5_000,
+    };
+    client.set_decay_config(&treasury, &config);
+    assert_eq!(client.get_decay_config(), Some(config.clone()));
+
+    // Inside the full-reward window: the whole allocation is claimable.
+    env.ledger().with_mut(|li| li.sequence_number = 50);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
+
+    // Three decay steps elapsed: 70% to claimant, 30% back to the treasury.
+    env.ledger().with_mut(|li| li.sequence_number = 130);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
+    assert_eq!(decay_bps(&config, 130), 7_000);
+
+    // The schedule never pays less than the configured floor.
+    env.ledger().with_mut(|li| li.sequence_number = 500);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+    assert_eq!(decay_bps(&config, 500), 5_000);
+}
+
+#[test]
+fn invalid_decay_config_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    let config = DecayConfig {
+        start_ledger: 0,
+        full_window_ledgers: 10,
+        decay_step_ledgers: 0,
+        decay_bps_per_step: 100,
+        floor_bps: 5_000,
+    };
+    assert_eq!(
+        client.try_set_decay_config(&treasury, &config),
+        Err(Ok(AirdropError::InvalidDecayConfig))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1350: governance-authorized multi-epoch Merkle root updates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governance_root_updates_preserve_claimed_bitmaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let dao = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    client.set_governance(&dao);
+    assert_eq!(client.get_governance(), Some(dao.clone()));
+
+    // Simulate a claim in epoch zero; the bitmap must survive both updates.
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Claimed(alice.clone(), token.clone()), &true);
+    });
+
+    assert_eq!(client.get_epoch(), 0);
+    let root_one = BytesN::from_array(&env, &[1u8; 32]);
+    client.update_root_by_governance(&root_one, &2_000);
+    assert_eq!(client.get_epoch(), 1);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(1)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
+
+    let root_two = BytesN::from_array(&env, &[2u8; 32]);
+    client.update_root_by_governance(&root_two, &3_000);
+    assert_eq!(client.get_epoch(), 2);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(2)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
+}

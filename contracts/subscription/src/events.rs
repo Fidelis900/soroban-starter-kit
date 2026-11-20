@@ -187,6 +187,31 @@ pub fn plan_changed(
     );
 }
 
+/// Emitted when a referral voucher is registered for a subscriber.
+pub fn voucher_applied_to_subscriber(
+    env: &Env,
+    subscriber: &Address,
+    code: &soroban_sdk::Bytes,
+    discount_bps: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "voucher_applied"), subscriber.clone()),
+        (code.clone(), discount_bps),
+    );
+}
+
+/// Emitted when a voucher is consumed by a recurring charge.
+pub fn voucher_applied(
+    env: &Env,
+    subscriber: &Address,
+    code: &soroban_sdk::Bytes,
+    discount_bps: u32,
+    gross: i128,
+    net: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "voucher_used"), subscriber.clone()),
+        (code.clone(), discount_bps, gross, net),
 /// Emitted when a subscription is due (or about to be due) for renewal.
 /// Topics: (Symbol, Address, Symbol) — event name, subscriber, plan
 /// Data: (next_billing_ledger, current_ledger)

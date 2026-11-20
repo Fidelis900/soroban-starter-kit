@@ -55,7 +55,7 @@ mod events;
 mod storage;
 
 pub use errors::AirdropError;
-pub use storage::{DataKey, VestingConfig, VestingSchedule};
+pub use storage::{DataKey, DecayConfig, VestingConfig, VestingSchedule};
 
 use soroban_common::{
     BPS_DENOMINATOR, LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee,
@@ -129,8 +129,22 @@ fn ensure_available(env: &Env, token: &Address, amount: i128) -> Result<(), Aird
     Ok(())
 }
 
-/// Load the root, and reject if the claim window has closed.
+/// Reject claims while the airdrop is emergency-paused.
+fn require_not_paused(env: &Env) -> Result<(), AirdropError> {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&DataKey::Paused)
+        .unwrap_or(false)
+    {
+        return Err(AirdropError::Paused);
+    }
+    Ok(())
+}
+
+/// Load the root, and reject if the claim window has closed or claims are paused.
 fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
+    require_not_paused(env)?;
     if !env.storage().instance().has(&DataKey::Admin) {
         return Err(AirdropError::NotInitialized);
     }
@@ -153,8 +167,40 @@ fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
     root_bytes.try_into().map_err(|_| AirdropError::RootNotSet)
 }
 
+/// Claimable share (in basis points) for a claim at ledger `now`.
+fn decay_bps(cfg: &DecayConfig, now: u32) -> u32 {
+    if now <= cfg.start_ledger + cfg.full_window_ledgers {
+        return BPS_DENOMINATOR as u32;
+    }
+    let elapsed = now - cfg.start_ledger - cfg.full_window_ledgers;
+    let steps = elapsed / cfg.decay_step_ledgers;
+    let reduction = steps
+        .saturating_mul(cfg.decay_bps_per_step)
+        .min(BPS_DENOMINATOR as u32 - cfg.floor_bps);
+    (BPS_DENOMINATOR as u32 - cfg.floor_bps - reduction).max(cfg.floor_bps)
+}
+
+/// Apply the configured time decay to `amount`, returning the claimant's share
+/// and the remainder that belongs to the campaign treasury.
+fn decayed_amount(env: &Env, amount: i128) -> Result<(i128, i128), AirdropError> {
+    let cfg: Option<DecayConfig> = env.storage().instance().get(&DataKey::DecayConfig);
+    let Some(cfg) = cfg else {
+        return Ok((amount, 0));
+    };
+    let bps = i128::from(decay_bps(&cfg, env.ledger().sequence()));
+    let claimable = amount
+        .checked_mul(bps)
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .ok_or(AirdropError::ArithmeticOverflow)?;
+    let remainder = amount
+        .checked_sub(claimable)
+        .ok_or(AirdropError::ArithmeticOverflow)?;
+    Ok((claimable, remainder))
+}
+
 /// Mark `(recipient, token)` claimed and pay out `amount`: the liquid portion
-/// is transferred now and the rest is locked in a vesting schedule.
+/// is transferred now and the rest is locked in a vesting schedule. When a
+/// decay schedule is configured, the decayed remainder is sent to the treasury.
 ///
 /// Callers must have already validated the proof, the claimed flag, and the
 /// available balance.
@@ -165,6 +211,8 @@ fn settle_claim(
     amount: i128,
     tier: u32,
 ) -> Result<(), AirdropError> {
+    let (claimable, remainder) = decayed_amount(env, amount)?;
+
     // Checks-effects-interactions: mark claimed before transfer.
     let claimed_key = DataKey::Claimed(recipient.clone(), token.clone());
     env.storage().persistent().set(&claimed_key, &true);
@@ -176,11 +224,11 @@ fn settle_claim(
 
     let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
     let liquid = match &vesting {
-        Some(cfg) => apply_bps_fee(amount, cfg.initial_unlock_bps)
+        Some(cfg) => apply_bps_fee(claimable, cfg.initial_unlock_bps)
             .ok_or(AirdropError::ArithmeticOverflow)?,
-        None => amount,
+        None => claimable,
     };
-    let locked = amount
+    let locked = claimable
         .checked_sub(liquid)
         .ok_or(AirdropError::ArithmeticOverflow)?;
 
@@ -209,6 +257,21 @@ fn settle_claim(
         token::Client::new(env, token).transfer(&env.current_contract_address(), recipient, &liquid);
     }
 
+    if remainder > 0 {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(AirdropError::NotInitialized)?;
+        token::Client::new(env, token).transfer(
+            &env.current_contract_address(),
+            &treasury,
+            &remainder,
+        );
+        events::decay_remainder(env, &treasury, token, remainder);
+    }
+
+    events::claimed(env, recipient, token, claimable);
     events::claimed(env, recipient, token, amount, tier);
     Ok(())
 }
@@ -322,6 +385,135 @@ mod contract {
             Ok(())
         }
 
+        /// Pause or resume all claims. Only the admin may call this.
+        ///
+        /// Pausing is an emergency brake for a bad Merkle root or leaf list:
+        /// `claim`, `claim_for` and `claim_batch` all fail with
+        /// [`AirdropError::Paused`] until the admin resumes the airdrop.
+        pub fn set_paused(env: Env, paused: bool) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Paused, &paused);
+            bump_instance(&env);
+            events::paused(&env, paused);
+            Ok(())
+        }
+
+        /// Returns `true` while claims are emergency-paused.
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false)
+        }
+
+        /// Configure time-decaying claim windows and the treasury that receives
+        /// the unclaimed decay remainder. Only the admin may call this.
+        pub fn set_decay_config(
+            env: Env,
+            treasury: Address,
+            config: DecayConfig,
+        ) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+
+            if config.decay_step_ledgers == 0
+                || config.floor_bps > BPS_DENOMINATOR as u32
+                || config.decay_bps_per_step > BPS_DENOMINATOR as u32
+            {
+                return Err(AirdropError::InvalidDecayConfig);
+            }
+
+            env.storage().instance().set(&DataKey::Treasury, &treasury);
+            env.storage().instance().set(&DataKey::DecayConfig, &config);
+            bump_instance(&env);
+            events::decay_config_set(&env, &treasury, &config);
+            Ok(())
+        }
+
+        /// Returns the configured decay schedule, if any.
+        pub fn get_decay_config(env: Env) -> Option<DecayConfig> {
+            env.storage().instance().get(&DataKey::DecayConfig)
+        }
+
+        /// Configure the DAO contract authorised to advance Merkle epochs.
+        /// Only the admin may call this.
+        pub fn set_governance(env: Env, governance: Address) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Governance, &governance);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Install a new Merkle root for the next campaign epoch.
+        ///
+        /// Only the configured governance DAO may call this. The previous
+        /// epoch's claimed bitmaps are intentionally left untouched, so a
+        /// recipient who already claimed cannot claim again under the new root.
+        pub fn update_root_by_governance(
+            env: Env,
+            new_root: BytesN<32>,
+            new_deadline: u32,
+        ) -> Result<(), AirdropError> {
+            let governance: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Governance)
+                .ok_or(AirdropError::NotInitialized)?;
+            governance.require_auth();
+
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(AirdropError::NotInitialized);
+            }
+
+            let epoch: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Epoch)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(AirdropError::ArithmeticOverflow)?;
+
+            let root_bytes = Bytes::from(new_root);
+            let key = DataKey::MerkleRoot(epoch);
+            env.storage().instance().set(&key, &root_bytes);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerkleRoot, &root_bytes);
+            env.storage().instance().set(&DataKey::Epoch, &epoch);
+            env.storage()
+                .instance()
+                .set(&DataKey::ClaimDeadline, &new_deadline);
+            bump_instance(&env);
+
+            events::epoch_root_updated(&env, epoch, &root_bytes, new_deadline);
+            Ok(())
+        }
+
+        /// Returns the current Merkle epoch (0 before the first governance update).
+        pub fn get_epoch(env: Env) -> u32 {
+            env.storage().instance().get(&DataKey::Epoch).unwrap_or(0)
+        }
+
+        /// Returns the configured governance address, if any.
+        pub fn get_governance(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::Governance)
+        }
+
+        /// Claim `amount` of `token` by supplying a valid merkle proof.
         /// Claim `amount` of `token` under allocation `tier` by supplying a
         /// valid merkle proof.
         ///
