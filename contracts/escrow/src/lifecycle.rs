@@ -27,7 +27,7 @@ fn validate_amount(amount: i128) -> Result<(), EscrowError> {
     Ok(())
 }
 
-fn validate_parties(
+pub(crate) fn validate_parties(
     buyer: &Address,
     seller: &Address,
     arbiter: &Address,
@@ -152,7 +152,7 @@ pub(crate) fn extend_ttl(env: &Env) {
     extend_ttl_instance(env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
 }
 
-fn store_escrow_data(
+pub(crate) fn store_escrow_data(
     env: &Env,
     buyer: &Address,
     seller: &Address,
@@ -183,7 +183,7 @@ fn store_escrow_data(
         .set(&AbandonmentBuffer, &abandonment_buffer);
 }
 
-fn emit_init_events(env: &Env, buyer: &Address, seller: &Address, arbiter: &Address, amount: i128) {
+pub(crate) fn emit_init_events(env: &Env, buyer: &Address, seller: &Address, arbiter: &Address, amount: i128) {
     events::escrow_created(env, buyer, seller, amount);
     events::initialized(env, buyer, seller, arbiter, amount);
 }
@@ -898,7 +898,7 @@ pub fn set_fee_config(env: Env, fee_bps: u32, treasury: Address) -> Result<(), E
 /// Compute and apply the fee on a gross release amount.
 ///
 /// Returns `(net_to_seller, fee_amount)`.
-fn apply_fee(env: &Env, gross: i128) -> (i128, i128) {
+pub(crate) fn apply_fee(env: &Env, gross: i128) -> (i128, i128) {
     let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
     if fee_bps == 0 {
         return (gross, 0);
@@ -917,7 +917,7 @@ fn apply_fee(env: &Env, gross: i128) -> (i128, i128) {
 }
 
 /// Route the fee to the treasury if non-zero.
-fn maybe_pay_fee(env: &Env, fee: i128) {
+pub(crate) fn maybe_pay_fee(env: &Env, fee: i128) {
     if fee <= 0 {
         return;
     }

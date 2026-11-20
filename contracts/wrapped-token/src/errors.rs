@@ -21,22 +21,32 @@ pub enum WrappedTokenError {
     /// A batch call was given an empty recipient list.
     EmptyBatch = 10,
     /// Aggregate unwrap volume in the current ledger window exceeded the cap.
-    RateLimitExceeded = 8,
+    RateLimitExceeded = 11,
     /// Amount is below the configured minimum wrap/unwrap threshold.
-    AmountTooLow = 9,
+    AmountTooLow = 12,
+    /// `wrap`/`unwrap` was re-entered while another wrap/unwrap was executing (#1435).
+    Reentrancy = 13,
+    /// The underlying asset transfer reverted or did not move the expected amount;
+    /// the whole operation, including any wrapped-token burn, was rolled back (#1434).
+    UnderlyingTransferFailed = 14,
 }
 
 impl_display_error!(
     WrappedTokenError,
-    AlreadyInitialized  => "already initialized",
-    NotInitialized      => "not initialized",
-    Unauthorized        => "not authorized",
-    InvalidAmount       => "invalid amount",
-    InsufficientBalance => "insufficient balance",
-    InsufficientReserve => "insufficient reserve",
-    MaxWrapExceeded     => "max wrap exceeded",
-    RateLimitExceeded   => "unwrap rate limit exceeded",
-    AmountTooLow        => "amount below minimum",
+    AlreadyInitialized       => "already initialized",
+    NotInitialized           => "not initialized",
+    Unauthorized             => "not authorized",
+    InvalidAmount            => "invalid amount",
+    InsufficientBalance      => "insufficient balance",
+    InsufficientReserve      => "insufficient reserve",
+    MaxWrapExceeded          => "max wrap exceeded",
+    Overflow                 => "arithmetic overflow",
+    InvalidFee               => "invalid fee configuration",
+    EmptyBatch               => "empty batch",
+    RateLimitExceeded        => "unwrap rate limit exceeded",
+    AmountTooLow             => "amount below minimum",
+    Reentrancy               => "reentrant call detected",
+    UnderlyingTransferFailed => "underlying transfer failed",
 );
 
 #[cfg(test)]
@@ -58,8 +68,13 @@ WrappedTokenError::InvalidAmount = {}\n\
 WrappedTokenError::InsufficientBalance = {}\n\
 WrappedTokenError::InsufficientReserve = {}\n\
 WrappedTokenError::MaxWrapExceeded = {}\n\
+WrappedTokenError::Overflow = {}\n\
+WrappedTokenError::InvalidFee = {}\n\
+WrappedTokenError::EmptyBatch = {}\n\
 WrappedTokenError::RateLimitExceeded = {}\n\
-WrappedTokenError::AmountTooLow = {}\n",
+WrappedTokenError::AmountTooLow = {}\n\
+WrappedTokenError::Reentrancy = {}\n\
+WrappedTokenError::UnderlyingTransferFailed = {}\n",
             WrappedTokenError::AlreadyInitialized as u32,
             WrappedTokenError::NotInitialized as u32,
             WrappedTokenError::Unauthorized as u32,
@@ -67,8 +82,13 @@ WrappedTokenError::AmountTooLow = {}\n",
             WrappedTokenError::InsufficientBalance as u32,
             WrappedTokenError::InsufficientReserve as u32,
             WrappedTokenError::MaxWrapExceeded as u32,
+            WrappedTokenError::Overflow as u32,
+            WrappedTokenError::InvalidFee as u32,
+            WrappedTokenError::EmptyBatch as u32,
             WrappedTokenError::RateLimitExceeded as u32,
             WrappedTokenError::AmountTooLow as u32,
+            WrappedTokenError::Reentrancy as u32,
+            WrappedTokenError::UnderlyingTransferFailed as u32,
         )
     }
 

@@ -20,4 +20,7 @@ EscrowError::InsufficientArbiterApprovals = 19
 EscrowError::DuplicateArbiterApproval = 20
 EscrowError::InvalidPartialAmount = 21
 EscrowError::MutualCancelNotAllowed = 22
+EscrowError::DisputeWindowClosed = 23
+EscrowError::DisputeWindowOpen = 24
+EscrowError::InvalidMilestoneSchedule = 25
 EscrowError::LockupPeriodActive = 23

@@ -58,5 +58,20 @@ pub fn fee_collected(env: &Env, op: Symbol, payer: &Address, recipient: &Address
         .publish(topics, (payer.clone(), recipient.clone(), fee));
 }
 
-use soroban_sdk::Symbol;
+/// Emitted when the admin updates the protocol fee configuration.
+pub fn fees_updated(env: &Env, admin: &Address, wrap_fee_bps: u32, unwrap_fee_bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "fees_updated"), admin.clone()),
+        (wrap_fee_bps, unwrap_fee_bps),
+    );
+}
+
+/// Proof-of-reserve audit event (#1436): emitted when the wrapped supply exceeds
+/// the underlying collateral held by the contract.
+/// Data: `(total_wrapped, total_locked, deficit)`.
+pub fn reserve_discrepancy(env: &Env, total_wrapped: i128, total_locked: i128, deficit: i128) {
+    env.events().publish(
+        (Symbol::new(env, "reserve_discrepancy"),),
+        (total_wrapped, total_locked, deficit),
+    );
 }
