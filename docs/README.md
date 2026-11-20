@@ -41,7 +41,19 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
   - Mainnet deployment
   - Monitoring and maintenance
 
+- **[Storage & TTL Runbook](storage-ttl-runbook.md)** — Operational guide for Soroban storage rent and state archival
+  - Instance vs. persistent TTL management
+  - Rent cost estimation and eviction risks
+  - Automated TTL bumping patterns
+  - Keeper-based archive restoration procedures
+
 ## Development Resources
+
+- **[Getting Started Tutorial](getting-started-tutorial.md)** — End-to-end walkthrough for your first custom contract
+  - Setting up Rust, Soroban CLI, and the Devcontainer
+  - Writing storage types, error enums, and contract logic
+  - Unit, property-based, and snapshot testing
+  - Deploying to a local testnet and invoking contract methods
 
 - **[Development Environment](dev-environment.md)** — Setting up your local development environment
   - Prerequisites

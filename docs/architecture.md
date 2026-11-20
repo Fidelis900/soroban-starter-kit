@@ -465,6 +465,171 @@ See [security.md](security.md) for detailed security analysis, including:
 
 ---
 
+## Cross-Contract Composability
+
+The starter-kit contracts are designed to be composed into larger systems. This section documents representative composite architectures, the interaction matrix between contracts, and the patterns and security practices that apply when contracts call one another.
+
+### Composite Architecture Overview
+
+The diagram below shows how the individual contracts can be wired together into a governance-and-DeFi stack. Arrows point from caller to callee.
+
+```mermaid
+flowchart TD
+    subgraph Governance
+        DAO[DAO Contract]
+        MS[Multisig Contract]
+        TL[Timelock Contract]
+        STK[Staking Contract]
+    end
+
+    subgraph DeFi
+        ORC[Oracle Contract]
+        SWP[Swap / AMM Contract]
+        TOK[Token Contract]
+        ESC[Escrow Contract]
+    end
+
+    DAO -->|propose / vote outcome| MS
+    MS -->|execute approved tx| TL
+    TL -->|delayed execution| STK
+    TL -->|delayed execution| TOK
+    STK -->|reward transfers| TOK
+    ORC -->|price feed| SWP
+    SWP -->|transfer / transfer_from| TOK
+    ESC -->|transfer| TOK
+    MS -->|admin authority| TOK
+```
+
+### Governance Flow: DAO → Multisig → Timelock → Staking
+
+A typical governance action (e.g. changing staking reward parameters) flows through several contracts. The DAO records the vote outcome, the multisig enforces a signer threshold, the timelock enforces a delay, and the staking contract applies the change.
+
+```mermaid
+sequenceDiagram
+    actor Voter
+    participant DAO as DAO Contract
+    participant MS as Multisig Contract
+    participant TL as Timelock Contract
+    participant STK as Staking Contract
+    participant TOK as Token Contract
+
+    Voter->>DAO: vote(proposal_id)
+    DAO-->>DAO: tally votes, mark proposal passed
+    DAO->>MS: propose_transaction(timelock, set_reward_rate, args)
+    MS-->>MS: emit transaction_proposed(tx_id, proposer)
+
+    loop until signature_count >= threshold
+        MS->>MS: sign_transaction(tx_id)
+    end
+
+    MS->>TL: execute_transaction(tx_id) → schedule(operation)
+    TL-->>TL: store queued operation, ready_at = now + delay
+    TL-->>TL: emit operation_scheduled(op_id, ready_at)
+
+    Note over TL: delay elapses
+
+    TL->>STK: execute(op_id) → set_reward_rate(rate)
+    STK-->>STK: update reward parameters
+    STK->>TOK: transfer(rewards_pool, staker, reward)
+    STK-->>TL: ok
+    TL-->>TL: emit operation_executed(op_id)
+```
+
+**Key properties:**
+- The DAO never calls the staking contract directly; the multisig and timelock sit between them, so a compromised DAO cannot bypass the signer threshold or the delay.
+- The timelock is the only address with privileged access to the staking contract, so access control is a single, auditable edge.
+- Reward payouts are the only path from staking to the token contract, keeping token authority centralized.
+
+### DeFi Flow: Oracle → Swap → Token
+
+A swap contract consumes an oracle price feed and settles trades against a token contract.
+
+```mermaid
+sequenceDiagram
+    actor Trader
+    participant ORC as Oracle Contract
+    participant SWP as Swap Contract
+    participant TOK as Token Contract
+
+    Trader->>SWP: swap(token_in, token_out, amount_in, min_out)
+    SWP->>ORC: get_price(token_in, token_out)
+    ORC-->>SWP: price, timestamp
+    SWP-->>SWP: verify timestamp freshness, compute amount_out
+    alt amount_out >= min_out
+        SWP->>TOK: transfer_from(trader, swap, amount_in)
+        TOK-->>SWP: ok
+        SWP->>TOK: transfer(swap, trader, amount_out)
+        TOK-->>SWP: ok
+        SWP-->>Trader: amount_out
+    else slippage exceeded
+        SWP-->>Trader: revert (SlippageExceeded)
+    end
+```
+
+**Key properties:**
+- The oracle is read-only from the swap's perspective; it never holds funds.
+- All token movement happens through the token contract's standard interface, so the swap inherits the token's authorization and allowance semantics.
+- The `min_out` check is evaluated **before** any transfer, so a stale or manipulated price cannot drain funds.
+
+### Contract Interaction Matrix
+
+The matrix summarizes which contracts invoke which. `—` means no direct call; a checkmark means the row contract calls the column contract.
+
+| Caller ↓ / Callee → | Token | Escrow | Multisig | Timelock | Staking | DAO | Oracle | Swap |
+|---------------------|:-----:|:------:|:--------:|:--------:|:-------:|:---:|:------:|:----:|
+| **Token**           | —     | —      | —        | —        | —       | —   | —      | —    |
+| **Escrow**          | ✓     | —      | —        | —        | —       | —   | —      | —    |
+| **Multisig**        | ✓     | ✓      | —        | ✓        | ✓       | —   | —      | ✓    |
+| **Timelock**        | ✓     | ✓      | —        | —        | ✓       | —   | —      | ✓    |
+| **Staking**         | ✓     | —      | —        | —        | —       | —   | —      | —    |
+| **DAO**             | —     | —      | ✓        | —        | —       | —   | —      | —    |
+| **Oracle**          | —     | —      | —        | —        | —       | —   | —      | —    |
+| **Swap**            | ✓     | —      | —        | —        | —       | —   | ✓      | —    |
+
+**Reading the matrix:** the token contract is a leaf dependency (it calls nothing), which makes it safe to reuse across every composite. The multisig and timelock are the only contracts that fan out to many targets, so they are the highest-value audit targets in a composite deployment.
+
+### Composability Patterns
+
+**1. Authority delegation.** Rather than embedding admin logic in every contract, delegate privileged authority to a multisig or timelock. The token's `admin` and the staking contract's owner should be the multisig/timelock address, not an EOA. This gives you threshold control and delayed execution for free.
+
+**2. Layered gating.** Stack controls in order of increasing friction: DAO vote → multisig threshold → timelock delay. Each layer is independently auditable and can be swapped without touching the others.
+
+**3. Leaf dependencies.** Keep the token contract free of outbound calls. A contract that never calls another contract cannot be re-entered through it, which makes it a safe base layer for every composite.
+
+**4. Single-use escrows as adapters.** Because each escrow instance is single-use, it works well as a short-lived adapter between two parties in a larger workflow (e.g. a DAO treasury paying a contractor) without accumulating state.
+
+**5. Read-only oracles.** Oracles should expose pure view functions and never hold funds. Consumers are responsible for freshness and sanity checks.
+
+### Security Best Practices for Composites
+
+**Access control propagation.** Privileged entry points must verify the *caller*, not just the *transaction signer*. When a timelock calls `set_reward_rate`, the staking contract must check that `env.invoker()` (or the stored owner) is the timelock address. Never assume that because a call originated from a trusted transaction it is a trusted call.
+
+**Cross-contract call ordering.** Follow Checks-Effects-Interactions (CEI) *across* contract boundaries, not just within one contract:
+1. Validate inputs and authorization (Checks).
+2. Update your own storage to the post-call state (Effects).
+3. Make the outbound call (Interactions).
+
+If the outbound call fails or re-enters, your state is already consistent and re-entrant calls hit terminal or guarded states.
+
+**Timelock gating.** Any operation that changes economic parameters, upgrades a contract, or moves treasury funds should be routed through a timelock. The timelock must:
+- Store the operation hash and `ready_at` ledger before execution.
+- Reject execution before `ready_at`.
+- Reject re-execution of an already-executed operation (idempotency).
+- Emit `operation_scheduled` / `operation_executed` / `operation_cancelled` events for monitoring.
+
+**Upgrade safety.** Soroban contracts are immutable once deployed; "upgrades" are typically done by deploying a new contract and migrating state or by pointing an authority (multisig/timelock) at a new address. When migrating:
+- Drain or freeze the old contract's funds before switching authority.
+- Keep the old contract's admin set to the timelock until migration completes, so no window exists where an EOA controls it.
+- Emit an `admin_changed` event on the old contract as the final migration step.
+
+**CEI across contracts.** When contract A calls contract B which calls back into A, A must already be in a safe state. The escrow's terminal-state guard (`InvalidState` on any transition out of `Completed`/`Refunded`/`Cancelled`) is the canonical example: even if the token transfer re-enters, the escrow rejects the call.
+
+**Reentrancy via token callbacks.** If a token contract can invoke a callback on transfer (e.g. a hook), treat every token transfer as a potential reentrancy point. Update state first, and never hold a lock across a cross-contract call.
+
+**Event correlation.** Emit events on both sides of a cross-contract call (e.g. `operation_executed` on the timelock and `reward_rate_changed` on staking) so off-chain indexers can reconstruct the full causal chain. Include a shared correlation id (operation hash or tx id) in event data where possible.
+
+---
+
 ## References
 
 - [ADR-0001: Storage Tier Choices](adr/0001-storage-tier-choices.md)
