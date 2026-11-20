@@ -9,7 +9,7 @@
 
 use super::*;
 use soroban_sdk::{
-    Address, Env,
+    Address, BytesN, Env, String,
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
 };
@@ -35,6 +35,71 @@ fn setup(env: &Env) -> (CrowdfundContractClient, Address, Address, Address, Addr
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_stretch_goals_unlock_dynamically() {
+    use soroban_sdk::String as SdkString;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, c2, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let goal = 1_000_i128;
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(FundingTier {
+        threshold: 1_500,
+        description: SdkString::from_str(&env, "Audit"),
+        max_backers: None,
+    });
+    tiers.push_back(FundingTier {
+        threshold: 3_000,
+        description: SdkString::from_str(&env, "Mobile app"),
+        max_backers: None,
+    });
+
+    client.initialize(&creator, &token, &goal, &deadline, &tiers, &None, &None);
+
+    client.pledge(&c1, &1_200, &None);
+    let info = client.get_info();
+    assert_eq!(info.stretch_goals.len(), 2);
+    assert!(!info.stretch_goals.get(0).unwrap().unlocked);
+    assert!(!info.stretch_goals.get(1).unwrap().unlocked);
+
+    client.pledge(&c2, &400, &None);
+    let info = client.get_info();
+    assert!(info.stretch_goals.get(0).unwrap().unlocked);
+    assert!(!info.stretch_goals.get(1).unwrap().unlocked);
+
+    client.pledge(&c1, &1_500, &None);
+    let info = client.get_info();
+    assert!(info.stretch_goals.get(0).unwrap().unlocked);
+    assert!(info.stretch_goals.get(1).unwrap().unlocked);
+}
+
+#[test]
+fn test_post_update_emits_event() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, _, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    client.initialize(
+        &creator,
+        &token,
+        &1_000,
+        &deadline,
+        &soroban_sdk::Vec::new(&env),
+        &None,
+        &None,
+    );
+
+    let hash = BytesN::from_array(&env, &[7u8; 32]);
+    let uri = String::from_str(&env, "ipfs://update-1");
+    client.post_update(&creator, &hash, &uri);
+}
+
+#[test]
 fn test_goal_met_creator_claims() {
     let env = Env::default();
     env.mock_all_auths();
@@ -42,7 +107,7 @@ fn test_goal_met_creator_claims() {
 
     let deadline = env.ledger().sequence() + 100;
     let goal = 5_000_i128;
-    client.initialize(&creator, &token, &goal, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &goal, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &3_000, &None);
     client.pledge(&c2, &2_500, &None);
@@ -65,7 +130,7 @@ fn test_pledge_increments_total() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 50;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &400, &None);
     assert_eq!(client.get_info().total_pledged, 400);
@@ -81,7 +146,7 @@ fn test_withdraw_before_deadline() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 50;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &3_000, &None);
     client.withdraw(&c1);
@@ -101,7 +166,7 @@ fn test_goal_not_met_contributors_refund() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &1_000, &None);
     client.pledge(&c2, &500, &None);
@@ -123,7 +188,7 @@ fn test_pledge_after_deadline_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
 
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.pledge(&c1, &500, &None);
@@ -137,7 +202,7 @@ fn test_claim_before_deadline_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None);
     client.pledge(&c1, &1_000, &None);
     // deadline not reached
     client.claim();
@@ -151,7 +216,7 @@ fn test_claim_goal_not_met_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
     client.pledge(&c1, &100, &None);
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.claim();
@@ -165,7 +230,7 @@ fn test_refund_when_goal_met_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None);
     client.pledge(&c1, &1_000, &None);
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.refund(&c1);
@@ -179,8 +244,8 @@ fn test_double_initialize_fails() {
     let (client, creator, _, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +259,7 @@ fn test_cancel_campaign_before_deadline() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &3_000, &None);
     client.pledge(&c2, &2_000, &None);
@@ -221,7 +286,7 @@ fn test_cancel_campaign_after_deadline_fails() {
     let (client, creator, _, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
 
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.cancel_campaign();
@@ -235,7 +300,7 @@ fn test_pledge_after_cancel_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.cancel_campaign();
     client.pledge(&c1, &1_000, &None);
@@ -264,7 +329,7 @@ fn test_tier_selection_and_tracking() {
         max_backers: None,
     });
 
-    client.initialize(&creator, &token, &10_000, &deadline, &tiers, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &tiers, &None, &None);
 
     // c1 claims tier 0 (Bronze)
     client.pledge(&c1, &1_000, &Some(0));
@@ -307,7 +372,7 @@ fn test_tier_capacity_exceeded() {
     let client = CrowdfundContractClient::new(&env, &addr);
     env.mock_all_auths();
 
-    client.initialize(&creator, &token_addr, &1_000, &deadline, &tiers, &None);
+    client.initialize(&creator, &token_addr, &1_000, &deadline, &tiers, &None, &None);
 
     client.pledge(&c1, &100, &Some(0));
     client.pledge(&c2, &100, &Some(0));
@@ -323,7 +388,7 @@ fn test_invalid_tier_id() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
 
     // Try to claim tier 5 when no tiers exist
     client.pledge(&c1, &100, &Some(5));
@@ -340,7 +405,7 @@ fn test_refund_batch() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &500, &None);
     client.pledge(&c2, &600, &None);
@@ -366,7 +431,7 @@ fn test_refund_batch_on_cancelled_campaign() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
 
     client.pledge(&c1, &500, &None);
     client.pledge(&c2, &600, &None);

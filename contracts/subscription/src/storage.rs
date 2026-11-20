@@ -23,6 +23,9 @@ pub enum DataKey {
     /// Number of ledgers a delinquent subscription is tolerated before it is
     /// suspended (instance storage).
     GracePeriod,
+    /// Subscriber-approved amount for a (subscriber, plan) pair when a provider
+    /// increases plan pricing and explicit consent is required.
+    ApprovedAmount(Address, Symbol),
     /// Accumulated provider revenue held in contract escrow.
     ProviderRevenue(Address),
     /// Minimum accumulated revenue required before a payout is allowed.
