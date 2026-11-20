@@ -418,46 +418,152 @@ mod contract {
             Self::execute_batch(env, v)
         }
 
-        /// Execute multiple already-approved proposals in a single transaction (#826).
+        /// Execute multiple already-approved proposals atomically in a single
+        /// invocation (#1448).
         ///
         /// ## Semantics
         ///
-        /// Each proposal ID is validated and attempted **independently**.  A
-        /// failure for one proposal does **not** abort the others:
-        ///
-        /// - If a proposal does not exist (`TransactionNotFound`) it is silently
-        ///   skipped.
-        /// - If a proposal is already executed (`AlreadyExecuted`), expired
-        ///   (`ProposalExpired`), or has insufficient weight (`ThresholdNotMet`)
-        ///   it is silently skipped.
-        ///
-        /// The caller should diff the returned `Vec<u64>` against the input to
-        /// identify which proposals were skipped.  Individual proposal state can
-        /// be inspected via `get_transaction`.
+        /// Every proposal ID is validated up-front (exists, not executed, not
+        /// expired, threshold met).  If **any** proposal fails validation the
+        /// whole call returns the corresponding error and nothing is executed.
+        /// Once all proposals validate, they are executed sequentially.  Soroban
+        /// invocation atomicity guarantees that a failure during execution rolls
+        /// back the entire batch.
         ///
         /// ## Returns
         ///
-        /// `Vec<u64>` �?" IDs of proposals that were successfully executed during
-        /// this call.  A `batch_executed` event is emitted with the executed IDs
-        /// and the count of skipped proposals.
+        /// `Vec<u64>` — IDs of proposals that were successfully executed during
+        /// this call (all of them, on success).  A `batch_executed` event is
+        /// emitted with the executed IDs and a skipped count of 0.
         pub fn execute_batch(env: Env, proposal_ids: Vec<u64>) -> Vec<u64> {
             let mut executed_ids: Vec<u64> = Vec::new(&env);
-            let mut skipped_count: u32 = 0;
 
+            // Validate every proposal before executing any of them so that a
+            // single bad ID aborts the whole batch (atomic semantics).
             for tx_id in proposal_ids.iter() {
-                match Self::execute_phase(&env, tx_id) {
-                    Ok(_) => {
-                        executed_ids.push_back(tx_id);
-                    }
-                    Err(_) => {
-                        skipped_count = skipped_count.saturating_add(1);
-                    }
-                }
+                Self::validate_executable(&env, tx_id);
             }
 
-            events::batch_executed(&env, &executed_ids, skipped_count);
+            for tx_id in proposal_ids.iter() {
+                Self::execute_phase(&env, tx_id);
+                executed_ids.push_back(tx_id);
+            }
+
+            events::batch_executed(&env, &executed_ids, 0);
             executed_ids
         }
+
+        /// Replace a signer key while preserving the wallet configuration (#1447).
+        ///
+        /// Requires threshold approvals from the current signer set.  The
+        /// `old_signer` must be an existing signer and `new_signer` must not
+        /// already be a signer.  The configuration nonce is incremented and any
+        /// pending (unexecuted) proposals signed by `old_signer` are invalidated
+        /// by clearing their signatures and accumulated weight.
+        pub fn replace_signer(
+            env: Env,
+            approvals: Vec<Address>,
+            old_signer: Address,
+            new_signer: Address,
+        ) -> Result<(), MultisigError> {
+            let signers = Self::get_required_signers(&env)?;
+            Self::require_threshold_approvals(&env, &approvals)?;
+
+            if !contains(&signers, &old_signer) {
+                return Err(MultisigError::NotSigner);
+            }
+            if contains(&signers, &new_signer) {
+                return Err(MultisigError::InvalidSigners);
+            }
+
+            // Rebuild signer list with the replacement.
+            let mut updated = Vec::new(&env);
+            for existing in signers.iter() {
+                if existing == old_signer {
+                    updated.push_back(new_signer.clone());
+                } else {
+                    updated.push_back(existing);
+                }
+            }
+            validate_unique_signers(&updated)?;
+
+            // Carry over the old signer's weight (default 1).
+            let mut weights_map: Map<Address, u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Weights)
+                .unwrap_or_else(|| Map::new(&env));
+            let old_weight = weights_map.get(old_signer.clone()).unwrap_or(1u32);
+            weights_map.remove(old_signer.clone());
+            weights_map.set(new_signer.clone(), old_weight);
+
+            env.storage().instance().set(&DataKey::Signers, &updated);
+            env.storage()
+                .instance()
+                .set(&DataKey::Weights, &weights_map);
+
+            // Increment configuration nonce.
+            let nonce: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ConfigNonce)
+                .unwrap_or(0u64);
+            env.storage()
+                .instance()
+                .set(&DataKey::ConfigNonce, &(nonce + 1));
+
+            // Invalidate pending proposals signed by the old signer.
+            Self::invalidate_pending_for_signer(&env, &old_signer);
+
+            bump_instance(&env);
+            events::signer_replaced(&env, &old_signer, &new_signer);
+            Ok(())
+        }
+
+        /// Return the current configuration nonce (#1447).
+        pub fn config_nonce(env: Env) -> u64 {
+            env.storage()
+                .instance()
+                .get(&DataKey::ConfigNonce)
+                .unwrap_or(0u64)
+        }
+
+        /// Garbage-collect all expired, unexecuted proposals (#1446).
+        ///
+        /// Iterates every stored proposal ID, removes those whose expiration
+        /// ledger has passed and which have not been executed, and emits a
+        /// `proposal_expired` event for each removal.  Returns the number of
+        /// proposals removed.
+        pub fn garbage_collect_expired(env: Env) -> u32 {
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextTransactionId)
+                .unwrap_or(0u64);
+            let current_ledger = env.ledger().sequence();
+            let mut removed: u32 = 0;
+
+            let mut tx_id: u64 = 0;
+            while tx_id < next_id {
+                if let Some(transaction) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Transaction>(&DataKey::Transaction(tx_id))
+                {
+                    if !transaction.executed && current_ledger > transaction.expiry_ledger {
+                        env.storage()
+                            .persistent()
+                            .remove(&DataKey::Transaction(tx_id));
+                        events::proposal_expired(&env, tx_id);
+                        removed = removed.saturating_add(1);
+                    }
+                }
+                tx_id += 1;
+            }
+
+            removed
+        }
+=======
 
         /// Return the current signer list.
         pub fn get_signers(env: Env) -> Vec<Address> {
@@ -557,7 +663,16 @@ mod contract {
             signatures.push_back(proposer.clone());
 
             let current_ledger = env.ledger().sequence();
-            let expiry_ledger = current_ledger.saturating_add(expiry_ledgers);
+            // Clamp the requested validity by the configured maximum (#1446).
+            let effective_expiry = match env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MaxProposalValidityLedgers)
+            {
+                Some(max_valid) => expiry_ledgers.min(max_valid),
+                None => expiry_ledgers,
+            };
+            let expiry_ledger = current_ledger.saturating_add(effective_expiry);
 
             let transaction = Transaction {
                 id: tx_id,
@@ -609,7 +724,21 @@ mod contract {
             }
 
             let weight = Self::signer_weight_internal(env, signer);
-            transaction.signatures.push_back(signer.clone());
+            // Keep signatures in strictly ascending address order so that
+            // duplicate detection (#1449) remains valid.
+            let mut new_signatures = Vec::new(env);
+            let mut inserted = false;
+            for existing in transaction.signatures.iter() {
+                if !inserted && *signer < existing {
+                    new_signatures.push_back(signer.clone());
+                    inserted = true;
+                }
+                new_signatures.push_back(existing);
+            }
+            if !inserted {
+                new_signatures.push_back(signer.clone());
+            }
+            transaction.signatures = new_signatures;
             transaction.accumulated_weight =
                 transaction.accumulated_weight.saturating_add(weight);
             let signature_count = transaction.signatures.len();
@@ -620,17 +749,16 @@ mod contract {
             Ok(signature_count)
         }
 
-        /// Phase 3 — verify accumulated weight meets threshold and execute.
+        /// Validate that a proposal is executable without mutating state.
         #[inline]
-        fn execute_phase(env: &Env, tx_id: u64) -> Result<Val, MultisigError> {
-            let mut transaction = Self::get_required_transaction(env, tx_id)?;
+        fn validate_executable(env: &Env, tx_id: u64) -> Result<(), MultisigError> {
+            let transaction = Self::get_required_transaction(env, tx_id)?;
             if transaction.executed {
                 return Err(MultisigError::AlreadyExecuted);
             }
             if env.ledger().sequence() > transaction.expiry_ledger {
                 return Err(MultisigError::ProposalExpired);
             }
-            // Enforce max proposal validity window if configured
             if let Some(max_valid) = env
                 .storage()
                 .instance()
@@ -651,6 +779,65 @@ mod contract {
                 return Err(MultisigError::ThresholdNotMet);
             }
 
+            // Reject duplicate signatures (#1449): signatures must be strictly
+            // ascending by address, guaranteeing distinct signers.
+            Self::verify_unique_signatures(&transaction.signatures)?;
+
+            Ok(())
+        }
+
+        /// Verify that `signatures` contains no duplicates (#1449).
+        ///
+        /// Signatures must be in strictly ascending address order.  A duplicate
+        /// (or out-of-order) entry yields `DuplicateSignature`.
+        #[inline]
+        fn verify_unique_signatures(signatures: &Vec<Address>) -> Result<(), MultisigError> {
+            let mut prev: Option<Address> = None;
+            for signer in signatures.iter() {
+                if let Some(p) = prev {
+                    if signer <= p {
+                        return Err(MultisigError::DuplicateSignature);
+                    }
+                }
+                prev = Some(signer);
+            }
+            Ok(())
+        }
+
+        /// Clear signatures/weight on pending proposals signed by `signer` (#1447).
+        #[inline]
+        fn invalidate_pending_for_signer(env: &Env, signer: &Address) {
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextTransactionId)
+                .unwrap_or(0u64);
+            let mut tx_id: u64 = 0;
+            while tx_id < next_id {
+                if let Some(mut transaction) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Transaction>(&DataKey::Transaction(tx_id))
+                {
+                    if !transaction.executed && contains(&transaction.signatures, signer) {
+                        transaction.signatures = Vec::new(env);
+                        transaction.accumulated_weight = 0;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::Transaction(tx_id), &transaction);
+                        bump_transaction(env, tx_id);
+                    }
+                }
+                tx_id += 1;
+            }
+        }
+
+        /// Phase 3 — verify accumulated weight meets threshold and execute.
+        #[inline]
+        fn execute_phase(env: &Env, tx_id: u64) -> Result<Val, MultisigError> {
+            Self::validate_executable(env, tx_id)?;
+
+            let mut transaction = Self::get_required_transaction(env, tx_id)?;
             transaction.executed = true;
             env.storage()
                 .persistent()

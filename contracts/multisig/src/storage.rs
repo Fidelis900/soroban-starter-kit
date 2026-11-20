@@ -23,6 +23,9 @@ pub enum DataKey {
     SpendingLimits(Address),
     /// All configured token spending limits.
     SpendingLimitsList,
+    /// Monotonic nonce bumped whenever the signer configuration changes
+    /// (e.g. via `replace_signer`). Used to invalidate stale signatures.
+    ConfigNonce,
 }
 
 #[contracttype]
@@ -52,16 +55,6 @@ pub struct Transaction {
 pub struct SignerWeight {
     pub signer: Address,
     pub weight: u32,
-}
-
-/// Spending limit configuration for a specific token.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenSpendingLimit {
-    pub token: Address,
-    pub daily_limit: i128,
-    pub spent_amount: i128,
-    pub last_refill_ledger: u32,
 }
 
 /// Spending limit configuration for a specific token.

@@ -1579,6 +1579,56 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 **Resolution:** Use a positive amount and a non-negative limit.
 
+---
+
+### `DuplicateSignature` (code 23)
+
+**Description:** The signatures submitted to `execute` (or another threshold-gated entry point) are not from distinct signers — the same signer address appears more than once.
+
+**Common cause:** A single signer submitting the same signature twice (or two copies of it) in an attempt to satisfy the threshold alone, or an integration that concatenates signature lists without de-duplicating signer addresses.
+
+**Resolution:** Collect exactly one signature per signer. Signatures are verified in strictly ascending signer-address order, so sort the collected signatures by signer address before submitting and remove any duplicates.
+
+---
+
+### `SignerAlreadyExists` (code 24)
+
+**Description:** `replace_signer` was called with a `new_signer` that is already a member of the multisig.
+
+**Common cause:** Replacing a signer with an address that is already in the signer set, or re-submitting a replacement that already took effect.
+
+**Resolution:** Call `get_signers()` to list the current signer set and choose a `new_signer` that is not already present. To change a signer's weight, use the weight-configuration entry point instead.
+
+---
+
+### `SignerNotFound` (code 25)
+
+**Description:** `replace_signer` was called with an `old_signer` that is not a member of the multisig.
+
+**Common cause:** Replacing a signer that was already replaced or removed, or passing the wrong address as `old_signer`.
+
+**Resolution:** Call `get_signers()` to confirm the current signer set before calling `replace_signer`. Note that replacing a signer increments the configuration nonce, which invalidates pending proposals signed under the previous configuration.
+
+---
+
+### `EmptyBatch` (code 26)
+
+**Description:** `execute_batch` was called with an empty list of proposals.
+
+**Common cause:** Passing an empty `Vec` of proposal IDs to `execute_batch`.
+
+**Resolution:** Pass at least one approved proposal ID. Use `execute` for a single proposal.
+
+---
+
+### `BatchExecutionFailed` (code 27)
+
+**Description:** One of the proposals in an `execute_batch` call failed to execute, so the entire batch was rolled back atomically — no proposal in the batch was applied.
+
+**Common cause:** A batched proposal that had not reached threshold, had expired, was cancelled, or whose target call reverted.
+
+**Resolution:** Verify every proposal in the batch is approved, unexpired, and not cancelled before batching. Re-run the failing proposal individually with `execute` to surface the underlying error, then retry the batch.
+
 > See `contract-api.md` for the full `MultisigContract` public API and the
 > remaining `MultisigError` codes 1–10.
 
