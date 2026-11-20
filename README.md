@@ -10,6 +10,8 @@ A curated collection of production-ready Soroban smart contract templates. These
 
 ## 🚀 Quick Start
 
+> **New to Soroban?** Follow the [Getting Started Tutorial](docs/getting-started-tutorial.md) for an end-to-end walkthrough: setting up your toolchain, writing storage types and contract logic, testing, and deploying your first custom contract.
+
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/soroban-contract-templates.git
@@ -376,6 +378,8 @@ A special thanks to all our [contributors](CONTRIBUTORS.md) who have helped make
 - [Deployment Guide](docs/deployment-guide.md)
 - [Testing Strategy](docs/testing-strategy.md) — Coverage matrix (unit/property/fuzz/integration) by contract
 - [Gas / Compute Unit Costs](docs/gas-costs.md) — Measured and estimated CU costs per contract function
+- [Getting Started Tutorial](docs/getting-started-tutorial.md) — End-to-end guide to building, testing, optimizing, and deploying your first custom contract
+- [Storage, TTL & State Archival Runbook](docs/storage-ttl-runbook.md) — Instance vs persistent TTL management, rent cost estimation, TTL renewal patterns, and archive restoration procedures
 - [Soroban Documentation](https://soroban.stellar.org/docs)
 - [Stellar Developer Discord](https://discord.gg/stellardev)
 - [Soroban Examples](https://github.com/stellar/soroban-examples)

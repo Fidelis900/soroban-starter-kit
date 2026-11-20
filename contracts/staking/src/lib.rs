@@ -36,6 +36,9 @@ pub use storage::{BOOST_DENOMINATOR, DataKey, LOCKUP_TIERS, REWARD_SCALE, Unbond
 use soroban_common::math::mul_div;
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance};
 
+/// Basis-point denominator used for slash percentages and APY decay factors.
+const BPS_DENOMINATOR: i128 = 10_000;
+
 fn bump(env: &Env) {
     extend_ttl_instance(env, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
 }
@@ -54,6 +57,73 @@ fn reward_rate(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::RewardRate)
         .unwrap_or(0i128)
+}
+
+/// Returns the base emission rate configured for dynamic APY decay (#1452).
+fn base_rate(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::BaseRate)
+        .unwrap_or(0i128)
+}
+
+/// Returns the saturation threshold for dynamic APY decay (#1452).
+fn saturation_threshold(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SaturationThreshold)
+        .unwrap_or(0i128)
+}
+
+/// Returns the decay factor (bps) for dynamic APY decay (#1452).
+fn decay_factor_bps(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::DecayFactorBps)
+        .unwrap_or(0i128)
+}
+
+/// Pure dynamic reward-rate calculator (#1452).
+///
+/// When dynamic parameters are configured (`saturation_threshold > 0`), the
+/// effective emission rate decays inversely with pool saturation:
+///
+/// ```text
+/// rate = base_rate * threshold / (threshold + total_staked)
+/// ```
+///
+/// As `total_staked` grows the rate shrinks toward zero, protecting the reward
+/// pool from premature depletion.  `decay_factor_bps` scales the sensitivity:
+/// a factor of `10_000` applies the full inverse curve, `0` disables decay
+/// (rate stays at `base_rate`).  When no dynamic params are set, the fixed
+/// [`reward_rate`] is returned unchanged.
+fn dynamic_reward_rate(env: &Env, total_staked: i128) -> i128 {
+    let threshold = saturation_threshold(env);
+    if threshold <= 0 {
+        return reward_rate(env);
+    }
+    let base = base_rate(env);
+    if base <= 0 {
+        return 0;
+    }
+    let staked = if total_staked > 0 { total_staked } else { 0 };
+    let denom = threshold.saturating_add(staked);
+    if denom <= 0 {
+        return base;
+    }
+    // Full inverse-saturation rate: base * threshold / (threshold + staked).
+    let full = match mul_div(base, threshold, denom) {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    // Blend between `base` (no decay) and `full` (full decay) by the factor.
+    let factor = decay_factor_bps(env).clamp(0, BPS_DENOMINATOR);
+    let decayed = base.saturating_sub(full);
+    let applied = match mul_div(decayed, factor, BPS_DENOMINATOR) {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    base.saturating_sub(applied)
 }
 
 /// Returns the ledger at which the current emission period ends.
@@ -84,7 +154,7 @@ fn projected_reward_per_token(env: &Env, total_staked: i128) -> Result<i128, Sta
     let now = env.ledger().sequence();
     let last = last_update_ledger(env);
     let end = period_end(env);
-    let rate = reward_rate(env);
+    let rate = dynamic_reward_rate(env, total_staked);
 
     let effective_now = if now < end { now } else { end };
     let effective_last = if last < end { last } else { end };
@@ -115,7 +185,7 @@ fn accrue(env: &Env, total_weight: i128) -> Result<(), StakingError> {
         let last = last_update_ledger(env);
         let elapsed = now.min(end).saturating_sub(last.min(end));
         let emitted = (elapsed as i128)
-            .checked_mul(reward_rate(env))
+            .checked_mul(dynamic_reward_rate(env, total_weight))
             .ok_or(StakingError::Overflow)?;
         let total = get_i128(env, &DataKey::TotalEmitted)
             .checked_add(emitted)
@@ -144,6 +214,20 @@ fn get_admin(env: &Env) -> Result<Address, StakingError> {
         .instance()
         .get(&DataKey::Admin)
         .ok_or(StakingError::NotInitialized)
+}
+
+/// Returns true if `who` is authorized to slash (#1450): the admin or any
+/// address registered via `set_slasher`.
+fn is_slasher(env: &Env, who: &Address) -> bool {
+    if let Ok(admin) = get_admin(env) {
+        if admin == *who {
+            return true;
+        }
+    }
+    env.storage()
+        .persistent()
+        .get::<DataKey, bool>(&DataKey::Slasher(who.clone()))
+        .unwrap_or(false)
 }
 
 fn get_stake_token(env: &Env) -> Result<Address, StakingError> {
@@ -352,6 +436,10 @@ mod contract {
             s.set(&DataKey::RewardRate, &0i128);
             s.set(&DataKey::PeriodEnd, &0u32);
             s.set(&DataKey::LastUpdateLedger, &env.ledger().sequence());
+            s.set(&DataKey::InsurancePool, &0i128);
+            s.set(&DataKey::BaseRate, &0i128);
+            s.set(&DataKey::SaturationThreshold, &0i128);
+            s.set(&DataKey::DecayFactorBps, &0i128);
             bump(&env);
             Ok(())
         }
@@ -478,7 +566,56 @@ mod contract {
         }
 
         /// Queue an unbonding withdrawal.  Rejected while a lockup is active.
+        ///
+        /// When an unbonding period is configured this delegates to
+        /// [`Self::request_unbond`]; otherwise tokens are returned immediately.
         pub fn unstake(env: Env, staker: Address, amount: i128) -> Result<(), StakingError> {
+            staker.require_auth();
+            get_total_staked_internal(&env)?;
+            if env.ledger().sequence() < locked_until(&env, &staker) {
+                return Err(StakingError::StillLocked);
+            }
+            let unbonding_period: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::UnbondingPeriod)
+                .unwrap_or(0u32);
+            if unbonding_period > 0 {
+                return Self::request_unbond(env, staker, amount);
+            }
+            accrue(&env, total_weight(&env))?;
+            update_reward(&env, &staker);
+            let prev = stake_of(&env, &staker);
+            if amount <= 0 || amount > prev {
+                return Err(StakingError::InsufficientStake);
+            }
+            set_stake(&env, &staker, prev - amount)?;
+            let stake_token = get_stake_token(&env)?;
+            token::Client::new(&env, &stake_token).transfer(
+                &env.current_contract_address(),
+                &staker,
+                &amount,
+            );
+            bump(&env);
+            Ok(())
+        }
+
+        /// Queue an unbonding withdrawal that matures after the configured
+        /// unbonding period (#1451).
+        ///
+        /// Moves `amount` out of the active stake into an [`UnbondRequest`]
+        /// whose `available_at` is `now + UnbondingPeriod`.  The tokens remain
+        /// in the contract until [`Self::claim_unbonded`] is called after
+        /// maturation.
+        ///
+        /// # Errors
+        /// - [`StakingError::StillLocked`] if a lockup is active.
+        /// - [`StakingError::InsufficientStake`] if `amount` exceeds the stake.
+        pub fn request_unbond(
+            env: Env,
+            staker: Address,
+            amount: i128,
+        ) -> Result<(), StakingError> {
             staker.require_auth();
             get_total_staked_internal(&env)?;
             if env.ledger().sequence() < locked_until(&env, &staker) {
@@ -496,31 +633,131 @@ mod contract {
                 .instance()
                 .get(&DataKey::UnbondingPeriod)
                 .unwrap_or(0u32);
-            if unbonding_period == 0 {
-                let stake_token = get_stake_token(&env)?;
-                token::Client::new(&env, &stake_token).transfer(
-                    &env.current_contract_address(),
-                    &staker,
-                    &amount,
-                );
-            } else {
-                let key = DataKey::UnbondRequest(staker.clone());
-                let existing: i128 = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, UnbondRequest>(&key)
-                    .map(|r| r.amount)
-                    .unwrap_or(0);
-                env.storage().persistent().set(
-                    &key,
-                    &UnbondRequest {
-                        amount: existing + amount,
-                        available_at: env.ledger().sequence() + unbonding_period,
-                    },
-                );
-            }
+            let now = env.ledger().sequence();
+            let available_at = now
+                .checked_add(unbonding_period)
+                .ok_or(StakingError::Overflow)?;
+            let key = DataKey::UnbondRequest(staker.clone());
+            let existing: i128 = env
+                .storage()
+                .persistent()
+                .get::<DataKey, UnbondRequest>(&key)
+                .map(|r| r.amount)
+                .unwrap_or(0);
+            let total = existing.checked_add(amount).ok_or(StakingError::Overflow)?;
+            env.storage().persistent().set(
+                &key,
+                &UnbondRequest {
+                    amount: total,
+                    available_at,
+                },
+            );
+            events::unbond_requested(&env, &staker, amount, available_at);
             bump(&env);
             Ok(())
+        }
+
+        /// Claim matured unbonded tokens (#1451).
+        ///
+        /// # Errors
+        /// - [`StakingError::NoUnbondRequest`] if nothing is queued.
+        /// - [`StakingError::UnbondingNotComplete`] before maturation.
+        pub fn claim_unbonded(env: Env, staker: Address) -> Result<i128, StakingError> {
+            staker.require_auth();
+            let key = DataKey::UnbondRequest(staker.clone());
+            let req: UnbondRequest = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(StakingError::NoUnbondRequest)?;
+            if env.ledger().sequence() < req.available_at {
+                return Err(StakingError::UnbondingNotComplete);
+            }
+            env.storage().persistent().remove(&key);
+            let stake_token = get_stake_token(&env)?;
+            token::Client::new(&env, &stake_token).transfer(
+                &env.current_contract_address(),
+                &staker,
+                &req.amount,
+            );
+            events::withdrawn(&env, &staker, req.amount);
+            bump(&env);
+            Ok(req.amount)
+        }
+
+        /// Register or revoke an authorized slasher (#1450).  Admin-only.
+        pub fn set_slasher(
+            env: Env,
+            slasher: Address,
+            authorized: bool,
+        ) -> Result<(), StakingError> {
+            let admin = get_admin(&env)?;
+            admin.require_auth();
+            env.storage()
+                .persistent()
+                .set(&DataKey::Slasher(slasher), &authorized);
+            bump(&env);
+            Ok(())
+        }
+
+        /// Configure dynamic APY decay parameters (#1452).  Admin-only.
+        ///
+        /// `decay_factor_bps` is clamped to `[0, 10_000]`.  A
+        /// `saturation_threshold` of `0` disables dynamic decay and falls back
+        /// to the fixed [`Self::set_reward_rate`] emission.
+        pub fn set_reward_params(
+            env: Env,
+            base_rate: i128,
+            saturation_threshold: i128,
+            decay_factor_bps: i128,
+        ) -> Result<(), StakingError> {
+            let admin = get_admin(&env)?;
+            admin.require_auth();
+            if base_rate < 0 || saturation_threshold < 0 {
+                return Err(StakingError::InvalidRewardRate);
+            }
+            get_total_staked_internal(&env)?;
+            accrue(&env, total_weight(&env))?;
+            let s = env.storage().instance();
+            s.set(&DataKey::BaseRate, &base_rate);
+            s.set(&DataKey::SaturationThreshold, &saturation_threshold);
+            s.set(
+                &DataKey::DecayFactorBps,
+                &decay_factor_bps.clamp(0, BPS_DENOMINATOR),
+            );
+            bump(&env);
+            Ok(())
+        }
+
+        /// Atomically compound pending rewards into the active stake (#1453).
+        ///
+        /// Equivalent to `claim_rewards` followed by `stake`, but in a single
+        /// invocation.  The reward tokens stay in the contract and are added
+        /// to the staker's principal.
+        pub fn compound(env: Env, staker: Address) -> Result<i128, StakingError> {
+            staker.require_auth();
+            get_total_staked_internal(&env)?;
+            accrue(&env, total_weight(&env))?;
+            update_reward(&env, &staker);
+            let reward = get_p_i128(&env, &DataKey::Rewards(staker.clone()));
+            if reward <= 0 {
+                bump(&env);
+                return Ok(0);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::Rewards(staker.clone()), &0i128);
+            let claimed = get_i128(&env, &DataKey::TotalClaimed)
+                .checked_add(reward)
+                .ok_or(StakingError::Overflow)?;
+            env.storage().instance().set(&DataKey::TotalClaimed, &claimed);
+            let new_stake = stake_of(&env, &staker)
+                .checked_add(reward)
+                .ok_or(StakingError::Overflow)?;
+            set_stake(&env, &staker, new_stake)?;
+            events::compounded(&env, &staker, reward);
+            bump(&env);
+            Ok(reward)
         }
 
         /// Cancel a pending unbonding request, returning the tokens directly
@@ -549,71 +786,107 @@ mod contract {
         }
 
         /// Withdraw tokens after the unbonding period has elapsed.
+        ///
+        /// Alias for [`Self::claim_unbonded`].
         pub fn withdraw(env: Env, staker: Address) -> Result<i128, StakingError> {
-            staker.require_auth();
-            let req: UnbondRequest = env
-                .storage()
-                .persistent()
-                .get(&DataKey::UnbondRequest(staker.clone()))
-                .ok_or(StakingError::NoUnbondRequest)?;
-            if env.ledger().sequence() < req.available_at {
-                return Err(StakingError::UnbondingNotComplete);
-            }
-            env.storage()
-                .persistent()
-                .remove(&DataKey::UnbondRequest(staker.clone()));
-            let stake_token = get_stake_token(&env)?;
-            token::Client::new(&env, &stake_token).transfer(
-                &env.current_contract_address(),
-                &staker,
-                &req.amount,
-            );
-            bump(&env);
-            Ok(req.amount)
+            Self::claim_unbonded(env, staker)
         }
 
-        /// Admin-only: slash up to `amount`, taking from active stake first and
-        /// then from any pending unbond request.
-        pub fn slash(env: Env, staker: Address, amount: i128) -> Result<(), StakingError> {
-            let admin = get_admin(&env)?;
-            admin.require_auth();
+        /// Slash `percentage` (basis points, `[0, 10_000]`) of `staker`'s
+        /// principal (#1450).  Restricted to the admin or registered slashers.
+        ///
+        /// Slashed tokens are deducted from the active stake first and then
+        /// from any pending unbond request, credited to the insurance pool and
+        /// transferred to the configured slash destination.
+        ///
+        /// # Errors
+        /// - [`StakingError::Unauthorized`] if the caller is not a slasher.
+        /// - [`StakingError::InvalidAmount`] if `percentage` is out of range.
+        pub fn slash(
+            env: Env,
+            staker: Address,
+            percentage: i128,
+        ) -> Result<i128, StakingError> {
+            let caller = get_admin(&env)?;
+            // The admin must authorize; a registered slasher authorizes itself.
+            caller.require_auth();
+            if !is_slasher(&env, &caller) {
+                return Err(StakingError::Unauthorized);
+            }
+            if !(0..=BPS_DENOMINATOR).contains(&percentage) {
+                return Err(StakingError::InvalidAmount);
+            }
             get_total_staked_internal(&env)?;
             accrue(&env, total_weight(&env))?;
             update_reward(&env, &staker);
 
             let current = stake_of(&env, &staker);
-            let from_stake = amount.min(current).max(0);
-            let mut remaining = amount.max(0) - from_stake;
+            let key = DataKey::UnbondRequest(staker.clone());
+            let pending = env
+                .storage()
+                .persistent()
+                .get::<DataKey, UnbondRequest>(&key)
+                .map(|r| r.amount)
+                .unwrap_or(0);
+            let principal = current
+                .checked_add(pending)
+                .ok_or(StakingError::Overflow)?;
+            let slashed = mul_div(principal, percentage, BPS_DENOMINATOR)
+                .map_err(|_| StakingError::Overflow)?;
+            if slashed <= 0 {
+                bump(&env);
+                return Ok(0);
+            }
+
+            let from_stake = slashed.min(current);
+            let mut remaining = slashed - from_stake;
             if from_stake > 0 {
                 set_stake(&env, &staker, current - from_stake)?;
             }
-            let mut from_unbond = 0i128;
             if remaining > 0 {
-                let key = DataKey::UnbondRequest(staker.clone());
-                if let Some(mut req) = env.storage().persistent().get::<DataKey, UnbondRequest>(&key) {
-                    from_unbond = remaining.min(req.amount);
+                if let Some(mut req) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, UnbondRequest>(&key)
+                {
+                    let from_unbond = remaining.min(req.amount);
                     req.amount -= from_unbond;
                     remaining -= from_unbond;
                     env.storage().persistent().set(&key, &req);
                 }
             }
             let _ = remaining;
-            let slashed = from_stake + from_unbond;
-            if slashed > 0 {
-                let dest: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::SlashDestination)
-                    .ok_or(StakingError::NotInitialized)?;
-                let stake_token = get_stake_token(&env)?;
-                token::Client::new(&env, &stake_token).transfer(
-                    &env.current_contract_address(),
-                    &dest,
-                    &slashed,
-                );
-            }
+
+            let pool = get_i128(&env, &DataKey::InsurancePool)
+                .checked_add(slashed)
+                .ok_or(StakingError::Overflow)?;
+            env.storage().instance().set(&DataKey::InsurancePool, &pool);
+
+            let dest: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SlashDestination)
+                .ok_or(StakingError::NotInitialized)?;
+            let stake_token = get_stake_token(&env)?;
+            token::Client::new(&env, &stake_token).transfer(
+                &env.current_contract_address(),
+                &dest,
+                &slashed,
+            );
+            events::slashed(&env, &staker, slashed, percentage);
             bump(&env);
-            Ok(())
+            Ok(slashed)
+        }
+
+        /// Returns the accumulated insurance pool balance (#1450).
+        pub fn insurance_pool(env: Env) -> i128 {
+            get_i128(&env, &DataKey::InsurancePool)
+        }
+
+        /// Returns the effective emission rate given the current total staked
+        /// (#1452).
+        pub fn current_reward_rate(env: Env) -> i128 {
+            dynamic_reward_rate(&env, total_weight(&env))
         }
 
         /// Returns the total amount currently staked (raw tokens).

@@ -27,6 +27,9 @@ pub enum DataKey {
     ThresholdChangeProposal(u64),
     /// Next id to assign to a threshold-change proposal.
     NextThresholdChangeId,
+    /// Monotonic nonce bumped whenever the signer configuration changes
+    /// (e.g. via `replace_signer`). Used to invalidate stale signatures.
+    ConfigNonce,
 }
 
 #[contracttype]

@@ -46,6 +46,14 @@ pub enum MultisigError {
     ThresholdChangeAlreadyExecuted = 18,
     /// The signer has already approved the threshold-change proposal.
     AlreadyApprovedThresholdChange = 19,
+    /// Duplicate signatures from the same signer were provided.
+    DuplicateSignature = 16,
+    /// The new signer is already an existing signer.
+    SignerAlreadyExists = 17,
+    /// The signer to replace does not exist.
+    SignerNotFound = 18,
+    /// The batch of proposals is empty.
+    BatchEmpty = 19,
 }
 
 impl_display_error!(
@@ -69,4 +77,8 @@ impl_display_error!(
     ThresholdChangeNotFound => "threshold change not found",
     ThresholdChangeAlreadyExecuted => "threshold change already executed",
     AlreadyApprovedThresholdChange => "already approved threshold change",
+    DuplicateSignature    => "duplicate signature",
+    SignerAlreadyExists   => "signer already exists",
+    SignerNotFound        => "signer not found",
+    BatchEmpty            => "batch empty",
 );

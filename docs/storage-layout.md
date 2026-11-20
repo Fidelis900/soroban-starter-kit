@@ -107,11 +107,16 @@ This document details the storage keys, types, and TTL management policy for eac
 | `Weights` | Instance | `Map<Address, u32>` | Extended on init / signer change | Per-signer vote weight for weighted voting; signers not listed default to 1 |
 | `Threshold` | Instance | `u32` | Extended on threshold change | Required number of signatures (N-of-M) |
 | `NextTransactionId` | Instance | `u64` | Extended on proposal | Auto-incrementing transaction ID counter |
-| `Transaction(u64)` | Persistent | `Transaction` | Extended on propose/sign/execute | Proposed transaction details and signatures |
+| `Transaction(u64)` | Persistent | `Transaction` | Extended on propose/sign/execute/GC | Proposed transaction details, signatures, expiration, and execution status |
+| `ConfigNonce` | Instance | `u64` | Extended on init / `replace_signer` | Monotonic configuration nonce; incremented on every signer-set change to invalidate stale approvals |
 | `Paused` | Instance | `bool` | Extended on pause/unpause | Whether contract is paused |
 | `Version` | Instance | `u32` | Extended on init | Contract version number |
 
-**Transaction Struct:** Contains proposer, target, function name, arguments, signatures, and execution status.
+**Transaction Struct:** Contains proposer, target, function name, arguments, signatures, execution status, and `expiry_ledger` — the ledger sequence after which the proposal can no longer be executed.
+
+**Proposal Expiration:** `expiry_ledger` is recorded at `propose` time (current ledger + a configurable expiration window). `execute` rejects any proposal whose `expiry_ledger` has been passed, so stale proposals cannot be executed months later. Because unexecuted proposals otherwise linger in persistent storage indefinitely (consuming rent and creating accidental-execution risk), a garbage-collection entry point removes expired proposals from storage; anyone may call it, and it only deletes proposals that are already past `expiry_ledger` and not yet executed.
+
+**Signer Replacement:** `replace_signer(old_signer, new_signer)` requires full threshold approval, rejects a `new_signer` that is already an authorized signer, and increments `ConfigNonce`. Pending transactions signed by the old key are invalidated by the nonce bump, so approvals gathered before the replacement cannot be replayed against the new signer set.
 
 ---
 

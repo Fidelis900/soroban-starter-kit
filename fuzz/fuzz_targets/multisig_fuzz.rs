@@ -236,6 +236,10 @@ enum Op {
     ApproveProposal(u32),
     ExecuteProposal(u32),
     AdvanceLedger(u32),
+    ReplaceSigner(u32, u32),
+    ExecuteBatch(u32, u32),
+    GarbageCollectExpired,
+    DuplicateSignatureAttempt(u32),
 }
 
 /// Decode arbitrary bytes into a bounded, deterministic sequence of operations.
@@ -243,7 +247,7 @@ fn decode_ops(data: &[u8]) -> Vec<Op> {
     let mut ops = Vec::new();
     let mut i = 0usize;
     while i < data.len() && ops.len() < MAX_OPS {
-        let tag = data[i] % 8;
+        let tag = data[i] % 12;
         i += 1;
         let a = *data.get(i).unwrap_or(&0) as u32;
         i += 1;
@@ -261,6 +265,10 @@ fn decode_ops(data: &[u8]) -> Vec<Op> {
             5 => Op::ApproveProposal(a % MAX_SIGNERS),
             6 => Op::ExecuteProposal(a % MAX_SIGNERS),
             7 => Op::AdvanceLedger(a % 100),
+            8 => Op::ReplaceSigner(a % MAX_SIGNERS, b % MAX_SIGNERS),
+            9 => Op::ExecuteBatch(a % MAX_SIGNERS, b % MAX_SIGNERS),
+            10 => Op::GarbageCollectExpired,
+            11 => Op::DuplicateSignatureAttempt(a % MAX_SIGNERS),
             _ => unreachable!(),
         };
         ops.push(op);
@@ -340,6 +348,83 @@ fuzz_target!(|data: &[u8]| {
                 current_ledger = current_ledger.saturating_add(step);
                 env.ledger().set_sequence_number(current_ledger);
             }
+            Op::ReplaceSigner(old_idx, new_idx) => {
+                if let Some(old_signer) = pick_signer(&env, &client, old_idx) {
+                    // Derive a candidate new signer from the existing set so we
+                    // exercise both the "already a signer" rejection path and
+                    // the successful replacement path.
+                    let new_signer = match pick_signer(&env, &client, new_idx) {
+                        Some(existing) => existing,
+                        None => Address::generate(&env),
+                    };
+                    let _ = client.try_replace_signer(&old_signer, &new_signer);
+                }
+            }
+            Op::ExecuteBatch(first_idx, second_idx) => {
+                // Build a batch of up to two proposal ids derived from the
+                // current proposal count. Execution must be atomic: either all
+                // proposals execute or none do.
+                let proposal_count = client.get_proposal_count();
+                if proposal_count > 0 {
+                    let mut batch: Vec<u32> = Vec::new(&env);
+                    let p0 = first_idx % proposal_count;
+                    batch.push_back(p0);
+                    if proposal_count > 1 {
+                        let p1 = second_idx % proposal_count;
+                        if p1 != p0 {
+                            batch.push_back(p1);
+                        }
+                    }
+
+                    let before: Vec<bool> = {
+                        let mut v = Vec::new(&env);
+                        for pid in 0..proposal_count {
+                            v.push_back(client.get_proposal(&pid).executed);
+                        }
+                        v
+                    };
+
+                    let result = client.try_execute_batch(&batch);
+
+                    // Atomicity: if the batch failed, no proposal may have
+                    // transitioned to executed.
+                    if result.is_err() {
+                        for pid in 0..proposal_count {
+                            assert!(
+                                client.get_proposal(&pid).executed == before.get(pid).unwrap(),
+                                "invariant violated: failed batch partially executed proposal {}",
+                                pid
+                            );
+                        }
+                    }
+                }
+            }
+            Op::GarbageCollectExpired => {
+                let before = client.get_proposal_count();
+                let _ = client.try_garbage_collect_expired();
+                let after = client.get_proposal_count();
+                // Garbage collection must never increase the proposal count.
+                assert!(
+                    after <= before,
+                    "invariant violated: garbage collection grew proposal count {} -> {}",
+                    before,
+                    after
+                );
+            }
+            Op::DuplicateSignatureAttempt(idx) => {
+                // Attempt a threshold bypass by submitting the same signer's
+                // signature multiple times. This must be rejected.
+                if let Some(addr) = pick_signer(&env, &client, idx) {
+                    let mut dup_sigs: Vec<Address> = Vec::new(&env);
+                    dup_sigs.push_back(addr.clone());
+                    dup_sigs.push_back(addr.clone());
+                    let result = client.try_execute_with_signatures(&dup_sigs);
+                    assert!(
+                        result.is_err(),
+                        "invariant violated: duplicate signatures accepted for threshold bypass"
+                    );
+                }
+            }
         }
 
         // ----- Invariant 1: accumulated weight >= threshold -----
@@ -386,6 +471,16 @@ fuzz_target!(|data: &[u8]| {
                     );
                 }
             }
+
+            // A proposal that has not yet expired must carry a sane deadline
+            // that is not in the past relative to its creation ledger.
+            assert!(
+                proposal.expiry_ledger >= proposal.created_ledger,
+                "invariant violated: proposal {} expiry {} precedes creation {}",
+                pid,
+                proposal.expiry_ledger,
+                proposal.created_ledger
+            );
         }
     }
 });

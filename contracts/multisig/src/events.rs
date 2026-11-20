@@ -72,11 +72,6 @@ pub fn transaction_queued(env: &Env, tx_id: u64, executable_at: u32) {
         .publish((Symbol::new(env, "queued"), tx_id), executable_at);
 }
 
-pub fn transaction_cancelled(env: &Env, tx_id: u64, canceller: &Address) {
-    env.events()
-        .publish((Symbol::new(env, "cancelled"), tx_id), canceller.clone());
-}
-
 pub fn timelock_updated(env: &Env, delay: u32) {
     env.events()
         .publish((Symbol::new(env, "timelock_set"),), delay);
@@ -184,5 +179,22 @@ pub fn dormant_signer_replaced(env: &Env, old_signer: &Address, new_signer: &Add
     env.events().publish(
         (Symbol::new(env, "dormant_replaced"), old_signer.clone()),
         new_signer.clone(),
+    );
+}
+
+/// Emitted when a signer key is replaced via `replace_signer` (#1447).
+///
+/// Data: `(old_signer, new_signer, config_nonce)` — the replaced signer, its
+/// replacement, and the incremented configuration nonce that invalidates
+/// pending transactions signed by the old key.
+pub fn signer_replaced(
+    env: &Env,
+    old_signer: &Address,
+    new_signer: &Address,
+    nonce: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "signer_replaced"), old_signer.clone()),
+        (new_signer.clone(), nonce),
     );
 }
