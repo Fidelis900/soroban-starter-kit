@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   wasm-size:
@@ -42,40 +43,17 @@ jobs:
           cd "$RUNNER_TEMP/base-worktree"
           ./scripts/contract-size-report.sh --limit-bytes 65536 --json-out "$RUNNER_TEMP/base-sizes.json"
 
-      - name: Reject optimized WASM size regressions
+      - name: Enforce WASM size budgets
         run: |
-          python3 - "$RUNNER_TEMP/base-sizes.json" "$RUNNER_TEMP/current-sizes.json" <<'PY'
-          import json
-          import sys
+          python3 .github/scripts/check_wasm_sizes.py \
+            --budgets .github/wasm_sizes.json \
+            --base "$RUNNER_TEMP/base-sizes.json" \
+            --current "$RUNNER_TEMP/current-sizes.json" \
+            --summary-out "$RUNNER_TEMP/wasm-size-summary.md"
 
-          with open(sys.argv[1], encoding="utf-8") as source:
-              base = json.load(source)
-          with open(sys.argv[2], encoding="utf-8") as source:
-              current = json.load(source)
-
-          base_sizes = base["contracts"]
-          current_sizes = current["contracts"]
-          failures = []
-
-          for name in sorted(set(base_sizes) | set(current_sizes)):
-              if name not in current_sizes:
-                  failures.append(f"{name}: contract disappeared from current build")
-                  continue
-              size = current_sizes[name]
-              if name not in base_sizes:
-                  print(f"NEW {name}: {size} bytes")
-                  continue
-              previous = base_sizes[name]
-              delta = size - previous
-              print(f"{name}: {previous} -> {size} bytes ({delta:+d})")
-              if delta > 0:
-                  failures.append(f"{name}: optimized WASM grew by {delta} bytes ({previous} -> {size})")
-
-          if failures:
-              print("\nWASM size regression check failed:")
-              for failure in failures:
-                  print(f"- {failure}")
-              sys.exit(1)
-
-          print("\nNo optimized WASM size regressions detected.")
-          PY
+      - name: Post WASM size comparison comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2
+        with:
+          header: wasm-size-budget
+          path: ${{ runner.temp }}/wasm-size-summary.md

@@ -17,6 +17,42 @@ Before writing the new WASM, check the
 storage your contract shares with other contracts and which changes would
 break existing on-chain data.
 
+## Pre-Upgrade Dry-Run Verification
+
+Before proposing an upgrade, run the automated compatibility check against an
+exported state snapshot and the new WASM:
+
+```bash
+# 1. Export the current on-chain state snapshot
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --network testnet \
+  --source $ADMIN_KEY \
+  -- export_state > state-snapshot.json
+
+# 2. Run the dry-run compatibility check
+./scripts/check-upgrade-compatibility.sh \
+  --snapshot state-snapshot.json \
+  --wasm target/wasm32-unknown-unknown/release/soroban_escrow_contract.wasm
+```
+
+The script simulates the upgrade against the snapshot and verifies:
+
+- **Storage key compatibility** — every storage key present in the snapshot
+  must still be readable by the new code (no removed or renamed keys, no
+  changed value types that would corrupt existing entries).
+- **Interface signature parity** — public function names, argument types, and
+  return types must remain compatible with the deployed interface.
+
+**Exit codes:**
+
+- `0` — the upgrade is storage-compatible and safe to propose.
+- non-zero — the upgrade is **storage-breaking**. Do **not** propose it. Fix
+  the storage layout or add an explicit migration before retrying.
+
+Run this check as part of the [Safety Checklist](#safety-checklist) below.
+=======
+
 ## Prerequisites
 
 - Stellar CLI installed and configured
@@ -264,6 +300,7 @@ stellar contract invoke \
 Before executing any upgrade:
 
 - [ ] New WASM built and tested locally
+- [ ] `scripts/check-upgrade-compatibility.sh` passes against exported state snapshot (exit code 0)
 - [ ] WASM hash verified matches `stellar contract install` output
 - [ ] All state migrations planned (if storage format changed)
 - [ ] Timelock delay respected (no shortcuts)
