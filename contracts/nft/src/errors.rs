@@ -22,6 +22,10 @@ pub enum NftError {
     RoyaltyRecipientMissing = 11,
     /// Token or collection is soulbound and cannot be transferred.
     NonTransferable = 12,
+    /// Royalty basis points exceed the 1 500 (15 %) cap.
+    RoyaltyTooHigh = 13,
+    /// Batch mint count does not match the number of provided URIs.
+    BatchLengthMismatch = 14,
 }
 
 impl_display_error!(
@@ -38,6 +42,8 @@ impl_display_error!(
     InvalidRoyalty          => "royalty bps exceeds 10 000",
     RoyaltyRecipientMissing => "royalty recipient must be set when royalty bps > 0",
     NonTransferable         => "token is soulbound and non-transferable",
+    RoyaltyTooHigh          => "royalty bps exceeds 1 500 (15 %)",
+    BatchLengthMismatch     => "batch count does not match uri count",
 );
 
 #[cfg(test)]
@@ -63,7 +69,9 @@ NftError::SupplyCapReached = {}\n\
 NftError::InvalidTokenId = {}\n\
 NftError::InvalidRoyalty = {}\n\
 NftError::RoyaltyRecipientMissing = {}\n\
-NftError::NonTransferable = {}\n",
+NftError::NonTransferable = {}\n\
+NftError::RoyaltyTooHigh = {}\n\
+NftError::BatchLengthMismatch = {}\n",
             NftError::NotAuthorized as u32,
             NftError::AlreadyInitialized as u32,
             NftError::NotInitialized as u32,
@@ -76,6 +84,8 @@ NftError::NonTransferable = {}\n",
             NftError::InvalidRoyalty as u32,
             NftError::RoyaltyRecipientMissing as u32,
             NftError::NonTransferable as u32,
+            NftError::RoyaltyTooHigh as u32,
+            NftError::BatchLengthMismatch as u32,
         )
     }
 

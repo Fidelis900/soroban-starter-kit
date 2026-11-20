@@ -33,6 +33,64 @@ use soroban_common::{
 /// may return, regardless of the requested `limit`.
 pub const MAX_SWAPS_PAGE_SIZE: u32 = 50;
 
+/// Minimum number of initial LP shares permanently locked to the dead address
+/// on first liquidity provision, preventing share-price inflation attacks.
+pub const MINIMUM_LIQUIDITY: i128 = 1_000;
+
+/// Fixed dead address (all-zero ed25519 public key) that receives the locked
+/// minimum liquidity shares. No private key exists for this address.
+fn dead_address(env: &Env) -> Address {
+    Address::from_string_bytes(&soroban_sdk::Bytes::from_array(env, &[0u8; 32]))
+}
+
+/// Accrue cumulative prices (`price_0_cumulative`, `price_1_cumulative`) using
+/// the pre-update reserves and the number of ledgers elapsed since the last
+/// update, then record the current ledger as the new update point.
+///
+/// Returns the updated `(price_0_cumulative, price_1_cumulative)` pair.
+fn update_cumulative_prices(env: &Env, reserve_0: i128, reserve_1: i128) -> (i128, i128) {
+    let current_ledger = env.ledger().sequence();
+    let last_update: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::LastUpdateLedger)
+        .unwrap_or(current_ledger);
+    let elapsed = current_ledger.saturating_sub(last_update) as i128;
+
+    let mut price_0_cumulative: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Price0Cumulative)
+        .unwrap_or(0);
+    let mut price_1_cumulative: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Price1Cumulative)
+        .unwrap_or(0);
+
+    if elapsed > 0 && reserve_0 > 0 && reserve_1 > 0 {
+        // price_0 = reserve_1 / reserve_0, price_1 = reserve_0 / reserve_1,
+        // scaled by 1e7 to retain precision in integer arithmetic.
+        const PRICE_SCALE: i128 = 10_000_000;
+        let delta_0 = reserve_1.saturating_mul(PRICE_SCALE) / reserve_0;
+        let delta_1 = reserve_0.saturating_mul(PRICE_SCALE) / reserve_1;
+        price_0_cumulative = price_0_cumulative.saturating_add(delta_0.saturating_mul(elapsed));
+        price_1_cumulative = price_1_cumulative.saturating_add(delta_1.saturating_mul(elapsed));
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Price0Cumulative, &price_0_cumulative);
+    env.storage()
+        .instance()
+        .set(&DataKey::Price1Cumulative, &price_1_cumulative);
+    env.storage()
+        .instance()
+        .set(&DataKey::LastUpdateLedger, &current_ledger);
+
+    (price_0_cumulative, price_1_cumulative)
+}
+
 fn bump_instance(env: &Env) {
     env.storage()
         .instance()
@@ -86,6 +144,20 @@ fn transfer_in_measured(env: &Env, token: &Address, from: &Address, amount: i128
     token::Client::new(env, token).transfer(from, &env.current_contract_address(), amount);
     let after = token_balance(env, token);
     after.saturating_sub(before)
+}
+
+/// Integer square root via Newton's method, used for initial LP share minting.
+fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 fn require_pending(state: SwapState) -> Result<(), SwapError> {
@@ -492,6 +564,20 @@ mod contract {
                     return Err(SwapError::ExecutionDelayExceeded);
                 }
             }
+
+            // Accrue cumulative prices at the start of the swap using the
+            // pre-swap reserves so TWAP observations stay manipulation-resistant.
+            let reserve_0: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Reserve0)
+                .unwrap_or(0);
+            let reserve_1: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Reserve1)
+                .unwrap_or(0);
+            update_cumulative_prices(&env, reserve_0, reserve_1);
 
             // HTLC: verify the revealed preimage against the stored hash lock.
             if let Some(ref hash_lock) = swap.hash_lock {
@@ -1008,10 +1094,107 @@ mod contract {
                 .persistent()
                 .get(&SwapKey::BasketSwap(swap_id))
                 .ok_or(SwapError::BasketSwapNotFound)
-                .get(&DataKey::Swap(swap_id))
-                .ok_or(SwapError::SwapNotFound)?;
-            bump_swap(&env, swap_id);
-            Ok(swap)
+        }
+
+        /// Return the stored cumulative price accumulators as
+        /// `(price_0_cumulative, price_1_cumulative)`.
+        ///
+        /// External contracts can derive a TWAP by differencing two observations
+        /// and dividing by the number of elapsed ledgers.
+        pub fn get_cumulative_prices(env: Env) -> (i128, i128) {
+            let price_0_cumulative: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Price0Cumulative)
+                .unwrap_or(0);
+            let price_1_cumulative: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Price1Cumulative)
+                .unwrap_or(0);
+            (price_0_cumulative, price_1_cumulative)
+        }
+
+        /// Provide initial liquidity to a pool, permanently locking
+        /// [`MINIMUM_LIQUIDITY`] shares to the dead address on first provision.
+        ///
+        /// Returns the number of LP shares credited to `provider` (net of the
+        /// locked minimum on the initial deposit).
+        ///
+        /// # Errors
+        /// - [`SwapError::InsufficientInitialLiquidity`] if the initial deposit
+        ///   would mint no more than the locked minimum.
+        pub fn add_liquidity(
+            env: Env,
+            provider: Address,
+            amount_0: i128,
+            amount_1: i128,
+        ) -> Result<i128, SwapError> {
+            provider.require_auth();
+            ensure_valid_leg_amount(amount_0)?;
+            ensure_valid_leg_amount(amount_1)?;
+
+            let reserve_0: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Reserve0)
+                .unwrap_or(0);
+            let reserve_1: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Reserve1)
+                .unwrap_or(0);
+            let total_shares: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalShares)
+                .unwrap_or(0);
+
+            // Accrue cumulative prices against the pre-update reserves.
+            update_cumulative_prices(&env, reserve_0, reserve_1);
+
+            let provider_shares = if total_shares == 0 {
+                // Initial provision: geometric mean of the deposited amounts.
+                let product = amount_0
+                    .checked_mul(amount_1)
+                    .ok_or(SwapError::MathOverflow)?;
+                let liquidity = isqrt(product);
+                if liquidity <= MINIMUM_LIQUIDITY {
+                    return Err(SwapError::InsufficientInitialLiquidity);
+                }
+                let locked = MINIMUM_LIQUIDITY;
+                let net = liquidity
+                    .checked_sub(locked)
+                    .ok_or(SwapError::InsufficientInitialLiquidity)?;
+                env.storage().instance().set(&DataKey::TotalShares, &liquidity);
+                events::liquidity_locked(&env, &dead_address(&env), locked);
+                net
+            } else {
+                let shares_0 = mul_div(amount_0, total_shares, reserve_0)
+                    .map_err(|_| SwapError::MathOverflow)?;
+                let shares_1 = mul_div(amount_1, total_shares, reserve_1)
+                    .map_err(|_| SwapError::MathOverflow)?;
+                let minted = shares_0.min(shares_1);
+                if minted <= 0 {
+                    return Err(SwapError::InvalidAmount);
+                }
+                let new_total = total_shares
+                    .checked_add(minted)
+                    .ok_or(SwapError::MathOverflow)?;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::TotalShares, &new_total);
+                minted
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::Reserve0, &reserve_0.saturating_add(amount_0));
+            env.storage()
+                .instance()
+                .set(&DataKey::Reserve1, &reserve_1.saturating_add(amount_1));
+            bump_instance(&env);
+            Ok(provider_shares)
         }
 
         /// Enumerate active (pending and non-expired) swaps, paginated by swap ID.

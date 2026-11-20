@@ -64,6 +64,26 @@ fn bench_mint(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_mint_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nft_mint_batch");
+    group.bench_function("mint_batch", |b| {
+        b.iter(|| {
+            let (env, client) = setup();
+            init_contract(&env, &client);
+            let to = Address::generate(&env);
+            let count = 10u32;
+            let mut uris = soroban_sdk::Vec::new(&env);
+            for i in 0..count {
+                uris.push_back(String::from_str(&env, "ipfs://benchmark/batch"));
+                let _ = i;
+            }
+            client.mint_batch(&to, &count, &uris);
+            env.budget().cpu_instruction_cost()
+        });
+    });
+    group.finish();
+}
+
 fn bench_transfer(c: &mut Criterion) {
     let mut group = c.benchmark_group("nft_transfer");
     group.bench_function("transfer", |b| {
@@ -121,6 +141,7 @@ criterion_group!(
     benches,
     bench_initialize,
     bench_mint,
+    bench_mint_batch,
     bench_transfer,
     bench_burn,
     bench_approve,
