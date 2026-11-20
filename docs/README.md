@@ -54,6 +54,10 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
   - Storage costs
   - Optimization strategies
 
+## Proposals
+
+- **[Proposals](proposals/README.md)**: Design notes for open issues (#1368–#1371: benchmarks, bench regression CI, cross-contract integration tests)
+
 ## Architecture Decision Records (ADRs)
 
 The [adr/](adr/) directory contains detailed decision records for key design choices:
