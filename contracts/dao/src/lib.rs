@@ -101,6 +101,11 @@ use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, paginate};
 /// Maximum number of proposals returned by a single `get_proposals` call.
 pub const MAX_PAGE_SIZE: u32 = 50;
 
+/// Maximum number of non-circulating holder addresses whose balances are
+/// subtracted from total supply for the dynamic quorum (issue #1440). Bounds
+/// the number of cross-contract balance reads at proposal creation.
+pub const MAX_NON_CIRCULATING_HOLDERS: u32 = 20;
+
 /// Default execution delay (in ledgers) for `ProposalTier::Standard` when no
 /// tier-specific delay has been configured. 24 hours at 5s/ledger ≈ 17 280.
 pub const DEFAULT_STANDARD_DELAY: u32 = 17_280;
@@ -384,8 +389,23 @@ mod contract {
                 .instance()
                 .get(&DataKey::VotingPeriod)
                 .ok_or(DaoError::NotInitialized)?;
-            let voting_start = env.ledger().sequence();
-            let deadline = voting_start + voting_period;
+            // Voting opens after the configurable review delay, giving the
+            // author a window to cancel a mistaken proposal (issue #1441).
+            let voting_delay: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingDelay)
+                .unwrap_or(0);
+            let voting_start = env.ledger().sequence().saturating_add(voting_delay);
+            let deadline = voting_start.saturating_add(voting_period);
+
+            // Snapshot the dynamic quorum threshold from the active circulating
+            // supply at creation time (issue #1440).
+            let dynamic_quorum = Self::snapshot_dynamic_quorum(
+                &env,
+                &token_client,
+                total_supply_at_creation,
+            );
 
             let proposal = Proposal {
                 id: proposal_id,
@@ -418,6 +438,13 @@ mod contract {
 
             // Track the active payload hash so future duplicates are rejected.
             env.storage().persistent().set(&hash_key, &proposal_id);
+
+            if let Some((circulating, required)) = dynamic_quorum {
+                let snapshot_key = ProposalKey::DynamicQuorumSnapshot(proposal_id);
+                env.storage().persistent().set(&snapshot_key, &required);
+                bump_persistent(&env, &snapshot_key);
+                events::dynamic_quorum_snapshot(&env, proposal_id, circulating, required);
+            }
 
             bump_instance(&env);
             bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
@@ -460,6 +487,9 @@ mod contract {
 
             if proposal.state != ProposalState::Active {
                 return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
             }
             if env.ledger().sequence() > proposal.deadline {
                 return Err(DaoError::VotingClosed);
@@ -565,6 +595,9 @@ mod contract {
 
             if proposal.state != ProposalState::Active {
                 return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
             }
             if env.ledger().sequence() > proposal.deadline {
                 return Err(DaoError::VotingClosed);
@@ -804,6 +837,9 @@ mod contract {
             if proposal.state != ProposalState::Active {
                 return Err(DaoError::InvalidState);
             }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
+            }
             if env.ledger().sequence() > proposal.deadline {
                 return Err(DaoError::VotingClosed);
             }
@@ -860,6 +896,9 @@ mod contract {
 
             if proposal.state != ProposalState::Active {
                 return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
             }
             if env.ledger().sequence() > proposal.deadline {
                 return Err(DaoError::VotingClosed);
@@ -1095,6 +1134,22 @@ mod contract {
                     .checked_mul(proposal.total_supply_at_creation)
                     .ok_or(DaoError::NotInitialized)?;
                 if lhs < rhs {
+                    return Err(DaoError::QuorumNotMet);
+                }
+            }
+
+            // Dynamic quorum against the circulating supply snapshotted at
+            // proposal creation (issue #1440).
+            if let Some(required) = env
+                .storage()
+                .persistent()
+                .get::<ProposalKey, i128>(&ProposalKey::DynamicQuorumSnapshot(proposal_id))
+            {
+                if total_votes < required {
+                    if proposal.bond_amount > 0 {
+                        Self::slash_bond(&env, &proposal);
+                    }
+                    Self::update_quorum_ema(&env, 0);
                     return Err(DaoError::QuorumNotMet);
                 }
             }
@@ -1340,6 +1395,12 @@ mod contract {
                 .persistent()
                 .set(&ProposalKey::Proposal(proposal_id), &proposal);
 
+            // Free the payload hash so the author can resubmit a corrected
+            // proposal (issue #1441).
+            env.storage()
+                .persistent()
+                .remove(&ProposalKey::ActivePayloadHash(proposal.payload_hash.clone()));
+
             // Refund the proposal bond to the proposer (#1321).
             if proposal.bond_amount > 0 {
                 let token_addr: Address = env
@@ -1360,6 +1421,108 @@ mod contract {
             events::proposal_cancelled(&env, &proposer, proposal_id);
 
             Ok(())
+        }
+
+        /// Set the review delay, in ledgers, between proposal creation and the
+        /// opening of voting (issue #1441).
+        ///
+        /// While `env.ledger().sequence() < proposal.voting_start` the author
+        /// may withdraw the proposal via [`cancel_proposal`] and votes are
+        /// rejected with [`DaoError::VotingNotStarted`]. Only affects
+        /// proposals created after the call.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_voting_delay(env: Env, admin: Address, voting_delay: u32) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::VotingDelay, &voting_delay);
+            bump_instance(&env);
+            events::voting_delay_set(&env, &admin, voting_delay);
+            Ok(())
+        }
+
+        /// Return the configured voting delay in ledgers (0 when unset).
+        #[must_use]
+        pub fn voting_delay(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::VotingDelay)
+                .unwrap_or(0)
+        }
+
+        /// Configure the dynamic quorum (issue #1440).
+        ///
+        /// `quorum_bps` is the share (0–10_000 basis points) of the *active
+        /// circulating* governance token supply that must participate for a
+        /// proposal to pass. Circulating supply is the token's `total_supply`
+        /// at proposal creation minus the balances of `non_circulating`
+        /// holders (staking pools, treasuries, vesting vaults, …) at that same
+        /// moment. The resulting threshold is snapshotted per proposal, so it
+        /// scales automatically as supply expands or tokens get locked, while
+        /// later supply changes cannot move the goalposts mid-vote.
+        ///
+        /// Pass `quorum_bps = 0` to disable. Only affects proposals created
+        /// after the call.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        /// Returns [`DaoError::InvalidQuorumBps`] if `quorum_bps` > 10 000.
+        /// Returns [`DaoError::TooManyNonCirculatingHolders`] if more than
+        ///   [`MAX_NON_CIRCULATING_HOLDERS`] addresses are supplied.
+        pub fn set_dynamic_quorum(
+            env: Env,
+            admin: Address,
+            quorum_bps: u32,
+            non_circulating: Vec<Address>,
+        ) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            if quorum_bps > BPS_DENOMINATOR {
+                return Err(DaoError::InvalidQuorumBps);
+            }
+            if non_circulating.len() > MAX_NON_CIRCULATING_HOLDERS {
+                return Err(DaoError::TooManyNonCirculatingHolders);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::DynamicQuorumBps, &quorum_bps);
+            env.storage()
+                .instance()
+                .set(&DataKey::NonCirculatingHolders, &non_circulating);
+            bump_instance(&env);
+            events::dynamic_quorum_set(&env, &admin, quorum_bps, non_circulating.len());
+            Ok(())
+        }
+
+        /// Return the dynamic quorum configuration: `(quorum_bps, non_circulating)`.
+        #[must_use]
+        pub fn dynamic_quorum_config(env: Env) -> (u32, Vec<Address>) {
+            let bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DynamicQuorumBps)
+                .unwrap_or(0);
+            let holders: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::NonCirculatingHolders)
+                .unwrap_or_else(|| Vec::new(&env));
+            (bps, holders)
+        }
+
+        /// Return the dynamic quorum (minimum total votes) snapshotted for
+        /// `proposal_id`, or `None` if dynamic quorum was disabled when the
+        /// proposal was created.
+        #[must_use]
+        pub fn proposal_dynamic_quorum(env: Env, proposal_id: u32) -> Option<i128> {
+            env.storage()
+                .persistent()
+                .get(&ProposalKey::DynamicQuorumSnapshot(proposal_id))
         }
 
         /// Set the optional emergency security council address (#1320).
@@ -1616,6 +1779,61 @@ mod contract {
                 proposals: page.items,
                 next_cursor: page.next_cursor,
             }
+        }
+
+        /// Verify `admin` is the stored admin and has authorized the call.
+        fn require_admin(env: &Env, admin: &Address) -> Result<(), DaoError> {
+            Self::require_initialized(env)?;
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(DaoError::NotInitialized)?;
+            if stored_admin != *admin {
+                return Err(DaoError::NotAuthorized);
+            }
+            admin.require_auth();
+            Ok(())
+        }
+
+        /// Compute the dynamic quorum threshold for a new proposal
+        /// (issue #1440).
+        ///
+        /// Returns `Some((circulating_supply, required_votes))` when dynamic
+        /// quorum is enabled, where
+        /// `circulating_supply = total_supply − Σ balance(non_circulating)`
+        /// (floored at zero) and
+        /// `required_votes = ceil(circulating_supply × bps / 10_000)`.
+        fn snapshot_dynamic_quorum(
+            env: &Env,
+            token_client: &token::Client,
+            total_supply: i128,
+        ) -> Option<(i128, i128)> {
+            let bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DynamicQuorumBps)
+                .unwrap_or(0);
+            if bps == 0 {
+                return None;
+            }
+            let holders: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::NonCirculatingHolders)
+                .unwrap_or_else(|| Vec::new(env));
+
+            let mut locked: i128 = 0;
+            for holder in holders.iter() {
+                locked = locked.saturating_add(token_client.balance(&holder).max(0));
+            }
+            let circulating = total_supply.saturating_sub(locked).max(0);
+
+            let denom = i128::from(BPS_DENOMINATOR);
+            let numerator = circulating.saturating_mul(i128::from(bps));
+            // Round up so a fractional threshold can never be under-counted.
+            let required = numerator / denom + i128::from(numerator % denom != 0);
+            Some((circulating, required))
         }
 
         fn require_initialized(env: &Env) -> Result<(), DaoError> {

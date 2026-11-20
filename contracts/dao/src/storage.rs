@@ -43,6 +43,19 @@ pub enum DataKey {
     /// Optional emergency security council address (multisig) allowed to
     /// fast-track emergency proposals (issue #1320).
     SecurityCouncil,
+    /// Number of ledgers between proposal creation and the opening of voting
+    /// (`u32`). During this review window the author may cancel the proposal
+    /// via `cancel_proposal` (issue #1441). Zero (default) opens voting
+    /// immediately.
+    VotingDelay,
+    /// Dynamic quorum, in basis points (0–10_000) of the *active circulating*
+    /// governance token supply snapshotted at proposal creation (`u32`,
+    /// issue #1440). Zero disables the dynamic quorum check.
+    DynamicQuorumBps,
+    /// Addresses whose balances are excluded from the circulating supply when
+    /// computing the dynamic quorum, e.g. staking pools, treasuries, or vesting
+    /// vaults (`Vec<Address>`, issue #1440).
+    NonCirculatingHolders,
 }
 
 /// Persistent-storage keys (per-proposal and per-vote data).
@@ -53,6 +66,10 @@ pub enum ProposalKey {
     /// Marks a payload hash as belonging to an active (unexecuted) proposal,
     /// used to reject duplicate submissions (issue #1319).
     ActivePayloadHash(BytesN<32>),
+    /// Minimum total votes required for the proposal to meet the dynamic
+    /// quorum, computed from the circulating supply at creation (`i128`,
+    /// issue #1440). Absent when dynamic quorum was disabled at creation.
+    DynamicQuorumSnapshot(u32),
 }
 
 /// Composite key for vote deduplication.

@@ -212,6 +212,22 @@ mod contract {
             lifecycle::mutual_cancel(env, buyer, seller)
         }
 
+        /// Configure a minimum holding period for the escrowed funds.
+        ///
+        /// Must be called by the buyer before funding.  No release to the
+        /// seller (approval, partial, milestone, dispute or multi-token)
+        /// succeeds while `env.ledger().timestamp() < lockup_deadline`;
+        /// such attempts fail with [`EscrowError::LockupPeriodActive`].
+        pub fn set_lockup_deadline(env: Env, lockup_deadline: u64) -> Result<(), EscrowError> {
+            lifecycle::set_lockup_deadline(env, lockup_deadline)
+        }
+
+        /// Return the configured lockup timestamp, or `None` if unset.
+        #[must_use]
+        pub fn get_lockup_deadline(env: Env) -> Option<u64> {
+            lifecycle::get_lockup_deadline(env)
+        }
+
         pub fn extend_deadline(env: Env, new_deadline: u32) -> Result<(), EscrowError> {
             lifecycle::extend_deadline(env, new_deadline)
         }

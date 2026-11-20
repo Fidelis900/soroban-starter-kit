@@ -77,6 +77,9 @@ pub enum DataKey {
     /// (`Vec<Address>`).  Each arbiter may approve at most once per direction;
     /// once the configured threshold is reached the dispute can be resolved.
     DisputeApprovals,
+    /// Ledger timestamp (`u64`, seconds) before which no funds may be released
+    /// to the seller. Absent means no lockup is enforced.
+    LockupDeadline,
 }
 
 /// Lifecycle states of an escrow.
@@ -328,6 +331,7 @@ mod discriminant_tests {
             DataKey::TokenAmounts => 24,
             DataKey::ArbiterFeeBps => 25,
             DataKey::DisputeApprovals => 26,
+            DataKey::LockupDeadline => 27,
         }
     }
 
@@ -364,6 +368,7 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::TokenAmounts), 24);
         assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 25);
         assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 26);
+        assert_eq!(escrow_data_key_index(&DataKey::LockupDeadline), 27);
     }
 }
 

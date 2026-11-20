@@ -753,6 +753,9 @@ fn test_cancel_proposal_by_proposer_pre_vote_refunds_bond() {
 
     mint_tokens(&env, &token, &admin, &admin, 2_000);
 
+    // Open a review window before voting starts (#1441).
+    client.set_voting_delay(&admin, &10);
+
     let before = soroban_sdk::token::Client::new(&env, &token).balance(&admin);
     let id = create_plain_proposal(&client, &env, &admin);
     let after_create = soroban_sdk::token::Client::new(&env, &token).balance(&admin);
@@ -768,12 +771,13 @@ fn test_cancel_proposal_by_proposer_pre_vote_refunds_bond() {
 
 /// cancel_proposal is rejected once voting has started.
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #21)")]
 fn test_cancel_proposal_after_voting_started_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, token, _) = setup(&env);
 
+    client.set_voting_delay(&admin, &10);
     mint_tokens(&env, &token, &admin, &admin, 1_000);
     let id = create_plain_proposal(&client, &env, &admin);
 
@@ -786,12 +790,13 @@ fn test_cancel_proposal_after_voting_started_fails() {
 
 /// A non-proposer cannot cancel a proposal via cancel_proposal.
 #[test]
-#[should_panic(expected = "Error(Contract, #1)")]
+#[should_panic(expected = "Error(Contract, #20)")]
 fn test_cancel_proposal_wrong_caller_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, token, _) = setup(&env);
 
+    client.set_voting_delay(&admin, &10);
     mint_tokens(&env, &token, &admin, &admin, 1_000);
     let id = create_plain_proposal(&client, &env, &admin);
 
@@ -1618,4 +1623,252 @@ fn test_vote_with_delegators_no_locked_tokens_fails() {
     let mut delegators = Vec::new(&env);
     delegators.push_back(delegator.clone());
     client.vote_with_delegators(&voter, &id, &true, &delegators);
+}
+
+// ---------------------------------------------------------------------------
+// #1441 — Author cancellation before voting starts
+// ---------------------------------------------------------------------------
+
+/// The voting delay pushes `voting_start` into the future and shifts the
+/// deadline accordingly.
+#[test]
+fn test_voting_delay_sets_future_voting_start() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    client.set_voting_delay(&admin, &25);
+    assert_eq!(client.voting_delay(), 25);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let now = env.ledger().sequence();
+    let id = create_plain_proposal(&client, &env, &admin);
+    let p = client.get_proposal(&id);
+    assert_eq!(p.voting_start, now + 25);
+    assert_eq!(p.deadline, now + 25 + 100);
+}
+
+/// The author can cancel during the review window, and the freed payload hash
+/// lets them resubmit the corrected proposal.
+#[test]
+fn test_author_cancel_before_voting_frees_payload_hash() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    client.set_voting_delay(&admin, &10);
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    env.ledger().with_mut(|l| l.sequence_number += 9);
+    client.cancel_proposal(&admin, &id);
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Cancelled);
+
+    // Same payload can be submitted again after cancellation.
+    let id2 = create_plain_proposal(&client, &env, &admin);
+    assert_ne!(id, id2);
+    assert_eq!(client.get_proposal(&id2).state, ProposalState::Active);
+}
+
+/// Votes are rejected while the review window is still open.
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_vote_before_voting_start_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    client.set_voting_delay(&admin, &10);
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    client.vote(&voter, &id, &true);
+}
+
+/// Once voting has opened, votes succeed and the author can no longer cancel.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_cancel_rejected_after_vote_opens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup(&env);
+
+    client.set_voting_delay(&admin, &10);
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &voter, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+    client.vote(&voter, &id, &true);
+    client.cancel_proposal(&admin, &id);
+}
+
+/// Only the admin may configure the voting delay.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_set_voting_delay_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token, _) = setup(&env);
+
+    let stranger = Address::generate(&env);
+    client.set_voting_delay(&stranger, &10);
+}
+
+// ---------------------------------------------------------------------------
+// #1440 — Dynamic quorum based on active circulating supply
+// ---------------------------------------------------------------------------
+
+/// The snapshotted quorum scales with circulating supply and ignores balances
+/// held by configured non-circulating holders.
+#[test]
+fn test_dynamic_quorum_scales_with_circulating_supply() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 1, 0, 0);
+
+    let staking_pool = Address::generate(&env);
+    client.set_dynamic_quorum(&admin, &2_000, &vec![&env, staking_pool.clone()]);
+    assert_eq!(client.dynamic_quorum_config().0, 2_000);
+
+    // total = 2_000, locked in staking = 1_000 → circulating = 1_000 → 20 % = 200.
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    mint_tokens(&env, &token, &admin, &staking_pool, 1_000);
+    let id1 = create_plain_proposal(&client, &env, &admin);
+    assert_eq!(client.proposal_dynamic_quorum(&id1), Some(200));
+
+    // Supply expands: +4_000 circulating → circulating = 5_000 → 20 % = 1_000.
+    let holder = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &holder, 4_000);
+    let id2 = client.create_proposal(
+        &admin,
+        &String::from_str(&env, "P2"),
+        &String::from_str(&env, "D2"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    assert_eq!(client.proposal_dynamic_quorum(&id2), Some(1_000));
+
+    // Earlier snapshot is unaffected by later supply changes.
+    assert_eq!(client.proposal_dynamic_quorum(&id1), Some(200));
+
+    // Holder stakes 3_000: circulating shrinks to 2_000 → 20 % = 400.
+    soroban_sdk::token::Client::new(&env, &token).transfer(&holder, &staking_pool, &3_000);
+    let id3 = client.create_proposal(
+        &admin,
+        &String::from_str(&env, "P3"),
+        &String::from_str(&env, "D3"),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+    assert_eq!(client.proposal_dynamic_quorum(&id3), Some(400));
+}
+
+/// The threshold rounds up so fractional quorums are never under-counted.
+#[test]
+fn test_dynamic_quorum_rounds_up() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 1, 0, 0);
+
+    client.set_dynamic_quorum(&admin, &3_333, &Vec::new(&env));
+    // 1_001 * 3_333 / 10_000 = 333.6333… → 334.
+    mint_tokens(&env, &token, &admin, &admin, 1_001);
+    let id = create_plain_proposal(&client, &env, &admin);
+    assert_eq!(client.proposal_dynamic_quorum(&id), Some(334));
+}
+
+/// No snapshot is stored when dynamic quorum is disabled.
+#[test]
+fn test_dynamic_quorum_disabled_by_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 1, 0, 0);
+
+    mint_tokens(&env, &token, &admin, &admin, 1_000);
+    let id = create_plain_proposal(&client, &env, &admin);
+    assert_eq!(client.proposal_dynamic_quorum(&id), None);
+}
+
+/// A proposal whose participation reaches the dynamic quorum can be queued.
+#[test]
+fn test_dynamic_quorum_met_allows_queue() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 1, 0, 0);
+
+    let staking_pool = Address::generate(&env);
+    client.set_dynamic_quorum(&admin, &2_000, &vec![&env, staking_pool.clone()]);
+
+    let voter = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &admin, 100);
+    mint_tokens(&env, &token, &admin, &voter, 300);
+    mint_tokens(&env, &token, &admin, &staking_pool, 600);
+    // circulating = 400 → required = 80.
+    let id = create_plain_proposal(&client, &env, &admin);
+    assert_eq!(client.proposal_dynamic_quorum(&id), Some(80));
+
+    client.vote(&voter, &id, &true);
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+    assert_eq!(client.get_proposal(&id).state, ProposalState::Queued);
+}
+
+/// A proposal that falls short of the dynamic quorum cannot be queued.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_dynamic_quorum_not_met_rejects_queue() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _) = setup_with_params(&env, 1, 0, 0);
+
+    client.set_dynamic_quorum(&admin, &2_000, &Vec::new(&env));
+
+    let voter = Address::generate(&env);
+    let other = Address::generate(&env);
+    mint_tokens(&env, &token, &admin, &admin, 100);
+    mint_tokens(&env, &token, &admin, &voter, 50);
+    mint_tokens(&env, &token, &admin, &other, 850);
+    // circulating = 1_000 → required = 200; only 50 votes cast.
+    let id = create_plain_proposal(&client, &env, &admin);
+
+    client.vote(&voter, &id, &true);
+    let deadline = client.get_proposal(&id).deadline;
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.queue_proposal(&id);
+}
+
+/// Dynamic quorum bps above 10_000 are rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_set_dynamic_quorum_invalid_bps_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _token, _) = setup(&env);
+
+    client.set_dynamic_quorum(&admin, &10_001, &Vec::new(&env));
+}
+
+/// Only the admin may configure the dynamic quorum.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_set_dynamic_quorum_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token, _) = setup(&env);
+
+    let stranger = Address::generate(&env);
+    client.set_dynamic_quorum(&stranger, &2_000, &Vec::new(&env));
 }

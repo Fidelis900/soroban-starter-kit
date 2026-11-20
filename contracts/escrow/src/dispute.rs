@@ -2,39 +2,56 @@ use soroban_sdk::{Address, Env};
 
 use crate::errors::EscrowError;
 use crate::events;
-use crate::lifecycle::{extend_ttl, get_required, refund_to_buyer, release_to_seller};
+use crate::lifecycle::{
+    MAX_ARBITER_FEE_BPS, extend_ttl, get_required, refund_to_buyer, release_to_seller,
+};
 use crate::storage::{DataKey, EscrowState};
 
 use DataKey::*;
 
-const MAX_ARBITER_FEE_BPS: u32 = 2_000;
 const BPS_DENOMINATOR: u32 = 10_000;
 
 /// Compute the arbiter fee owed on `amount` given the configured fee (in bps).
-fn compute_arbiter_fee(env: &Env, amount: i128) -> i128 {
+///
+/// The configured fee is re-checked against the hardcoded
+/// [`MAX_ARBITER_FEE_BPS`] ceiling at settlement time (issue #1439), so a
+/// resolution can never pay out more than 10 % of the disputed funds even if
+/// an out-of-range value somehow reached storage.
+///
+/// # Errors
+/// Returns [`EscrowError::ArbiterFeeTooHigh`] when the stored fee exceeds the
+/// ceiling; the resolution is rejected and no funds move.
+fn compute_arbiter_fee(env: &Env, amount: i128) -> Result<i128, EscrowError> {
     let fee_bps: u32 = env
         .storage()
         .instance()
         .get(&DataKey::ArbiterFeeBps)
         .unwrap_or(0);
+    if fee_bps > MAX_ARBITER_FEE_BPS {
+        return Err(EscrowError::ArbiterFeeTooHigh);
+    }
     if fee_bps == 0 || amount <= 0 {
-        return 0;
+        return Ok(0);
     }
     let fee = amount
         .saturating_mul(i128::from(fee_bps))
         / i128::from(BPS_DENOMINATOR);
-    fee.min(amount)
+    // Defence in depth: never exceed the ceiling share of the disputed amount.
+    let ceiling = amount
+        .saturating_mul(i128::from(MAX_ARBITER_FEE_BPS))
+        / i128::from(BPS_DENOMINATOR);
+    Ok(fee.min(ceiling))
 }
 
 /// Deduct the arbiter fee from the disputed funds and pay the arbiter.
 /// Returns the remaining amount to be split between buyer and seller.
-fn pay_arbiter_fee(env: &Env, arbiter: &Address, disputed: i128) -> i128 {
-    let fee = compute_arbiter_fee(env, disputed);
+fn pay_arbiter_fee(env: &Env, arbiter: &Address, disputed: i128) -> Result<i128, EscrowError> {
+    let fee = compute_arbiter_fee(env, disputed)?;
     if fee > 0 {
         crate::lifecycle::transfer_funds(env, arbiter, fee);
         events::arbiter_fee_paid(env, arbiter, fee);
     }
-    disputed.saturating_sub(fee)
+    Ok(disputed.saturating_sub(fee))
 }
 
 /// Resolve the dispute by releasing the remaining (post-fee) funds to the
@@ -45,7 +62,7 @@ fn settle(
     release_to_seller_flag: bool,
 ) -> Result<(), EscrowError> {
     let disputed: i128 = get_required(&env, &Amount)?;
-    let remaining = pay_arbiter_fee(&env, arbiter, disputed);
+    let remaining = pay_arbiter_fee(&env, arbiter, disputed)?;
 
     if release_to_seller_flag {
         env.storage()
