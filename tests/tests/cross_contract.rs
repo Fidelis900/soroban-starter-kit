@@ -27,10 +27,12 @@ use soroban_sdk::{
 // The generated clients are imported from the workspace crates. The exact
 // crate names follow the repository layout under `contracts/`.
 
+use crowdfund::{CrowdfundContract, CrowdfundContractClient};
 use dao::{DaoContract, DaoContractClient, ProposalStatus};
 use multisig::{MultisigContract, MultisigContractClient};
 use staking::{StakingContract, StakingContractClient};
 use swap::{SwapContract, SwapContractClient};
+use timelock::{ReleaseTranche, TimelockContract, TimelockContractClient};
 use treasury::{TreasuryContract, TreasuryContractClient};
 use vesting::{VestingContract, VestingContractClient};
 
@@ -52,6 +54,8 @@ struct CrossContractEnv {
     dao: DaoContractClient<'static>,
     multisig: MultisigContractClient<'static>,
     treasury: TreasuryContractClient<'static>,
+    crowdfund: CrowdfundContractClient<'static>,
+    timelock: TimelockContractClient<'static>,
     admin: Address,
 }
 
@@ -114,6 +118,14 @@ impl CrossContractEnv {
         let dao = DaoContractClient::new(&env, &dao_id);
         dao.initialize(&admin, &token_a_id, &multisig_id, &treasury_id);
 
+        // --- Crowdfund ----------------------------------------------------
+        let crowdfund_id = env.register(CrowdfundContract, ());
+        let crowdfund = CrowdfundContractClient::new(&env, &crowdfund_id);
+
+        // --- Timelock -----------------------------------------------------
+        let timelock_id = env.register(TimelockContract, ());
+        let timelock = TimelockContractClient::new(&env, &timelock_id);
+
         Self {
             env,
             token_a,
@@ -126,6 +138,8 @@ impl CrossContractEnv {
             dao,
             multisig,
             treasury,
+            crowdfund,
+            timelock,
             admin,
         }
     }
@@ -136,6 +150,15 @@ impl CrossContractEnv {
         let mut info = self.env.ledger().get();
         info.timestamp += seconds;
         info.sequence_number += 1;
+        self.env.ledger().set(info);
+    }
+
+    /// Advance the ledger sequence number by `delta` without changing the
+    /// timestamp. Timelock tranches are gated on ledger sequence, so this is
+    /// the primitive used to step through scheduled releases.
+    fn advance_sequence(&self, delta: u32) {
+        let mut info = self.env.ledger().get();
+        info.sequence_number += delta;
         self.env.ledger().set(info);
     }
 }
@@ -512,6 +535,170 @@ fn test_full_composite_workflow_end_to_end() {
     let claimed = t.vesting.claim(&beneficiary, &grant_id);
     assert_eq!(claimed, rewards);
     assert_eq!(t.token_b.balance(&beneficiary), rewards);
+}
+
+// ---------------------------------------------------------------------------
+// Workflow 4: Crowdfund success -> Timelock tranche releases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_crowdfund_success_initializes_timelock_tranche_releases() {
+    let t = CrossContractEnv::new();
+    let creator = Address::generate(&t.env);
+    let beneficiary = Address::generate(&t.env);
+
+    // ------------------------------------------------------------------
+    // Step 1: Configure and launch the crowdfund campaign.
+    // ------------------------------------------------------------------
+    let goal = 1_000_000i128;
+    let deadline = t.env.ledger().timestamp() + 30 * 24 * 60 * 60; // 30 days
+
+    t.crowdfund
+        .initialize(&creator, &t.token_a_id, &goal, &deadline);
+
+    // ------------------------------------------------------------------
+    // Step 2: Backers pledge until the goal is met.
+    // ------------------------------------------------------------------
+    let backer_one = Address::generate(&t.env);
+    let backer_two = Address::generate(&t.env);
+    let pledge_one = 600_000i128;
+    let pledge_two = 400_000i128;
+
+    t.token_a_admin.mint(&backer_one, &pledge_one);
+    t.token_a_admin.mint(&backer_two, &pledge_two);
+
+    t.crowdfund.pledge(&backer_one, &pledge_one);
+    t.crowdfund.pledge(&backer_two, &pledge_two);
+
+    assert_eq!(
+        t.crowdfund.total_pledged(),
+        goal,
+        "campaign did not reach its goal"
+    );
+    assert_eq!(
+        t.token_a.balance(&t.crowdfund.address),
+        goal,
+        "crowdfund contract did not custody the pledged funds"
+    );
+
+    // ------------------------------------------------------------------
+    // Step 3: Advance past the deadline and claim the raised funds.
+    // ------------------------------------------------------------------
+    t.advance_time(30 * 24 * 60 * 60 + 1);
+
+    let raised = t.crowdfund.claim_funds(&creator);
+    assert_eq!(raised, goal, "creator did not receive the full raise");
+    assert_eq!(
+        t.token_a.balance(&creator),
+        goal,
+        "creator balance does not reflect the claimed raise"
+    );
+    assert_eq!(
+        t.token_a.balance(&t.crowdfund.address),
+        0,
+        "crowdfund contract should be drained after claim"
+    );
+
+    // ------------------------------------------------------------------
+    // Step 4: Initialize the timelock with the raised funds and a series
+    // of tranches whose release ledgers increase monotonically.
+    // ------------------------------------------------------------------
+    let current_seq = t.env.ledger().sequence_number();
+    let tranche_amounts = [250_000i128, 350_000i128, 400_000i128];
+    let tranche_offsets = [10u32, 20u32, 30u32];
+
+    let mut tranches = Vec::new(&t.env);
+    for i in 0..tranche_amounts.len() {
+        tranches.push_back(ReleaseTranche {
+            amount: tranche_amounts[i],
+            release_ledger: current_seq + tranche_offsets[i],
+        });
+    }
+
+    // Move the claimed funds into the timelock contract.
+    t.token_a.transfer(&creator, &t.timelock.address, &goal);
+
+    t.timelock
+        .initialize(&creator, &t.token_a_id, &beneficiary, &tranches);
+
+    assert_eq!(
+        t.token_a.balance(&t.timelock.address),
+        goal,
+        "timelock did not custody the raised funds"
+    );
+    assert_eq!(
+        t.timelock.pending_tranches(),
+        tranches.len(),
+        "timelock did not register every tranche"
+    );
+
+    // ------------------------------------------------------------------
+    // Step 5: Step the ledger sequence forward and assert each tranche
+    // releases in order, crediting the beneficiary.
+    // ------------------------------------------------------------------
+    let mut expected_balance = 0i128;
+
+    for i in 0..tranche_amounts.len() {
+        // Just before this tranche's release ledger, nothing new releases.
+        let release_ledger = current_seq + tranche_offsets[i];
+        let seq_now = t.env.ledger().sequence_number();
+        t.advance_sequence(release_ledger - seq_now - 1);
+
+        let released_early = t.timelock.release(&beneficiary);
+        assert_eq!(
+            released_early, 0,
+            "tranche {} released before its release ledger",
+            i
+        );
+        assert_eq!(
+            t.token_a.balance(&beneficiary),
+            expected_balance,
+            "beneficiary balance changed before tranche {} released",
+            i
+        );
+
+        // Advance to the release ledger; the tranche must now release.
+        t.advance_sequence(1);
+
+        let released = t.timelock.release(&beneficiary);
+        assert_eq!(
+            released, tranche_amounts[i],
+            "tranche {} released the wrong amount",
+            i
+        );
+
+        expected_balance += tranche_amounts[i];
+        assert_eq!(
+            t.token_a.balance(&beneficiary),
+            expected_balance,
+            "beneficiary balance did not increase by tranche {}",
+            i
+        );
+        assert_eq!(
+            t.timelock.pending_tranches(),
+            tranche_amounts.len() - (i + 1),
+            "pending tranche count wrong after tranche {}",
+            i
+        );
+    }
+
+    // All tranches released: the timelock should be fully drained and the
+    // beneficiary should hold the entire raise.
+    assert_eq!(
+        t.token_a.balance(&beneficiary),
+        goal,
+        "beneficiary did not receive the full raise across tranches"
+    );
+    assert_eq!(
+        t.token_a.balance(&t.timelock.address),
+        0,
+        "timelock should be empty after all tranches released"
+    );
+    assert_eq!(
+        t.timelock.pending_tranches(),
+        0,
+        "no tranches should remain pending"
+    );
 }
 
 #[test]

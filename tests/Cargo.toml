@@ -14,10 +14,16 @@ soroban-marketplace-template = { path = "../contracts/marketplace" }
 soroban-nft-template = { path = "../contracts/nft" }
 soroban-auction-template = { path = "../contracts/auction" }
 soroban-lottery-template = { path = "../contracts/lottery" }
+soroban-crowdfund-template = { path = "../contracts/crowdfund" }
+soroban-timelock-template = { path = "../contracts/timelock" }
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "cross_contract"
+path = "tests/cross_contract.rs"
 
 [lints]
 workspace = true
