@@ -185,3 +185,31 @@ pub fn dynamic_quorum_snapshot(
         (circulating_supply, required_votes),
     );
 }
+
+/// Emitted when a voter's token balance is snapshotted at proposal creation
+/// ledger, so vote weight is evaluated against the historical balance
+/// (issue #1442).
+pub fn vote_snapshot_recorded(env: &Env, proposal_id: u32, voter: &Address, balance: i128) {
+    env.events().publish(
+        (Symbol::new(env, "vote_snapshot"), voter.clone()),
+        (proposal_id, balance),
+    );
+}
+
+/// Emitted when a passed proposal enters the execution timelock (issue #1443).
+/// Data: `executable_at` is the ledger at which execution becomes allowed.
+pub fn timelock_started(env: &Env, proposal_id: u32, executable_at: u32) {
+    env.events().publish(
+        (Symbol::new(env, "timelock_started"),),
+        (proposal_id, executable_at),
+    );
+}
+
+/// Emitted when the guardian multi-sig vetoes a pending proposal during the
+/// timelock window (issue #1444).
+pub fn guardian_vetoed(env: &Env, guardian: &Address, proposal_id: u32) {
+    env.events().publish(
+        (Symbol::new(env, "guardian_vetoed"), guardian.clone()),
+        proposal_id,
+    );
+}

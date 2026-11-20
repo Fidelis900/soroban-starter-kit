@@ -34,6 +34,19 @@ Let me carefully reconstruct the file with all four features implemented:
 //! * **Duplicate payload rejection** (issue #1319) — proposals are hashed
 //!   over their payload; creating a proposal identical to an active one is
 //!   rejected with `DaoError::DuplicateProposal`.
+//! * **Vote-weight snapshots** (issue #1442) — each proposal records the
+//!   ledger at which it was created and, on an address's first vote, the
+//!   voter's token balance is snapshotted into `VoteSnapshotKey`. Vote weight
+//!   is derived exclusively from that snapshot, so tokens transferred after a
+//!   vote cannot be recycled by the recipient to vote again (their snapshot
+//!   is zero).
+//! * **Immutable execution timelock** (issue #1443) — a minimum 48-hour
+//!   `TimelockDelay` is fixed at initialization (it may only ever be
+//!   increased). Passed proposals record `executable_at = now + delay` and
+//!   `execute_proposal` rejects any call before that ledger.
+//! * **Guardian emergency veto** (issue #1444) — a configured multi-sig
+//!   guardian may call `guardian_veto` to cancel a `Queued` proposal during
+//!   its timelock window, before it becomes executable.
 //!
 
 //! ## Quorum modes
@@ -82,7 +95,6 @@ Let me carefully reconstruct the file with all four features implemented:
 //! per call. Pass the returned `next_cursor` to fetch the following page.
 
 use soroban_sdk::{Address, Bytes, Env, String, Symbol, Val, Vec, contract, contractimpl, token};
-use soroban_sdk::{Address, Env, String, Symbol, Val, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
@@ -91,9 +103,7 @@ mod storage;
 pub use errors::DaoError;
 pub use storage::{
     ChoiceTally, DataKey, DelegateKey, LockedTokensKey, Proposal, ProposalKey, ProposalPage,
-    ProposalState, ProposalTier, VoteKey, VotingType,
-    DataKey, DelegateKey, LockedTokensKey, Proposal, ProposalKey, ProposalPage, ProposalState,
-    VoteKey,
+    ProposalState, ProposalTier, VoteKey, VoteSnapshotKey, VotingType,
 };
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, paginate};
@@ -105,6 +115,10 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// subtracted from total supply for the dynamic quorum (issue #1440). Bounds
 /// the number of cross-contract balance reads at proposal creation.
 pub const MAX_NON_CIRCULATING_HOLDERS: u32 = 20;
+
+/// Minimum execution timelock (in ledgers) between a proposal passing and
+/// becoming executable (issue #1443). 48 hours at 5s/ledger = 34 560.
+pub const MIN_TIMELOCK_DELAY: u32 = 34_560;
 
 /// Default execution delay (in ledgers) for `ProposalTier::Standard` when no
 /// tier-specific delay has been configured. 24 hours at 5s/ledger ≈ 17 280.
@@ -236,6 +250,12 @@ mod contract {
             env.storage()
                 .instance()
                 .set(&DataKey::ExecutionDelay, &execution_delay);
+            // Immutable execution timelock (issue #1443): never below the
+            // 48-hour minimum, regardless of the caller-supplied value.
+            let timelock_delay = execution_delay.max(MIN_TIMELOCK_DELAY);
+            env.storage()
+                .instance()
+                .set(&DataKey::TimelockDelay, &timelock_delay);
             // Tier-specific delays default to the standard delay for Standard,
             // and to the longer defaults for Financial / Critical (issue #1318).
             env.storage()
@@ -427,6 +447,9 @@ mod contract {
                 tier,
                 choices,
                 payload_hash: payload_hash.clone(),
+                // Record the creation ledger so vote weights can be evaluated
+                // against a historical snapshot (issue #1442).
+                created_at: env.ledger().sequence(),
             };
 
             env.storage()
@@ -512,8 +535,26 @@ mod contract {
 
             let dao_address = env.current_contract_address();
 
-            // Voter's own balance.
-            let own_balance = token_client.balance(&voter);
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            // Weight is derived exclusively from this snapshot so tokens moved
+            // after voting cannot be recycled by the recipient.
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
             if own_balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
@@ -631,7 +672,24 @@ mod contract {
             let token_client = token::Client::new(&env, &token);
             let dao_address = env.current_contract_address();
 
-            let own_balance = token_client.balance(&voter);
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
             if own_balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
@@ -920,7 +978,24 @@ mod contract {
             let token_client = token::Client::new(&env, &token);
             let dao_address = env.current_contract_address();
 
-            let own_balance = token_client.balance(&voter);
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
             if own_balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
@@ -931,7 +1006,6 @@ mod contract {
             };
             env.storage().persistent().set(&locked_key, &own_balance);
             bump_persistent(&env, &locked_key);
-            events::tokens_locked(&env, &voter, proposal_id,
             events::tokens_locked(&env, &voter, proposal_id, own_balance);
 
             // --- Aggregate delegated tokens ---
@@ -1164,13 +1238,19 @@ mod contract {
                 return Err(DaoError::ProposalRejected);
             }
 
-            // Set execution_eta and transition to Queued.
-            let execution_delay: u32 = env
+            // Set execution_eta and transition to Queued. The immutable
+            // timelock delay (issue #1443) is measured from the current ledger
+            // so a passed proposal can never execute immediately.
+            let timelock_delay: u32 = env
                 .storage()
                 .instance()
-                .get(&DataKey::ExecutionDelay)
-                .unwrap_or(0u32);
-            let execution_eta = proposal.deadline + execution_delay;
+                .get(&DataKey::TimelockDelay)
+                .unwrap_or(MIN_TIMELOCK_DELAY);
+            let execution_eta = env
+                .ledger()
+                .sequence()
+                .saturating_add(timelock_delay)
+                .max(proposal.deadline.saturating_add(timelock_delay));
 
             proposal.state = ProposalState::Queued;
             proposal.execution_eta = execution_eta;
@@ -1258,6 +1338,92 @@ mod contract {
                 .checked_add(proposal.no_votes)
                 .unwrap_or(0);
             Self::update_quorum_ema(&env, Self::participation_bps(total_votes, quorum));
+
+            Ok(())
+        }
+
+        /// Configure the emergency guardian address (issue #1444).
+        ///
+        /// The guardian is expected to be a multi-sig account. It may cancel a
+        /// `Queued` proposal during its timelock window via [`guardian_veto`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_guardian(
+            env: Env,
+            admin: Address,
+            guardian: Address,
+        ) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::Guardian, &guardian);
+            bump_instance(&env);
+            events::guardian_set(&env, &admin, &guardian);
+            Ok(())
+        }
+
+        /// Return the configured guardian address, if any (issue #1444).
+        #[must_use]
+        pub fn guardian(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::Guardian)
+        }
+
+        /// Emergency veto of a queued proposal by the guardian (issue #1444).
+        ///
+        /// Only the configured guardian may call this. It succeeds only while
+        /// the proposal is `Queued` and before its `execution_eta` (i.e. during
+        /// the timelock window), cancelling the proposal so a malicious action
+        /// can never be dispatched.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::MissingGuardian`] if no guardian is configured.
+        /// Returns [`DaoError::UnauthorizedGuardian`] if the caller is not the guardian.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Queued`.
+        /// Returns [`DaoError::TimelockExpired`] if the timelock has already elapsed.
+        pub fn guardian_veto(
+            env: Env,
+            guardian: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_guardian: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Guardian)
+                .ok_or(DaoError::MissingGuardian)?;
+            if stored_guardian != guardian {
+                return Err(DaoError::UnauthorizedGuardian);
+            }
+            guardian.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Queued {
+                return Err(DaoError::InvalidState);
+            }
+            // The veto is only available during the timelock window.
+            if env.ledger().sequence() >= proposal.execution_eta {
+                return Err(DaoError::TimelockExpired);
+            }
+
+            proposal.state = ProposalState::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            events::guardian_vetoed(&env, &guardian, proposal_id);
 
             Ok(())
         }
@@ -1714,6 +1880,15 @@ mod contract {
                 .instance()
                 .get(&DataKey::ProposalCount)
                 .unwrap_or(0)
+        }
+
+        /// Return the immutable execution timelock delay in ledgers (issue #1443).
+        #[must_use]
+        pub fn timelock_delay(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::TimelockDelay)
+                .unwrap_or(MIN_TIMELOCK_DELAY)
         }
 
         /// Return the current adaptive quorum EMA in basis points (issue #1107).

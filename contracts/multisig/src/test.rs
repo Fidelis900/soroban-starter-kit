@@ -1099,29 +1099,34 @@ fn set_spending_limit_requires_threshold() {
     );
 }
 
-// ── #1322 threshold change proposals ─────────────────────────────────────────
+// ── #1445 threshold change proposals ─────────────────────────────────────────
 
 #[test]
-fn propose_threshold_change_applies_after_current_threshold_approvals() {
+fn threshold_change_proposal_executes_after_current_threshold_approvals() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, bob, _, _) = create_multisig(&env);
 
+    // Proposer counts as the first approval; threshold stays unchanged.
     let proposal_id = client.propose_threshold_change(&alice, &3);
     assert_eq!(client.get_threshold(), Some(2));
 
-    // First approval is not enough (current threshold is 2).
+    let proposal = client.get_threshold_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.new_threshold, 3);
+    assert!(!proposal.executed);
+    assert_eq!(proposal.approvals, vec![&env, alice.clone()]);
+
+    // Second approval reaches the current threshold (2) and applies the change.
     client.approve_threshold_change(&bob, &proposal_id);
     assert_eq!(client.get_threshold(), Some(3));
 
     let proposal = client.get_threshold_proposal(&proposal_id).unwrap();
-    assert_eq!(proposal.new_threshold, 3);
-    assert!(proposal.applied);
+    assert!(proposal.executed);
     assert_eq!(proposal.approvals, vec![&env, alice, bob]);
 }
 
 #[test]
-fn propose_threshold_change_emits_event_on_apply() {
+fn threshold_change_proposal_emits_event_on_execution() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, bob, _, _) = create_multisig(&env);
@@ -1136,7 +1141,46 @@ fn propose_threshold_change_emits_event_on_apply() {
 }
 
 #[test]
-fn propose_threshold_change_requires_signer() {
+fn threshold_change_proposal_requires_insufficient_approvals_to_execute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    // Only the proposer has approved; current threshold is 2.
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    assert_eq!(
+        client.try_execute_threshold_change(&alice, &proposal_id),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+    assert_eq!(client.get_threshold(), Some(2));
+}
+
+#[test]
+fn threshold_change_proposal_rejects_zero_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &0),
+        Err(Ok(MultisigError::InvalidNewThreshold))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_threshold_above_signer_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &4),
+        Err(Ok(MultisigError::InvalidNewThreshold))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_non_signer_proposer() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _, _, _, _) = create_multisig(&env);
@@ -1149,31 +1193,7 @@ fn propose_threshold_change_requires_signer() {
 }
 
 #[test]
-fn propose_threshold_change_rejects_zero() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, alice, _, _, _) = create_multisig(&env);
-
-    assert_eq!(
-        client.try_propose_threshold_change(&alice, &0),
-        Err(Ok(MultisigError::InvalidThreshold))
-    );
-}
-
-#[test]
-fn propose_threshold_change_rejects_above_signer_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, alice, _, _, _) = create_multisig(&env);
-
-    assert_eq!(
-        client.try_propose_threshold_change(&alice, &4),
-        Err(Ok(MultisigError::InvalidThreshold))
-    );
-}
-
-#[test]
-fn approve_threshold_change_rejects_non_signer() {
+fn threshold_change_proposal_rejects_non_signer_approver() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, _, _, _) = create_multisig(&env);
@@ -1186,7 +1206,7 @@ fn approve_threshold_change_rejects_non_signer() {
 }
 
 #[test]
-fn approve_threshold_change_rejects_duplicate_approval() {
+fn threshold_change_proposal_rejects_duplicate_approval() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, _, _, _) = create_multisig(&env);
@@ -1199,7 +1219,7 @@ fn approve_threshold_change_rejects_duplicate_approval() {
 }
 
 #[test]
-fn approve_threshold_change_rejects_unknown_proposal() {
+fn threshold_change_proposal_rejects_unknown_proposal() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, _, _, _) = create_multisig(&env);
@@ -1211,7 +1231,7 @@ fn approve_threshold_change_rejects_unknown_proposal() {
 }
 
 #[test]
-fn approve_threshold_change_rejects_already_applied_proposal() {
+fn threshold_change_proposal_rejects_approval_after_execution() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, alice, bob, carol, _) = create_multisig(&env);

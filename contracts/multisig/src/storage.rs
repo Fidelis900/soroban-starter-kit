@@ -23,6 +23,10 @@ pub enum DataKey {
     SpendingLimits(Address),
     /// All configured token spending limits.
     SpendingLimitsList,
+    /// A pending threshold-change proposal keyed by its id.
+    ThresholdChangeProposal(u64),
+    /// Next id to assign to a threshold-change proposal.
+    NextThresholdChangeId,
     /// Monotonic nonce bumped whenever the signer configuration changes
     /// (e.g. via `replace_signer`). Used to invalidate stale signatures.
     ConfigNonce,
@@ -65,6 +69,21 @@ pub struct TokenSpendingLimit {
     pub daily_limit: i128,
     pub spent_amount: i128,
     pub last_refill_ledger: u32,
+}
+
+/// A proposal to change the signer threshold.  It must collect approvals from
+/// the current threshold signers before the new threshold is applied.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThresholdChangeProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub new_threshold: u32,
+    /// Addresses that have approved this proposal.
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    /// Ledger sequence when the proposal was created.
+    pub created_ledger: u32,
 }
 
 /// Retrieve the weight assigned to `signer`.  Returns 1 if no weights map is

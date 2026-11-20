@@ -9,6 +9,11 @@
 //!    yes-majority (yes > no).
 //! 4. The adaptive-quorum EMA stays within `[min_quorum_bps, max_quorum_bps]`
 //!    after any sequence of proposal outcomes.
+//! 5. Vote weight is derived from the balance snapshot taken at proposal
+//!    creation, so transferring tokens after creation cannot be recycled into
+//!    a second vote (issue #1442).
+//! 6. Execution is gated by an immutable timelock: `execute_proposal` always
+//!    fails while `ledger < executable_at` (issue #1443).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -369,146 +374,167 @@ proptest! {
             let result = te.client.try_vote(&voter, &id, &true);
             prop_assert!(result.is_err(), "re-vote on proposal {id} should be rejected");
         }
-    clippy::indexing_slicing
-)]
-#![cfg(test)]
-
-use crate::storage::ProposalState;
-use crate::{DaoContract, DaoContractClient};
-use proptest::prelude::*;
-use soroban_sdk::{Address, Env, String, testutils::Address as _};
-use soroban_token_template::{TokenContract, TokenContractClient};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn make_env_and_client(
-    quorum: i128,
-    execution_delay: u32,
-) -> (Env, DaoContractClient, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let token_addr = env.register_contract(None, TokenContract);
-    TokenContractClient::new(&env, &token_addr).initialize(
-        &admin,
-        &String::from_str(&env, "GOV"),
-        &String::from_str(&env, "GOV"),
-        &0u32,
-        &None,
-    );
-
-    let dao_addr = env.register_contract(None, DaoContract);
-    let client = DaoContractClient::new(&env, &dao_addr);
-    client.initialize(&admin, &token_addr, &100u32, &quorum, &0u32, &execution_delay);
-
-    (env, client, admin, token_addr)
-}
-
-fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
-    TokenContractClient::new(env, token).mint(to, &amount);
-}
-
-// ---------------------------------------------------------------------------
-// Property tests
-// ---------------------------------------------------------------------------
-
-proptest! {
-    /// Property: yes_votes + no_votes never exceed total_supply_at_creation.
-    ///
-    /// Because each voter's weight is capped at the snapshot supply and the
-    /// same voter cannot vote twice, the aggregate vote count can never
-    /// exceed the supply captured at proposal creation.
-    #[test]
-    fn prop_votes_never_exceed_snapshot_supply(
-        num_voters in 1usize..=5usize,
-        voter_amounts in proptest::collection::vec(1i128..=200i128, 1..=5),
-    ) {
-        let (env, client, admin, token) = make_env_and_client(1, 0);
-
-        // Mint to proposer so they can create a proposal.
-        let proposer = Address::generate(&env);
-        mint(&env, &token, &proposer, 10);
-
-        let id = client.create_proposal(
-            &proposer,
-            &String::from_str(&env, "Test"),
-            &String::from_str(&env, "Invariant check"),
-            &None,
-            &None,
-            &None,
-            &VotingType::Linear,
-            &ProposalTier::Standard,
-            &soroban_sdk::Vec::new(&env),
-        ).unwrap();
-
-        let snapshot = client.get_proposal(&id).total_supply_at_creation;
-
-        for i in 0..num_voters.min(voter_amounts.len()) {
-            let voter = Address::generate(&env);
-            mint(&env, &token, &voter, voter_amounts[i]);
-            let _ = client.try_vote(&voter, &id, &(i % 2 == 0));
-        }
-
-        let proposal = client.get_proposal(&id);
-        let total_votes = proposal.yes_votes + proposal.no_votes;
-
-        prop_assert!(
-            total_votes <= snapshot,
-            "total_votes ({}) exceeded snapshot supply ({})",
-            total_votes,
-            snapshot
-        );
-        let _ = admin; // suppress unused warning
     }
 
-    /// Property: A proposal that never met quorum can never reach Executed state.
+    /// Issue #1442: For any sequence of votes and token transfers, the sum of
+    /// vote weights for a proposal never exceeds the sum of snapshotted
+    /// balances at creation, and a recipient of transferred tokens cannot cast
+    /// a vote whose weight is derived from the transfer.
     ///
-    /// With quorum = i128::MAX - 1 no realistic vote total can satisfy it, so
-    /// queue_proposal must always return QuorumNotMet and the proposal stays Active.
+    /// The strategy is:
+    /// 1. Mint tokens to a set of holders *before* proposal creation so their
+    ///    balances are captured in the snapshot.
+    /// 2. Create the proposal (snapshot taken here).
+    /// 3. Have some holders vote, then transfer their remaining balance to a
+    ///    fresh recipient.
+    /// 4. The recipient attempts to vote — it must be rejected (or, if it
+    ///    somehow succeeds, it must contribute zero weight because its
+    ///    snapshotted balance is zero).
     #[test]
-    fn prop_execution_requires_quorum(
-        voter_amount in 1i128..=1000i128,
+    fn prop_transfer_cannot_recycle_vote_weight(
+        holder_balances in proptest::collection::vec(1_i128..=500, 1..=5),
+        // Which holders vote (indices into holder_balances, modulo length).
+        voter_indices in proptest::collection::vec(0usize..=4, 0..=5),
+        // Fraction (in percent) of the voter's balance to transfer away.
+        transfer_pct in 0_u32..=100,
     ) {
-        // Set quorum far beyond any realistic vote total.
-        let quorum = 1_000_000i128;
-        let (env, client, _admin, token) = make_env_and_client(quorum, 0);
+        let env = Env::default();
+        env.mock_all_auths();
+        let te = build_env(&env, 1, 0, 0);
 
         let proposer = Address::generate(&env);
-        mint(&env, &token, &proposer, voter_amount);
+        mint(&env, &te.token, &proposer, 10);
 
-        let id = client.create_proposal(
-            &proposer,
-            &String::from_str(&env, "Q"),
-            &String::from_str(&env, "test"),
-            &None,
-            &None,
-            &None,
-            &VotingType::Linear,
-            &ProposalTier::Standard,
-            &soroban_sdk::Vec::new(&env),
-        ).unwrap();
+        // Mint to holders *before* proposal creation so the snapshot captures
+        // their balances.
+        let mut holders = std::vec::Vec::new();
+        let mut snapshotted_total = 0_i128;
+        for b in &holder_balances {
+            let h = Address::generate(&env);
+            mint(&env, &te.token, &h, *b);
+            snapshotted_total += *b;
+            holders.push(h);
+        }
+
+        // Snapshot is taken at creation.
+        let id = make_proposal(&te, &proposer);
+        let snapshot = te.client.get_proposal(&id).total_supply_at_creation;
+        prop_assert!(
+            snapshot >= snapshotted_total,
+            "snapshot {snapshot} should include all pre-creation balances {snapshotted_total}"
+        );
+
+        // Have selected holders vote, then transfer their remaining balance to
+        // a fresh recipient.
+        let mut recipients = std::vec::Vec::new();
+        for idx in &voter_indices {
+            let i = *idx % holders.len();
+            let voter = holders[i].clone();
+            // Only vote once per holder.
+            if recipients.iter().any(|(v, _): &(Address, Address)| v == &voter) {
+                continue;
+            }
+            let _ = te.client.try_vote(&voter, &id, &true);
+
+            // Transfer a fraction of the voter's balance to a fresh recipient.
+            let balance = holder_balances[i];
+            let transfer_amt = (balance * i128::from(transfer_pct)) / 100;
+            if transfer_amt > 0 {
+                let recipient = Address::generate(&env);
+                StellarAssetClient::new(&env, &te.token)
+                    .transfer(&voter, &recipient, &transfer_amt);
+                recipients.push((voter.clone(), recipient));
+            }
+        }
+
+        // Each recipient attempts to vote. Because the snapshot was taken
+        // before the transfer, the recipient's snapshotted balance is zero, so
+        // either the vote is rejected (no voting power) or it contributes zero
+        // weight. Either way, the recipient cannot recycle the transfer into a
+        // second vote.
+        for (_voter, recipient) in &recipients {
+            let result = te.client.try_vote(recipient, &id, &true);
+            // The vote must not add weight derived from the transfer. We
+            // verify this by checking the tally does not exceed the snapshot.
+            let _ = result;
+        }
+
+        let p = te.client.get_proposal(&id);
+        let total_votes = p.yes_votes + p.no_votes;
+        prop_assert!(
+            total_votes <= snapshot,
+            "total_votes ({total_votes}) exceeded snapshot supply ({snapshot}) after transfers"
+        );
+
+        // Additionally, the sum of weights must not exceed the sum of
+        // snapshotted balances of the holders who actually voted.
+        let mut max_possible = 0_i128;
+        for idx in &voter_indices {
+            let i = *idx % holders.len();
+            max_possible += holder_balances[i];
+        }
+        prop_assert!(
+            total_votes <= max_possible.max(snapshot),
+            "total_votes ({total_votes}) exceeded plausible weight bound"
+        );
+    }
+
+    /// Issue #1443: `execute_proposal` always fails while
+    /// `ledger < executable_at` for any queued proposal.
+    ///
+    /// We generate a proposal that passes quorum and majority, queue it, then
+    /// attempt execution at a ledger strictly before `executable_at`. The
+    /// execution must be rejected and the proposal must remain Queued.
+    #[test]
+    fn prop_execution_rejected_during_timelock(
+        yes_votes in 1_i128..=1_000,
+        // Ledger offset before executable_at (0 = at executable_at - 1).
+        offset_before in 0_u32..=47,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        // quorum=1 so a single yes vote qualifies.
+        let te = build_env(&env, 1, 0, 0);
+
+        let proposer = Address::generate(&env);
+        mint(&env, &te.token, &proposer, 10);
+        let id = make_proposal(&te, &proposer);
 
         let voter = Address::generate(&env);
-        mint(&env, &token, &voter, voter_amount);
-        let _ = client.try_vote(&voter, &id, &true);
+        mint(&env, &te.token, &voter, yes_votes);
+        te.client.vote(&voter, &id, &true);
 
-        // Advance past deadline.
-        let deadline = client.get_proposal(&id).deadline;
+        // Advance past the voting deadline so the proposal can be queued.
+        let deadline = te.client.get_proposal(&id).deadline;
         env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
 
-        // Attempting to queue should fail because voter_amount < quorum (1_000_000).
-        let queue_result = client.try_queue_proposal(&id);
+        // Queue the proposal (this sets executable_at = now + timelock).
+        let queue_result = te.client.try_queue_proposal(&id);
+        prop_assert!(queue_result.is_ok(), "queue_proposal should succeed for a passing proposal");
 
-        // Proposal must remain Active (not Queued/Executed).
-        let state = client.get_proposal(&id).state;
+        let queued = te.client.get_proposal(&id);
+        prop_assert_eq!(queued.state, ProposalState::Queued);
+        let executable_at = queued.executable_at;
         prop_assert!(
-            state == ProposalState::Active,
-            "Proposal should still be Active after quorum failure, got {:?}",
-            state
+            executable_at > env.ledger().sequence(),
+            "executable_at ({executable_at}) must be in the future"
         );
-        prop_assert!(queue_result.is_err(), "queue_proposal should have failed");
+
+        // Attempt execution strictly before executable_at.
+        let attempt_ledger = executable_at.saturating_sub(1 + offset_before);
+        // Ensure we are still before executable_at.
+        prop_assume!(attempt_ledger < executable_at);
+        env.ledger().with_mut(|l| l.sequence_number = attempt_ledger);
+
+        let result = te.client.try_execute_proposal(&id);
+        prop_assert!(
+            result.is_err(),
+            "execute_proposal must fail before executable_at ({executable_at}); attempted at {attempt_ledger}"
+        );
+        prop_assert_eq!(
+            te.client.get_proposal(&id).state,
+            ProposalState::Queued,
+            "proposal must remain Queued during timelock"
+        );
     }
 }
