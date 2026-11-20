@@ -40,6 +40,9 @@ pub fn campaign_cancelled(env: &Env, creator: &Address) {
     env.events().publish(
         (Symbol::new(env, "campaign_cancelled"), creator.clone()),
         (),
+    );
+}
+
 pub fn creator_claim_expired(env: &Env, claim_deadline: u32) {
     env.events().publish(
         (Symbol::new(env, "creator_claim_expired"),),
@@ -58,5 +61,12 @@ pub fn milestone_voted(env: &Env, milestone_id: u32, voter: &Address, approve: b
     env.events().publish(
         (Symbol::new(env, "milestone_voted"), milestone_id, voter.clone()),
         approve,
+    );
+}
+
+pub fn project_update(env: &Env, creator: &Address, update_hash: &soroban_sdk::BytesN<32>, uri: &soroban_sdk::String) {
+    env.events().publish(
+        (Symbol::new(env, "project_update"), creator.clone()),
+        (update_hash.clone(), uri.clone()),
     );
 }

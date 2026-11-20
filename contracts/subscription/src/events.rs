@@ -212,5 +212,30 @@ pub fn voucher_applied(
     env.events().publish(
         (Symbol::new(env, "voucher_used"), subscriber.clone()),
         (code.clone(), discount_bps, gross, net),
+/// Emitted when a subscription is due (or about to be due) for renewal.
+/// Topics: (Symbol, Address, Symbol) — event name, subscriber, plan
+/// Data: (next_billing_ledger, current_ledger)
+pub fn billing_due_soon(
+    env: &Env,
+    subscriber: &Address,
+    plan_id: &Symbol,
+    next_billing_ledger: u32,
+    current_ledger: u32,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "billing_due_soon"),
+            subscriber.clone(),
+            plan_id.clone(),
+        ),
+        (next_billing_ledger, current_ledger),
+    );
+}
+
+/// Emitted when a fixed-term subscription reaches its billing cycle limit.
+pub fn subscription_expired(env: &Env, subscriber: &Address, plan_id: &Symbol) {
+    env.events().publish(
+        (Symbol::new(env, "subscription_expired"), subscriber.clone()),
+        plan_id.clone(),
     );
 }

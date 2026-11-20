@@ -12,12 +12,8 @@ pub enum DataKey {
     MerkleRoot,
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
-    /// Payment token address (instance).
-    Token,
-    /// Merkle root as a 32-byte value stored as Bytes, keyed by round (instance).
-    MerkleRoot(u32),
-    /// Whether a given address has already claimed in a given round (persistent).
-    Claimed(u32, Address),
+    /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).
+    ClaimedTier(Address, Address),
     /// The ledger sequence number after which claims are rejected (instance).
     ClaimDeadline,
     /// Optional [`VestingConfig`] applied to every claim (instance).
