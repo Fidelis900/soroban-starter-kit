@@ -640,7 +640,7 @@ proptest! {
     fn prop_arbiter_fee_conserves_disputed_amount(
         total in 2i128..=1_000_000i128,
         n in 1u32..=5u32,
-        fee_bps in 0u32..=2_000u32,
+        fee_bps in 0u32..=1_000u32,
         favour_seller in any::<bool>(),
     ) {
         let env = Env::default();

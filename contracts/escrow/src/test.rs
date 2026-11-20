@@ -1730,7 +1730,7 @@ fn test_initialize_arbiter_fee_at_cap_succeeds() {
     let deadline = env.ledger().sequence() + 100;
     let (client, _) = create_escrow_contract(&env);
 
-    // 2_000 bps == 20% is the maximum allowed arbiter fee.
+    // 1_000 bps == 10% is the hardcoded maximum arbiter fee (#1439).
     client.initialize(
         &admin,
         &buyer,
@@ -1741,7 +1741,7 @@ fn test_initialize_arbiter_fee_at_cap_succeeds() {
         &deadline,
         &0,
         &None,
-        &Some(2_000u32),
+        &Some(1_000u32),
     );
     assert_eq!(client.get_escrow_info().amount, 1_000);
 }
@@ -1760,7 +1760,7 @@ fn test_initialize_arbiter_fee_above_cap_fails() {
     let deadline = env.ledger().sequence() + 100;
     let (client, _) = create_escrow_contract(&env);
 
-    // 2_001 bps > 20% cap — must be rejected.
+    // 1_001 bps > 10% cap — must be rejected.
     client.initialize(
         &admin,
         &buyer,
@@ -1771,7 +1771,7 @@ fn test_initialize_arbiter_fee_above_cap_fails() {
         &deadline,
         &0,
         &None,
-        &Some(2_001u32),
+        &Some(1_001u32),
     );
 }
 
@@ -2010,4 +2010,237 @@ fn test_multi_arbiter_non_committee_approval_rejected() {
 
     let outsider = Address::generate(&env);
     client.approve_dispute(&outsider, &true);
+}
+
+// ── #1439 arbiter fee ceiling enforcement ─────────────────────────────────────
+
+/// Initialize (but do not fund) a single-arbiter escrow with the given fee.
+fn try_init_with_arbiter_fee(env: &Env, fee_bps: u32) -> Option<EscrowError> {
+    let admin = Address::generate(env);
+    let buyer = Address::generate(env);
+    let seller = Address::generate(env);
+    let arbiter = Address::generate(env);
+    let token = create_mock_token(env);
+    let deadline = env.ledger().sequence() + 100;
+    let (client, _) = create_escrow_contract(env);
+    match client.try_initialize(
+        &admin,
+        &buyer,
+        &seller,
+        &arbiter,
+        &token,
+        &1_000,
+        &deadline,
+        &0,
+        &None,
+        &None,
+        &Some(fee_bps),
+    ) {
+        Ok(_) => None,
+        Err(Ok(e)) => Some(e),
+        Err(Err(e)) => panic!("unexpected invoke error: {:?}", e),
+    }
+}
+
+#[test]
+fn test_arbiter_fee_ceiling_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    assert!(try_init_with_arbiter_fee(&env, 0).is_none());
+    assert!(try_init_with_arbiter_fee(&env, 999).is_none());
+    assert!(try_init_with_arbiter_fee(&env, 1_000).is_none());
+    assert!(matches!(
+        try_init_with_arbiter_fee(&env, 1_001),
+        Some(EscrowError::ArbiterFeeTooHigh)
+    ));
+    assert!(matches!(
+        try_init_with_arbiter_fee(&env, 2_000),
+        Some(EscrowError::ArbiterFeeTooHigh)
+    ));
+    assert!(matches!(
+        try_init_with_arbiter_fee(&env, u32::MAX),
+        Some(EscrowError::ArbiterFeeTooHigh)
+    ));
+}
+
+#[test]
+fn test_resolve_dispute_at_fee_ceiling_pays_at_most_ten_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, buyer, _seller, arbiter, _token, amount) =
+        setup_funded_escrow_with_arbiter_fee(&env, 1_000);
+    client.raise_dispute(&buyer);
+    client.resolve_dispute(&arbiter, &true);
+
+    let fee = amount * 1_000 / 10_000;
+    assert_eq!(last_event_data::<(i128, i128)>(&env), (amount - fee, fee));
+}
+
+#[test]
+fn test_resolve_dispute_rejects_fee_above_ceiling() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, buyer, _seller, arbiter, _token, _amount) =
+        setup_funded_escrow_with_arbiter_fee(&env, 500);
+    client.raise_dispute(&buyer);
+
+    // Simulate a corrupted / out-of-range fee reaching storage.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::ArbiterFeeBps, &5_000u32);
+    });
+
+    assert!(matches!(
+        client.try_resolve_dispute(&arbiter, &true),
+        Err(Ok(EscrowError::ArbiterFeeTooHigh))
+    ));
+    // Resolution was rejected: escrow remains disputed, no funds moved.
+    assert_eq!(client.get_state(), Some(EscrowState::Disputed));
+}
+
+// ── #1438 buyer lockup enforcement ────────────────────────────────────────────
+
+/// Returns (client, buyer, seller, lockup_deadline) for a funded escrow whose
+/// buyer configured a lockup `lockup_secs` seconds in the future.
+fn setup_funded_escrow_with_lockup<'a>(
+    env: &'a Env,
+    lockup_secs: u64,
+) -> (EscrowContractClient<'a>, Address, Address, u64) {
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let admin = Address::generate(env);
+    let buyer = Address::generate(env);
+    let seller = Address::generate(env);
+    let arbiter = Address::generate(env);
+    let token = create_mock_token(env);
+    let deadline = env.ledger().sequence() + 100;
+
+    let (client, _) = create_escrow_contract(env);
+    client.initialize(
+        &admin, &buyer, &seller, &arbiter, &token, &1_000, &deadline, &0, &None, &None, &None,
+    );
+    let lockup_deadline = env.ledger().timestamp() + lockup_secs;
+    client.set_lockup_deadline(&lockup_deadline);
+    client.fund();
+    (client, buyer, seller, lockup_deadline)
+}
+
+#[test]
+fn test_lockup_deadline_is_stored() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, _, lockup_deadline) = setup_funded_escrow_with_lockup(&env, 3_600);
+    assert_eq!(client.get_lockup_deadline(), Some(lockup_deadline));
+}
+
+#[test]
+fn test_approve_delivery_rejected_before_lockup() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup_funded_escrow_with_lockup(&env, 3_600);
+    client.mark_delivered();
+
+    assert!(matches!(
+        client.try_approve_delivery(),
+        Err(Ok(EscrowError::LockupPeriodActive))
+    ));
+    assert_eq!(client.get_state(), Some(EscrowState::Delivered));
+}
+
+#[test]
+fn test_release_partial_rejected_before_lockup() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup_funded_escrow_with_lockup(&env, 3_600);
+    assert!(matches!(
+        client.try_release_partial(&100),
+        Err(Ok(EscrowError::LockupPeriodActive))
+    ));
+    assert_eq!(client.get_escrow_info().amount, 1_000);
+}
+
+#[test]
+fn test_release_rejected_one_second_before_lockup() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, _, lockup_deadline) = setup_funded_escrow_with_lockup(&env, 3_600);
+    client.mark_delivered();
+    env.ledger().with_mut(|l| l.timestamp = lockup_deadline - 1);
+
+    assert!(matches!(
+        client.try_approve_delivery(),
+        Err(Ok(EscrowError::LockupPeriodActive))
+    ));
+}
+
+#[test]
+fn test_release_succeeds_once_lockup_elapsed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, _, lockup_deadline) = setup_funded_escrow_with_lockup(&env, 3_600);
+    client.mark_delivered();
+    env.ledger().with_mut(|l| l.timestamp = lockup_deadline);
+
+    client.approve_delivery();
+    assert_eq!(client.get_state(), Some(EscrowState::Completed));
+}
+
+#[test]
+fn test_dispute_release_to_seller_rejected_before_lockup() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, buyer, ..) = setup_funded_escrow_with_lockup(&env, 3_600);
+    let arbiter = client.get_escrow_info().arbiter;
+    client.raise_dispute(&buyer);
+
+    assert!(matches!(
+        client.try_resolve_dispute(&arbiter, &true),
+        Err(Ok(EscrowError::LockupPeriodActive))
+    ));
+}
+
+#[test]
+fn test_set_lockup_rejected_after_funding() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, ..) = setup_funded_escrow(&env);
+    let future = env.ledger().timestamp() + 3_600;
+    assert!(matches!(
+        client.try_set_lockup_deadline(&future),
+        Err(Ok(EscrowError::InvalidState))
+    ));
+}
+
+#[test]
+fn test_set_lockup_rejects_past_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let token = create_mock_token(&env);
+    let deadline = env.ledger().sequence() + 100;
+    let (client, _) = create_escrow_contract(&env);
+    client.initialize(
+        &admin, &buyer, &seller, &arbiter, &token, &1_000, &deadline, &0, &None, &None, &None,
+    );
+
+    assert!(matches!(
+        client.try_set_lockup_deadline(&1_000),
+        Err(Ok(EscrowError::InvalidState))
+    ));
+    assert_eq!(client.get_lockup_deadline(), None);
 }

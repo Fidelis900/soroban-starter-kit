@@ -52,7 +52,7 @@ pub enum EscrowError {
     EmptyTokenList = 15,
     /// Token lists and amount lists must have the same length.
     TokenListMismatch = 16,
-    /// The arbiter fee in basis points exceeds the maximum allowed (2 000).
+    /// The arbiter fee in basis points exceeds the hardcoded ceiling (1 000 = 10 %).
     ArbiterFeeTooHigh = 17,
     /// The arbiter threshold is zero or exceeds the number of configured arbiters.
     InvalidThreshold = 18,
@@ -64,6 +64,8 @@ pub enum EscrowError {
     InvalidPartialAmount = 21,
     /// Mutual cancellation is not allowed in the escrow's current state.
     MutualCancelNotAllowed = 22,
+    /// A release was attempted before the configured lockup timestamp elapsed.
+    LockupPeriodActive = 23,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -96,12 +98,13 @@ impl_display_error!(
     Reentrancy                => "reentrant call detected",
     EmptyTokenList            => "token list must not be empty",
     TokenListMismatch         => "token and amount lists must have the same length",
-    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (2 000 bps)",
+    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (1 000 bps)",
     InvalidThreshold          => "invalid arbiter threshold",
     InsufficientArbiterApprovals => "insufficient arbiter approvals",
     DuplicateArbiterApproval  => "duplicate arbiter approval",
     InvalidPartialAmount      => "invalid partial release amount",
     MutualCancelNotAllowed    => "mutual cancellation not allowed",
+    LockupPeriodActive        => "lockup period has not elapsed",
 );
 
 #[cfg(test)]
@@ -137,7 +140,8 @@ EscrowError::InvalidThreshold = {}\n\
 EscrowError::InsufficientArbiterApprovals = {}\n\
 EscrowError::DuplicateArbiterApproval = {}\n\
 EscrowError::InvalidPartialAmount = {}\n\
-EscrowError::MutualCancelNotAllowed = {}\n",
+EscrowError::MutualCancelNotAllowed = {}\n\
+EscrowError::LockupPeriodActive = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -160,6 +164,7 @@ EscrowError::MutualCancelNotAllowed = {}\n",
             EscrowError::DuplicateArbiterApproval as u32,
             EscrowError::InvalidPartialAmount as u32,
             EscrowError::MutualCancelNotAllowed as u32,
+            EscrowError::LockupPeriodActive as u32,
         )
     }
 
