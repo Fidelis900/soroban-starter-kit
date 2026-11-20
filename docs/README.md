@@ -60,6 +60,9 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
 - **[Fuzz: vesting_state_machine](fuzzing/vesting-state-machine.md)** — Create/claim/revoke interleavings, grant conservation (#1365)
 - **[Fuzz: nft_state_machine](fuzzing/nft-state-machine.md)** — Approvals, `transfer_from`, royalty bounds (#1366)
 - **[Bench: lottery_ops](benchmarks/lottery-ops.md)** — Ticket purchase scaling (10–500) and multi-winner draw costs (#1367)
+## Proposals
+
+- **[Proposals](proposals/README.md)**: Design notes for open issues (#1368–#1371: benchmarks, bench regression CI, cross-contract integration tests)
 
 ## Architecture Decision Records (ADRs)
 

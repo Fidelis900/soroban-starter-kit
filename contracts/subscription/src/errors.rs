@@ -25,11 +25,22 @@ pub enum SubscriptionError {
     /// A billing calculation overflowed.
     ArithmeticOverflow = 15,
     /// Subscription was suspended for non-payment after its grace period expired.
-    SubscriptionSuspended = 14,
+    SubscriptionSuspended = 16,
     /// The current billing period is due or overdue and must be charged first.
+    PaymentOverdue = 17,
     PaymentOverdue = 15,
     /// An arithmetic operation overflowed.
     ArithmeticOverflow = 16,
+    /// Referral voucher discount is outside 0..=10_000 basis points.
+    InvalidVoucher = 17,
+    /// Provider has not configured a minimum payout threshold.
+    PayoutThresholdNotSet = 20,
+    /// Accumulated revenue is below the provider's minimum payout threshold.
+    BelowPayoutThreshold = 21,
+    /// Payout threshold must be positive.
+    InvalidPayoutThreshold = 22,
+    /// A fixed-term subscription must allow at least one billing cycle.
+    InvalidMaxBillingCycles = 23,
 }
 
 impl_display_error!(
@@ -47,6 +58,14 @@ impl_display_error!(
     PlanAlreadyExists      => "plan already exists",
     PlanNotFound           => "plan not found",
     PlanInactive           => "plan inactive",
+    InvalidDiscount        => "invalid discount",
+    ArithmeticOverflow     => "arithmetic overflow",
+    SubscriptionSuspended  => "subscription suspended",
+    PaymentOverdue         => "payment overdue",
+    PayoutThresholdNotSet  => "payout threshold not set",
+    BelowPayoutThreshold   => "accumulated revenue is below payout threshold",
+    InvalidPayoutThreshold => "payout threshold must be positive",
+    InvalidMaxBillingCycles => "max billing cycles must be at least one",
 );
 
 #[cfg(test)]

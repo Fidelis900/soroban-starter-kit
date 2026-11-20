@@ -14,6 +14,7 @@ pub enum DataKey {
     Claimed,
     Pledge(Address),
     Tiers,
+    StretchGoals,
     MaxPledgePerAddress,
     DeadlineExtended,
     Cancelled,
@@ -22,6 +23,10 @@ pub enum DataKey {
     ClaimWindow,
     Milestones,
     MilestoneVotes(u32, Address),
+    /// Weighted approval power (sum of approving pledges) for a milestone.
+    MilestoneApprovalPower(u32),
+    /// Set when the creator submits a milestone release proposal.
+    MilestoneRequested(u32),
     MilestoneReleased(u32),
     WhitelistedTokens,
     TokenPledge(Address, Address), // (pledger, token)
@@ -40,6 +45,7 @@ pub struct CrowdfundInfo {
     pub claimed: bool,
     pub cancelled: bool,
     pub tiers: Vec<TierStatus>,
+    pub stretch_goals: Vec<StretchGoalStatus>,
     pub max_pledge_per_address: Option<i128>,
 }
 
@@ -63,6 +69,23 @@ pub struct TierStatus {
     pub met: bool,
     pub max_backers: Option<u32>,
     pub current_backers: u32,
+}
+
+/// Secondary stretch goal: crossing `threshold` unlocks the described feature.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StretchGoal {
+    pub threshold: i128,
+    pub description: String,
+}
+
+/// A stretch goal plus its dynamically computed unlock status.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StretchGoalStatus {
+    pub threshold: i128,
+    pub description: String,
+    pub unlocked: bool,
 }
 
 /// Milestone for tranche-based fund release

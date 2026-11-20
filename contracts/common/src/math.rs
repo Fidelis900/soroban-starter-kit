@@ -518,6 +518,52 @@ mod tests {
     }
 
     #[test]
+    fn fixed_sqrt_scaled_edge_cases() {
+        // Zero is always zero.
+        assert_eq!(fixed_sqrt_scaled(0, 1_000_000_000), Ok(0));
+        // One in scale 10^9 is 1e-9; its sqrt is 1e-4.5, so the floor is 0.
+        assert_eq!(fixed_sqrt_scaled(1, 1_000_000_000), Ok(0));
+        // A perfect square: 4.0 -> 2.0.
+        assert_eq!(fixed_sqrt_scaled(4_000_000_000, 1_000_000_000), Ok(2_000_000_000));
+        // 9.0 -> 3.0.
+        assert_eq!(fixed_sqrt_scaled(9_000_000_000, 1_000_000_000), Ok(3_000_000_000));
+        // 1.0 -> 1.0.
+        assert_eq!(fixed_sqrt_scaled(1_000_000_000, 1_000_000_000), Ok(1_000_000_000));
+        // 0.25 -> 0.5.
+        assert_eq!(fixed_sqrt_scaled(250_000_000, 1_000_000_000), Ok(500_000_000));
+        // Invalid inputs.
+        assert_eq!(fixed_sqrt_scaled(-1, 1_000_000_000), Err(FixedPointError::InvalidScale));
+        assert_eq!(fixed_sqrt_scaled(1, 0), Err(FixedPointError::InvalidScale));
+        assert_eq!(fixed_sqrt_scaled(1, -1), Err(FixedPointError::InvalidScale));
+        // Overflow of the radicand.
+        assert_eq!(fixed_sqrt_scaled(i128::MAX, 2), Err(FixedPointError::Overflow));
+    }
+
+    #[test]
+    fn fixed_sqrt_scaled_matches_float() {
+        let scales: [i128; 3] = [10_000_000, 1_000_000_000, 1_000_000_000_000_000_000];
+        let values: [i128; 8] = [1, 2, 3, 10, 100, 1_000, 123_456, 1_000_000];
+        for &scale in scales.iter() {
+            for &v in values.iter() {
+                let val = v * scale;
+                let result = fixed_sqrt_scaled(val, scale).unwrap();
+                let expected = (val as f64).sqrt();
+                let diff = (result as f64 - expected).abs();
+                // Allow a small tolerance for floating-point rounding; the
+                // integer result should be within a few units of the float.
+                assert!(
+                    diff <= 2.0,
+                    "scale={} val={} result={} expected={}",
+                    scale,
+                    val,
+                    result,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fixed_sqrt_large_values() {
         // Largest root whose square fits in i128.
         let max_root = 13_043_817_825_332_782_212i128;
@@ -532,5 +578,15 @@ mod tests {
     fn fixed_sqrt_negative_input() {
         assert_eq!(fixed_sqrt(-1), Err(FixedPointError::NegativeInput));
         assert_eq!(fixed_sqrt(i128::MIN), Err(FixedPointError::NegativeInput));
+    }
+
+    #[test]
+    fn fixed_sqrt_scaled_large_value() {
+        // sqrt of a large perfect square in scale 10^9.
+        let scale = 1_000_000_000i128;
+        let val = 1_000_000_000_000_000_000i128; // 1e9 in scale 1e9
+        let result = fixed_sqrt_scaled(val, scale).unwrap();
+        let expected = (val as f64).sqrt();
+        assert!((result as f64 - expected).abs() <= 2.0);
     }
 }

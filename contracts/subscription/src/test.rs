@@ -9,11 +9,13 @@
 
 use soroban_sdk::{
     Address, Env, Symbol,
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     token::StellarAssetClient,
 };
 
-use crate::{SubscriptionContract, SubscriptionContractClient, SubscriptionError};
+use crate::{
+    SubscriptionContract, SubscriptionContractClient, SubscriptionError, SubscriptionStatus,
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -53,7 +55,7 @@ fn approve_and_subscribe(
     StellarAssetClient::new(env, token_addr).mint(subscriber, &allowance);
     let token_client = soroban_sdk::token::Client::new(env, token_addr);
     token_client.approve(subscriber, contract_addr, &allowance, &1_000_000);
-    client.subscribe(subscriber, plan_id, &trial_ledgers);
+    client.subscribe(subscriber, plan_id, &trial_ledgers, &None);
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────
@@ -140,7 +142,7 @@ fn test_subscribe_to_nonexistent_plan_fails() {
     let subscriber = Address::generate(&env);
     let nonexistent_plan = Symbol::new(&env, "noexist");
     
-    let result = client.try_subscribe(&subscriber, &nonexistent_plan, &None);
+    let result = client.try_subscribe(&subscriber, &nonexistent_plan, &None, &None);
     assert_eq!(result, Err(Ok(SubscriptionError::PlanNotFound)));
 }
 
@@ -154,7 +156,7 @@ fn test_subscribe_to_inactive_plan_fails() {
     client.register_plan(&basic_plan, &100, &50);
     client.set_plan_active(&basic_plan, &false);
     
-    let result = client.try_subscribe(&subscriber, &basic_plan, &None);
+    let result = client.try_subscribe(&subscriber, &basic_plan, &None, &None);
     assert_eq!(result, Err(Ok(SubscriptionError::PlanInactive)));
 }
 
@@ -168,7 +170,7 @@ fn test_subscribe_twice_fails() {
     client.register_plan(&basic_plan, &100, &50);
 
     approve_and_subscribe(&env, &client, &addr, &token, &subscriber, &basic_plan, 1_000, None);
-    let result = client.try_subscribe(&subscriber, &basic_plan, &None);
+    let result = client.try_subscribe(&subscriber, &basic_plan, &None, &None);
     assert_eq!(result, Err(Ok(SubscriptionError::AlreadySubscribed)));
 }
 
@@ -301,7 +303,7 @@ fn test_charge_insufficient_allowance_fails() {
     StellarAssetClient::new(&env, &token).mint(&subscriber, &500);
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     token_client.approve(&subscriber, &addr, &50, &1_000_000); // only 50 approved, need 100
-    client.subscribe(&subscriber, &basic_plan, &None);
+    client.subscribe(&subscriber, &basic_plan, &None, &None);
 
     env.ledger().with_mut(|l| l.sequence_number += 50);
     let result = client.try_charge(&subscriber);
@@ -378,7 +380,7 @@ fn test_resubscribe_after_cancel() {
     client.cancel(&subscriber);
 
     // Re-subscribing after cancel should succeed with a different plan.
-    let result = client.try_subscribe(&subscriber, &premium_plan, &None);
+    let result = client.try_subscribe(&subscriber, &premium_plan, &None, &None);
     assert!(result.is_ok());
 
     let info = client.get_subscription(&subscriber).unwrap();
@@ -521,4 +523,130 @@ fn test_subscribe_with_zero_trial_ledgers_skips_trial() {
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     assert_eq!(token_client.balance(&provider), 100);
     assert_eq!(token_client.balance(&subscriber), 400);
+}
+// ── issue #1353: referral credit vouchers ────────────────────────────────────
+
+#[test]
+fn test_referral_voucher_discounts_only_next_charge() {
+    let env = setup_env();
+    let (client, addr, provider, token) = setup(&env);
+    let subscriber = Address::generate(&env);
+    let plan_id = Symbol::new(&env, "pro");
+    client.register_plan(&plan_id, &1_000, &10, &0, &0);
+
+    StellarAssetClient::new(&env, &token).mint(&subscriber, &10_000);
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    token_client.approve(&subscriber, &addr, &10_000, &1_000_000);
+    client.subscribe(&subscriber, &plan_id, &None, &None);
+
+    let code = soroban_sdk::Bytes::from_slice(&env, b"REFERRAL25");
+    client.apply_voucher(&subscriber, &code, &2_500);
+    assert_eq!(client.get_voucher(&subscriber, &code), Some(2_500));
+    assert_eq!(client.get_active_voucher(&subscriber), Some((code.clone(), 2_500)));
+
+    // First invoice after the voucher is discounted by 25%.
+    env.ledger().with_mut(|li| li.sequence_number = 11);
+    assert_eq!(
+        client.charge(&subscriber, &plan_id),
+        Ok(crate::ChargeOutcome::Charged)
+    );
+    assert_eq!(token_client.balance(&provider), 750);
+    assert!(client.get_active_voucher(&subscriber).is_none());
+
+    // The voucher is consumed: the following invoice is back to full price.
+    env.ledger().with_mut(|li| li.sequence_number = 21);
+    client.charge(&subscriber, &plan_id);
+    assert_eq!(token_client.balance(&provider), 1_750);
+}
+
+#[test]
+fn test_referral_voucher_rejects_invalid_discount() {
+    let env = setup_env();
+    let (_client, _addr, _provider, _token) = setup(&env);
+    let subscriber = Address::generate(&env);
+    let client = _client;
+    let code = soroban_sdk::Bytes::from_slice(&env, b"BAD");
+    assert_eq!(
+        client.try_apply_voucher(&subscriber, &code, &10_001),
+        Err(Ok(SubscriptionError::InvalidVoucher))
+#[test]
+fn revenue_accumulates_in_escrow_and_is_withdrawn_at_threshold() {
+    let env = setup_env();
+    let (client, contract_addr, provider, token) = setup(&env);
+    let plan = Symbol::new(&env, "plan");
+    client.register_plan(&plan, &100, &10, &0, &0);
+    let subscriber = Address::generate(&env);
+    approve_and_subscribe(&env, &client, &contract_addr, &token, &subscriber, &plan, 1_000, None);
+    client.set_min_payout_threshold(&provider, &150);
+
+    client.charge(&subscriber, &plan);
+    assert_eq!(client.get_provider_revenue(&provider), 100);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 100);
+    assert_eq!(
+        client.try_withdraw_provider_revenue(&provider),
+        Err(Ok(SubscriptionError::BelowPayoutThreshold))
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.charge(&subscriber, &plan);
+    assert_eq!(client.get_provider_revenue(&provider), 200);
+    assert_eq!(client.withdraw_provider_revenue(&provider), 200);
+    assert_eq!(client.get_provider_revenue(&provider), 0);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&provider), 200);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 0);
+}
+
+#[test]
+fn due_subscriptions_are_queryable_with_advance_notice() {
+    let env = setup_env();
+    let (client, contract_addr, provider, token) = setup(&env);
+    let plan = Symbol::new(&env, "plan");
+    client.register_plan(&plan, &100, &100, &0, &0);
+    client.set_notification_window(&10);
+    let subscriber = Address::generate(&env);
+    approve_and_subscribe(&env, &client, &contract_addr, &token, &subscriber, &plan, 1_000, None);
+
+    env.ledger().with_mut(|l| l.sequence_number = 89);
+    assert_eq!(client.get_due_subscriptions(&10).len(), 0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 95);
+    let events_before = env.events().all().events().len();
+    let due = client.get_due_subscriptions(&10);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due.first().unwrap().0, subscriber);
+    assert_eq!(due.first().unwrap().2, 100);
+    assert!(env.events().all().events().len() > events_before);
+    assert_eq!(client.get_due_subscriptions(&0).len(), 0);
+}
+
+#[test]
+fn fixed_term_subscription_expires_after_max_billing_cycles() {
+    let env = setup_env();
+    let (client, contract_addr, provider, token) = setup(&env);
+    let plan = Symbol::new(&env, "plan");
+    client.register_plan(&plan, &100, &10, &0, &0);
+    let subscriber = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&subscriber, &1_000);
+    soroban_sdk::token::Client::new(&env, &token).approve(&subscriber, &contract_addr, &1_000, &1_000_000);
+    client.subscribe(&subscriber, &plan, &None, &None, &Some(2));
+
+    client.charge(&subscriber, &plan);
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.charge(&subscriber, &plan);
+    let info = client.get_subscription(&subscriber, &plan).unwrap();
+    assert_eq!(info.billing_cycles, 2);
+    assert_eq!(info.status, SubscriptionStatus::Active);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 200);
+
+    env.ledger().with_mut(|l| l.sequence_number = 20);
+    assert_eq!(client.charge(&subscriber, &plan), crate::ChargeOutcome::Skipped);
+    let info = client.get_subscription(&subscriber, &plan).unwrap();
+    assert_eq!(info.status, SubscriptionStatus::Expired);
+    assert_eq!(info.billing_cycles, 2);
+    assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&contract_addr), 200);
+    assert_eq!(client.get_due_subscriptions(&10).len(), 0);
+    assert_eq!(
+        client.try_charge(&subscriber, &plan),
+        Err(Ok(SubscriptionError::SubscriptionInactive))
+    );
 }

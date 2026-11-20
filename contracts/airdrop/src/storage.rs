@@ -12,12 +12,8 @@ pub enum DataKey {
     MerkleRoot,
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
-    /// Payment token address (instance).
-    Token,
-    /// Merkle root as a 32-byte value stored as Bytes, keyed by round (instance).
-    MerkleRoot(u32),
-    /// Whether a given address has already claimed in a given round (persistent).
-    Claimed(u32, Address),
+    /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).
+    ClaimedTier(Address, Address),
     /// The ledger sequence number after which claims are rejected (instance).
     ClaimDeadline,
     /// Optional [`VestingConfig`] applied to every claim (instance).
@@ -26,6 +22,36 @@ pub enum DataKey {
     Vesting(Address, Address),
     /// Total still-locked vesting balance of a token owed to recipients (persistent).
     TotalLocked(Address),
+    /// Emergency pause flag: when true all claims are rejected (instance).
+    Paused,
+    /// Time-decay parameters for individual claim windows (instance).
+    DecayConfig,
+    /// Address receiving the unclaimed decay remainder (instance).
+    Treasury,
+    /// Governance DAO allowed to advance the campaign to a new Merkle epoch.
+    Governance,
+    /// Current Merkle epoch (instance). Claimed bitmaps are shared across epochs.
+    Epoch,
+}
+
+/// Time-decaying claim schedule.
+///
+/// A claim made in `full_window_ledgers` after `start_ledger` receives 100% of
+/// its leaf amount. Every `decay_step_ledgers` thereafter the claimable share
+/// drops by `decay_bps_per_step` basis points, never below `floor_bps`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecayConfig {
+    /// First ledger of the campaign.
+    pub start_ledger: u32,
+    /// Number of full-reward ledgers after the start.
+    pub full_window_ledgers: u32,
+    /// Length of one decay step in ledgers.
+    pub decay_step_ledgers: u32,
+    /// Basis points removed per elapsed step.
+    pub decay_bps_per_step: u32,
+    /// Minimum claimable share in basis points.
+    pub floor_bps: u32,
 }
 
 /// Vesting parameters applied to every claim.
