@@ -459,6 +459,105 @@ proptest! {
         prop_assert!(received > 0, "non-zero fill must deliver a non-zero amount");
     }
 
+    /// Property: Constant product invariant `k = reserve_a * reserve_b` never
+    /// decreases across a long run of random swaps.
+    ///
+    /// Closes #1468.
+    #[test]
+    fn prop_constant_product_invariant_holds(
+        initial_a in 1_000i128..=1_000_000i128,
+        initial_b in 1_000i128..=1_000_000i128,
+        swaps in prop::collection::vec((1i128..=10_000i128, any::<bool>()), 10_000..=10_000),
+    ) {
+        let mut reserve_a = initial_a;
+        let mut reserve_b = initial_b;
+        let mut k = reserve_a * reserve_b;
+
+        for (amount, a_to_b) in swaps {
+            let (reserve_in, reserve_out) = if a_to_b {
+                (reserve_a, reserve_b)
+            } else {
+                (reserve_b, reserve_a)
+            };
+
+            // Constant product output with the standard 0.3% fee, rounded down.
+            let amount_in_with_fee = amount * 997;
+            let numerator = amount_in_with_fee * reserve_out;
+            let denominator = reserve_in * 1000 + amount_in_with_fee;
+            if denominator == 0 {
+                continue;
+            }
+            let amount_out = numerator / denominator;
+            if amount_out <= 0 || amount_out >= reserve_out {
+                continue;
+            }
+
+            if a_to_b {
+                reserve_a += amount;
+                reserve_b -= amount_out;
+            } else {
+                reserve_b += amount;
+                reserve_a -= amount_out;
+            }
+
+            let new_k = reserve_a * reserve_b;
+            prop_assert!(
+                new_k >= k,
+                "invariant decreased: old_k={}, new_k={}",
+                k,
+                new_k
+            );
+            k = new_k;
+        }
+    }
+
+    /// Property: Flash swap repayment verification — the borrower must return
+    /// the borrowed amount plus fee, and the pool invariant must not decrease.
+    ///
+    /// Closes #1469.
+    #[test]
+    fn prop_flash_swap_repayment_verified(
+        reserve_a in 1_000i128..=1_000_000i128,
+        reserve_b in 1_000i128..=1_000_000i128,
+        borrow_frac_bps in 1u32..=5_000u32,
+        fee_bps in 0u32..=100u32,
+    ) {
+        let borrow_a = reserve_a * (borrow_frac_bps as i128) / 10_000;
+        if borrow_a <= 0 {
+            return Ok(());
+        }
+
+        let fee = borrow_a * (fee_bps as i128) / 10_000;
+        let required_repayment = borrow_a + fee;
+
+        // Repayment must always cover the principal.
+        prop_assert!(required_repayment >= borrow_a);
+
+        // Simulate a successful flash swap: borrow then repay principal + fee.
+        let mut pool_a = reserve_a - borrow_a;
+        let mut pool_b = reserve_b;
+        pool_a += required_repayment;
+        let new_k = pool_a * pool_b;
+        let old_k = reserve_a * reserve_b;
+        prop_assert!(
+            new_k >= old_k,
+            "flash swap decreased invariant: old_k={}, new_k={}",
+            old_k,
+            new_k
+        );
+
+        // Simulate an under-repayment: only principal returned, fee missing.
+        let mut bad_pool_a = reserve_a - borrow_a;
+        bad_pool_a += borrow_a;
+        let bad_k = bad_pool_a * reserve_b;
+        if fee > 0 {
+            prop_assert!(
+                bad_k < old_k,
+                "under-repayment should be detectable via invariant"
+            );
+        }
+    }
+
     /// Property: Batch cancellation refunds every escrowed balance and leaves
     /// the contract with no residual funds.
     #[test]

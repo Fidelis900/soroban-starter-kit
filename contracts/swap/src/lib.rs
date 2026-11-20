@@ -95,6 +95,54 @@ fn require_pending(state: SwapState) -> Result<(), SwapError> {
     Ok(())
 }
 
+/// Compute the constant-product invariant `k = reserve_a * reserve_b`.
+///
+/// Uses checked multiplication so that an overflow is surfaced as a dedicated
+/// error rather than silently wrapping and corrupting the invariant check.
+fn compute_k(reserve_a: i128, reserve_b: i128) -> Result<i128, SwapError> {
+    reserve_a
+        .checked_mul(reserve_b)
+        .ok_or(SwapError::InvariantViolation)
+}
+
+/// Assert that the pool invariant did not decrease across a swap.
+///
+/// Precision rounding in swap output calculations can cause `k` to shrink
+/// slightly after a swap, which drains the pool over time. Every swap must
+/// therefore end with `new_k >= old_k`.
+fn assert_invariant_non_decreasing(
+    reserve_a_before: i128,
+    reserve_b_before: i128,
+    reserve_a_after: i128,
+    reserve_b_after: i128,
+) -> Result<(), SwapError> {
+    let old_k = compute_k(reserve_a_before, reserve_b_before)?;
+    let new_k = compute_k(reserve_a_after, reserve_b_after)?;
+    if new_k < old_k {
+        return Err(SwapError::InvariantViolation);
+    }
+    Ok(())
+}
+
+/// Callback interface invoked by [`SwapContract::flash_swap`] on the caller
+/// contract after the requested tokens have been transferred out.
+#[soroban_sdk::contractclient(name = "FlashSwapCallbackClient")]
+pub trait FlashSwapCallback {
+    /// Called by the swap contract after lending `amount_out` of `token_out`.
+    ///
+    /// The callee must ensure that by the time this returns, the swap contract
+    /// holds at least `amount_in` of `token_in` (loan plus fee) so repayment
+    /// can be verified within the same transaction.
+    fn flash_swap_callback(
+        env: Env,
+        token_in: Address,
+        amount_in: i128,
+        token_out: Address,
+        amount_out: i128,
+        callback_data: soroban_sdk::Bytes,
+    );
+}
+
 /// Atomic swap contract.
 /// Atomic two-party token swap.
 /// Computes the protocol treasury fee and validates anti-fee-evasion constraints.
@@ -514,6 +562,11 @@ mod contract {
                 .map_err(|_| SwapError::MathOverflow)?;
             ensure_valid_leg_amount(fill_amount_b)?;
 
+            // Snapshot pool reserves before any transfers so the constant-product
+            // invariant can be verified once the swap completes.
+            let reserve_a_before = token_balance(&env, &swap.token_a);
+            let reserve_b_before = token_balance(&env, &swap.token_b);
+
             let fee = calculate_and_validate_fee(fill_amount_b, fee_bps)?;
             let party_a_amount = fill_amount_b
                 .checked_sub(fee)
@@ -598,6 +651,16 @@ mod contract {
                 );
             }
 
+            // Enforce the constant-product invariant: k must never decrease.
+            let reserve_a_after = token_balance(&env, &swap.token_a);
+            let reserve_b_after = token_balance(&env, &swap.token_b);
+            assert_invariant_non_decreasing(
+                reserve_a_before,
+                reserve_b_before,
+                reserve_a_after,
+                reserve_b_after,
+            )?;
+
             swap.filled_amount = swap
                 .filled_amount
                 .checked_add(fill_amount_a)
@@ -618,6 +681,81 @@ mod contract {
             bump_instance(&env);
             events::swap_accepted(&env, &taker, swap_id, fill_amount_a);
             Ok(swap_id)
+        }
+
+        /// Execute an uncollateralized flash swap.
+        ///
+        /// The contract transfers `amount_out` of `token_out` to `caller`, then
+        /// invokes [`FlashSwapCallback::flash_swap_callback`] on `caller`. Before
+        /// the transaction concludes the contract verifies that its `token_in`
+        /// balance increased by at least `amount_in` (loan plus fee). If repayment
+        /// is insufficient the whole invocation reverts.
+        ///
+        /// # Errors
+        /// - [`SwapError::InvalidAmount`] if `amount_in` or `amount_out` <= 0.
+        /// - [`SwapError::InsufficientLiquidity`] if the pool cannot cover `amount_out`.
+        /// - [`SwapError::FlashRepaymentNotMet`] if repayment plus fee is short.
+        #[allow(clippy::too_many_arguments)]
+        pub fn flash_swap(
+            env: Env,
+            caller: Address,
+            token_in: Address,
+            amount_in: i128,
+            token_out: Address,
+            amount_out: i128,
+            callback_data: soroban_sdk::Bytes,
+        ) -> Result<(), SwapError> {
+            caller.require_auth();
+            ensure_valid_leg_amount(amount_in)?;
+            ensure_valid_leg_amount(amount_out)?;
+
+            let fee_bps: u32 = get_required(&env, &FeeBps)?;
+            let fee = calculate_and_validate_fee(amount_in, fee_bps)?;
+            let repayment_due = amount_in
+                .checked_add(fee)
+                .ok_or(SwapError::MathOverflow)?;
+
+            let reserve_in_before = token_balance(&env, &token_in);
+            let reserve_out_before = token_balance(&env, &token_out);
+            if reserve_out_before < amount_out {
+                return Err(SwapError::InsufficientLiquidity);
+            }
+
+            // Lend the requested tokens to the caller.
+            token::Client::new(&env, &token_out).transfer(
+                &env.current_contract_address(),
+                &caller,
+                &amount_out,
+            );
+
+            // Execute the caller's callback within the same transaction.
+            FlashSwapCallbackClient::new(&env, &caller).flash_swap_callback(
+                &token_in,
+                &amount_in,
+                &token_out,
+                &amount_out,
+                &callback_data,
+            );
+
+            // Verify repayment plus fee before the transaction concludes.
+            let reserve_in_after = token_balance(&env, &token_in);
+            let repaid = reserve_in_after.saturating_sub(reserve_in_before);
+            if repaid < repayment_due {
+                return Err(SwapError::FlashRepaymentNotMet);
+            }
+
+            // Enforce the constant-product invariant across the flash swap.
+            let reserve_out_after = token_balance(&env, &token_out);
+            assert_invariant_non_decreasing(
+                reserve_in_before,
+                reserve_out_before,
+                reserve_in_after,
+                reserve_out_after,
+            )?;
+
+            bump_instance(&env);
+            events::flash_swap(&env, &caller, &token_in, amount_in, &token_out, amount_out, fee);
+            Ok(())
         }
 
         /// Fill part of a swap that allows partial fills, delivering a proportional
@@ -658,6 +796,10 @@ mod contract {
                 .map_err(|_| SwapError::MathOverflow)?;
             ensure_valid_leg_amount(fill_amount_b)?;
 
+            // Snapshot reserves before transfers to verify the invariant after.
+            let reserve_a_before = token_balance(&env, &swap.token_a);
+            let reserve_b_before = token_balance(&env, &swap.token_b);
+
             token::Client::new(&env, &swap.token_b).transfer(
                 &taker,
                 &env.current_contract_address(),
@@ -673,6 +815,16 @@ mod contract {
                 &taker,
                 &fill_amount,
             );
+
+            // Enforce the constant-product invariant: k must never decrease.
+            let reserve_a_after = token_balance(&env, &swap.token_a);
+            let reserve_b_after = token_balance(&env, &swap.token_b);
+            assert_invariant_non_decreasing(
+                reserve_a_before,
+                reserve_b_before,
+                reserve_a_after,
+                reserve_b_after,
+            )?;
 
             swap.filled_amount = swap
                 .filled_amount

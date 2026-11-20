@@ -40,6 +40,10 @@ pub enum BondingCurveError {
     /// Returned when the dynamic exit-fee arithmetic overflows or produces an
     /// out-of-range fee.
     ExitFeeOverflow = 14,
+    /// Returned when a sell would reduce the real reserve balance below the
+    /// permanent virtual reserve floor, which is locked in the contract to
+    /// keep pricing formulas from dividing by zero.
+    ReserveBelowFloor = 15,
 }
 
 impl_display_error!(
@@ -60,6 +64,7 @@ impl_display_error!(
     PriceSurgeDetected   => "price surge detected: buys temporarily halted",
     InvalidSigmoidParameters => "invalid sigmoid curve parameters",
     ExitFeeOverflow      => "exit fee arithmetic overflow",
+    ReserveBelowFloor    => "sell would reduce reserve below the virtual floor",
 );
 
 #[cfg(test)]
@@ -87,9 +92,10 @@ BondingCurveError::CooldownActive = {}\n\
 BondingCurveError::CurveGraduated = {}\n\
 BondingCurveError::NotGraduated = {}\n\
 BondingCurveError::PurchaseExceedsLimit = {}\n\
-BondingCurveError::PriceSurgeDetected = {}\n",
+BondingCurveError::PriceSurgeDetected = {}\n\
 BondingCurveError::InvalidSigmoidParameters = {}\n\
-BondingCurveError::ExitFeeOverflow = {}\n",
+BondingCurveError::ExitFeeOverflow = {}\n\
+BondingCurveError::ReserveBelowFloor = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
             BondingCurveError::NotInitialized as u32,
             BondingCurveError::Unauthorized as u32,
@@ -106,6 +112,7 @@ BondingCurveError::ExitFeeOverflow = {}\n",
             BondingCurveError::PriceSurgeDetected as u32,
             BondingCurveError::InvalidSigmoidParameters as u32,
             BondingCurveError::ExitFeeOverflow as u32,
+            BondingCurveError::ReserveBelowFloor as u32,
         )
     }
 

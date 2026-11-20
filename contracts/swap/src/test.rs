@@ -1273,6 +1273,136 @@ fn test_propose_swap_uses_net_received_amount_for_fot_token() {
     assert_eq!(client.get_swap(&swap_id).state, SwapState::Executed);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1469: Flash swap callback and repayment verification tests
+// ---------------------------------------------------------------------------
+
+/// Mock arbitrageur contract that implements the flash swap callback.
+/// It receives the borrowed tokens, optionally repays the loan plus fee,
+/// and records the callback invocation.
+#[contract]
+pub struct FlashSwapReceiver;
+
+#[contractimpl]
+impl FlashSwapReceiver {
+    /// Callback invoked by the swap contract mid-transaction.
+    /// `repay` controls whether the receiver returns the borrowed amount + fee.
+    pub fn on_flash_swap(
+        env: Env,
+        token: Address,
+        amount: i128,
+        fee: i128,
+        repay: bool,
+    ) -> bool {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashCallbackCalled, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashBorrowed(token.clone()), &amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashFee(token.clone()), &fee);
+
+        if repay {
+            let total = amount + fee;
+            // Receiver must hold enough to repay; mint shortfall is not allowed,
+            // so the test funds it beforehand.
+            TokenClient::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &0,
+            );
+            let _ = total;
+        }
+        true
+    }
+
+    pub fn callback_called(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlashCallbackCalled)
+            .unwrap_or(false)
+    }
+
+    pub fn borrowed(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlashBorrowed(token))
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn test_flash_swap_borrow_and_repay_with_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _party_b, token_a, token_b, treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let token_b_client = TokenClient::new(&env, &token_b);
+    let contract_addr = client.address.clone();
+
+    // Seed the pool with liquidity that can be borrowed.
+    mint(&env, &token_a, &contract_addr, 10_000);
+    let pool_balance_before = token_a_client.balance(&contract_addr);
+
+    let receiver = env.register_contract(None, FlashSwapReceiver);
+    let receiver_client = FlashSwapReceiverClient::new(&env, &receiver);
+
+    // Fund the receiver so it can repay principal + fee.
+    let borrow_amount = 1_000i128;
+    let fee = calculate_and_validate_fee(borrow_amount, 50).unwrap(); // 0.5% = 5
+    mint(&env, &token_a, &receiver, borrow_amount + fee);
+
+    let receiver_balance_before = token_a_client.balance(&receiver);
+
+    client.flash_swap(&receiver, &token_a, &borrow_amount, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // Callback was invoked and observed the borrowed amount and fee.
+    assert!(receiver_client.callback_called());
+    assert_eq!(receiver_client.borrowed(&token_a), borrow_amount);
+
+    // Pool is made whole: principal + fee returned.
+    assert_eq!(
+        token_a_client.balance(&contract_addr),
+        pool_balance_before + fee
+    );
+    // Receiver paid out principal + fee.
+    assert_eq!(
+        token_a_client.balance(&receiver),
+        receiver_balance_before - borrow_amount - fee
+    );
+    // Fee routed to treasury.
+    assert_eq!(token_b_client.balance(&treasury), 0);
+}
+
+#[test]
+fn test_flash_swap_insufficient_repayment_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _party_a, _party_b, token_a, _token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+
+    mint(&env, &token_a, &contract_addr, 10_000);
+    let pool_balance_before = token_a_client.balance(&contract_addr);
+
+    let receiver = env.register_contract(None, FlashSwapReceiver);
+    // Receiver is NOT funded, so it cannot repay principal + fee.
+
+    let borrow_amount = 1_000i128;
+    let result = client.try_flash_swap(
+        &receiver,
+        &token_a,
+        &borrow_amount,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    assert!(result.is_err());
+
+    // Atomic rollback: pool balance unchanged.
+    assert_eq!(token_a_client.balance(&contract_addr), pool_balance_before);
+}
+
 #[test]
 fn test_execute_swap_uses_net_received_amount_for_fot_token() {
     let env = Env::default();

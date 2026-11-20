@@ -52,6 +52,23 @@ pub fn sold(
     );
 }
 
+/// Emitted when the protocol fee is deducted from a trade and routed to the
+/// treasury. `trader` is the account that paid the fee, `treasury` is the
+/// destination address, `fee_amount` is the fee in the trade's input token,
+/// and `is_buy` distinguishes purchases from sales.
+pub fn protocol_fee_collected(
+    env: &Env,
+    trader: &Address,
+    treasury: &Address,
+    fee_amount: i128,
+    is_buy: bool,
+) {
+    env.events().publish(
+        (Symbol::new(env, "protocol_fee"), trader.clone()),
+        (treasury.clone(), fee_amount, is_buy),
+    );
+}
+
 /// Emitted when the admin updates the single-transaction purchase cap.
 /// `bps` is the cap expressed in basis points of total max supply.
 pub fn max_buy_bps_set(env: &Env, admin: &Address, bps: u32) {
