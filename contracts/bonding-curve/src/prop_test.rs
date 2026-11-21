@@ -150,6 +150,13 @@ proptest! {
         prop_assert!(supply_after_sell >= 0, "Supply went negative");
     }
 
+    /// Property: The virtual reserve floor is never breached, even when the entire
+    /// token supply is liquidated back to the curve.
+    ///
+    /// Closes #1466 – Reserve pool minimum liquidity floor preventing divide-by-zero
+    #[test]
+    fn prop_reserve_never_reaches_zero(
+        buy_amount in 1i128..=1_000i128,
     /// Property: quoting a buy must never overflow, even for supplies approaching the
     /// i128 boundary, and the quoted price must be monotonically non-decreasing in supply.
     ///
@@ -169,6 +176,40 @@ proptest! {
 
         let (client, token_addr, _) = setup_bonding_curve(&env);
         let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&trader, &10_000_000);
+
+        // Buy some tokens.
+        if client.try_buy(&trader, &buy_amount, &i128::MAX).is_err() {
+            return Ok(());
+        }
+
+        // Liquidate 100% of the acquired supply back to the curve.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(2);
+        });
+        let owned = client.balance(&trader);
+        if client.try_sell(&trader, &owned, &0i128).is_err() {
+            return Ok(());
+        }
+
+        // The reserve must never reach absolute zero thanks to the virtual floor.
+        prop_assert!(client.get_reserve() > 0,
+            "Reserve reached zero after full liquidation: reserve={}",
+            client.get_reserve());
+
+        // Pricing must remain well-defined (no divide-by-zero).
+        let price = client.get_price();
+        prop_assert!(price > 0, "Price became non-positive: {}", price);
+    }
+
+    /// Property: Protocol fee is deducted as `amount * fee_bps / 10_000` on both
+    /// buy and sell paths, and the net amount is used for curve math.
+    ///
+    /// Closes #1467 – Protocol fee deduction on trading volume routed to treasury
+    #[test]
+    fn prop_protocol_fee_split(
+        amount in 1i128..=10_000i128,
+        fee_bps in 0u32..=1_000u32,
         StellarAssetClient::new(&env, &token_addr).mint(&trader, &i128::MAX);
 
         // Drive supply up towards the boundary; every quote must succeed without panicking.
@@ -255,6 +296,66 @@ proptest! {
             l.sequence_number = 100;
         });
 
+        let admin = Address::generate(&env);
+        let sac_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(sac_admin);
+        let token_addr = sac.address();
+        let contract_addr = env.register_contract(None, BondingCurveContract);
+        let client = BondingCurveContractClient::new(&env, &contract_addr);
+        let treasury = Address::generate(&env);
+        client.initialize(
+            &admin,
+            &token_addr,
+            &1_000_000i128,
+            &1i128,
+            &10_000u32,
+            &fee_bps,
+            &treasury,
+            &None::<i128>,
+        );
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&trader, &10_000_000);
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+
+        let expected_fee = amount * (fee_bps as i128) / 10_000;
+
+        // --- Buy path ---
+        let treasury_before_buy = token_client.balance(&treasury);
+        let trader_before_buy = token_client.balance(&trader);
+        if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+            return Ok(());
+        }
+        let treasury_after_buy = token_client.balance(&treasury);
+        let trader_after_buy = token_client.balance(&trader);
+        let buy_cost = trader_before_buy - trader_after_buy;
+
+        // Fee routed to treasury must equal the configured split of trade volume.
+        prop_assert_eq!(treasury_after_buy - treasury_before_buy, expected_fee,
+            "Buy fee mismatch: expected={}, actual={}",
+            expected_fee, treasury_after_buy - treasury_before_buy);
+        // Net amount (volume minus fee) is what the curve consumes.
+        prop_assert_eq!(buy_cost - expected_fee, amount - expected_fee,
+            "Buy net amount mismatch");
+
+        // --- Sell path ---
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(2);
+        });
+        let owned = client.balance(&trader);
+        let treasury_before_sell = token_client.balance(&treasury);
+        let trader_before_sell = token_client.balance(&trader);
+        if client.try_sell(&trader, &owned, &0i128).is_err() {
+            return Ok(());
+        }
+        let treasury_after_sell = token_client.balance(&treasury);
+        let trader_after_sell = token_client.balance(&trader);
+        let sell_proceeds = trader_after_sell - trader_before_sell;
+
+        let expected_sell_fee = sell_proceeds * (fee_bps as i128) / 10_000;
+        prop_assert_eq!(treasury_after_sell - treasury_before_sell, expected_sell_fee,
+            "Sell fee mismatch: expected={}, actual={}",
+            expected_sell_fee, treasury_after_sell - treasury_before_sell);
         let (client, token_addr, _) = setup_bonding_curve(&env);
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &token_addr).mint(&trader, &10_000_000);

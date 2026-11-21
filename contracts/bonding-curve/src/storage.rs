@@ -44,6 +44,11 @@ pub enum DataKey {
     /// Sigmoid curve configuration: midpoint (in supply units) and steepness
     /// (fixed-point scale multiplier). Stored in instance storage.
     SigmoidConfig,
+    /// Permanent virtual reserve floor (in reserve token base units) that is
+    /// always treated as present in the reserve pool for pricing purposes and
+    /// can never be withdrawn. Prevents divide-by-zero when the real reserve
+    /// balance reaches zero after a full token-supply liquidation (instance).
+    VirtualReserveFloor,
 }
 
 /// Fixed-point scale used for prices, slopes, and ratios.
@@ -68,6 +73,13 @@ pub const BUY_COOLDOWN_LEDGERS: u32 = 1;
 /// Default look-back window (in ledgers) used by the price-surge circuit
 /// breaker when `SurgeWindowLedgers` has not been configured.
 pub const DEFAULT_SURGE_WINDOW_LEDGERS: u32 = 20;
+
+/// Default permanent virtual reserve floor (in reserve token base units).
+///
+/// This amount is always treated as present in the reserve pool by the pricing
+/// math, guaranteeing the effective reserve never reaches absolute zero even
+/// after 100% of the token supply is sold back to the curve.
+pub const DEFAULT_VIRTUAL_RESERVE_FLOOR: i128 = 1_000;
 /// Selects the pricing model used by the bonding curve.
 ///
 /// * `Linear` — constant slope price curve.

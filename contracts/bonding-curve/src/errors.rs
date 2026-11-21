@@ -39,6 +39,11 @@ pub enum BondingCurveError {
     InvalidSigmoidParameters = 15,
     /// Returned when the dynamic exit-fee arithmetic overflows or produces an
     /// out-of-range fee.
+    ExitFeeOverflow = 14,
+    /// Returned when a sell would reduce the real reserve balance below the
+    /// permanent virtual reserve floor, which is locked in the contract to
+    /// keep pricing formulas from dividing by zero.
+    ReserveBelowFloor = 15,
     ExitFeeOverflow = 16,
     /// Returned when a buy or sell executes at a price worse than the
     /// caller-supplied slippage bound (`min_tokens_out` / `min_collateral_out`).
@@ -63,6 +68,7 @@ impl_display_error!(
     PriceSurgeDetected   => "price surge detected: buys temporarily halted",
     InvalidSigmoidParameters => "invalid sigmoid curve parameters",
     ExitFeeOverflow      => "exit fee arithmetic overflow",
+    ReserveBelowFloor    => "sell would reduce reserve below the virtual floor",
     SlippageExceeded     => "slippage tolerance exceeded",
 );
 
@@ -94,6 +100,7 @@ BondingCurveError::PurchaseExceedsLimit = {}\n\
 BondingCurveError::PriceSurgeDetected = {}\n\
 BondingCurveError::InvalidSigmoidParameters = {}\n\
 BondingCurveError::ExitFeeOverflow = {}\n\
+BondingCurveError::ReserveBelowFloor = {}\n",
 BondingCurveError::SlippageExceeded = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
             BondingCurveError::NotInitialized as u32,
@@ -111,6 +118,7 @@ BondingCurveError::SlippageExceeded = {}\n",
             BondingCurveError::PriceSurgeDetected as u32,
             BondingCurveError::InvalidSigmoidParameters as u32,
             BondingCurveError::ExitFeeOverflow as u32,
+            BondingCurveError::ReserveBelowFloor as u32,
             BondingCurveError::SlippageExceeded as u32,
         )
     }

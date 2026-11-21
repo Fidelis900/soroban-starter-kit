@@ -29,6 +29,7 @@ pub enum SwapError {
     NotCreator = 20,
     EmptyBatch = 21,
     SecretNotRevealed = 22,
+    InvariantViolated = 23,
     FeeZeroNotAllowed = 12,
     ExecutionDelayExceeded = 13,
     SwapExpired = 15,
@@ -59,6 +60,7 @@ impl_display_error!(
     NotCreator             => "caller is not the swap creator",
     EmptyBatch             => "batch must contain at least one swap",
     SecretNotRevealed      => "secret has not been revealed",
+    InvariantViolated      => "swap would decrease the pool invariant",
     SwapExpired            => "swap has expired",
     InsufficientInitialLiquidity => "insufficient initial liquidity",
 );
@@ -89,6 +91,8 @@ SwapError::HashLockMismatch = {}\n\
 SwapError::NotCreator = {}\n\
 SwapError::EmptyBatch = {}\n\
 SwapError::SecretNotRevealed = {}\n\
+SwapError::InvariantViolated = {}\n\
+SwapError::SwapExpired = {}\n",
 SwapError::SwapExpired = {}\n\
 SwapError::InsufficientInitialLiquidity = {}\n",
             SwapError::NotAuthorized as u32,
@@ -105,6 +109,7 @@ SwapError::InsufficientInitialLiquidity = {}\n",
             SwapError::NotCreator as u32,
             SwapError::EmptyBatch as u32,
             SwapError::SecretNotRevealed as u32,
+            SwapError::InvariantViolated as u32,
             SwapError::SwapExpired as u32,
             SwapError::InsufficientInitialLiquidity as u32,
         )
