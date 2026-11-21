@@ -826,3 +826,50 @@ fn batch_creation_matches_individual() {
     assert_eq!(c.client.claimable(&b1), c.client.claimable(&b2));
 }
 
+// ── #1458 change_beneficiary ─────────────────────────────────────────────────
+
+#[test]
+fn change_beneficiary_moves_schedule_and_claims_continue() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    let new_b = Address::generate(&c.env);
+    c.client.create_schedule(&b, &100, &150, &250, &1000, &true);
+
+    // Partial claim under the old key.
+    at(&c, 170);
+    assert_eq!(c.client.claim(&b), 200);
+
+    // The current beneficiary must authorize the change.
+    c.client.change_beneficiary(&b, &new_b);
+    let auths = c.env.auths();
+    assert_eq!(auths.last().unwrap().0, b);
+
+    // Schedule moved to the new address.
+    assert_eq!(c.client.get_info(&b), None);
+    let info = c.client.get_info(&new_b).unwrap();
+    assert_eq!((info.amount, info.claimed), (1000, 200));
+
+    // Old key can no longer claim; new key receives the remainder.
+    assert_eq!(
+        c.client.try_claim(&b),
+        Err(Ok(VestingError::ScheduleNotFound))
+    );
+    at(&c, 250);
+    assert_eq!(c.client.claim(&new_b), 800);
+    assert_eq!(bal(&c, &new_b), 800);
+}
+
+// ── #1459 zero-duration schedules ────────────────────────────────────────────
+
+#[test]
+fn zero_duration_schedule_rejected() {
+    let c = setup_ctx();
+    let b = Address::generate(&c.env);
+    at(&c, 100);
+    assert_eq!(
+        c.client.try_create_schedule(&b, &200, &200, &200, &1000, &true),
+        Err(Ok(VestingError::InvalidScheduleDuration))
+    );
+    assert!(c.client.get_info(&b).is_none());
+}
+

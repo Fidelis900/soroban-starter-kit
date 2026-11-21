@@ -44,6 +44,8 @@ pub enum CrowdfundError {
     MilestoneApprovalThresholdNotMet = 24,
     /// The creator has not proposed this milestone for release.
     MilestoneNotRequested = 25,
+    /// The KYC attestation hash supplied on campaign init is empty or invalid.
+    InvalidKycHash = 26,
 }
 
 impl_display_error!(
@@ -76,6 +78,7 @@ impl_display_error!(
     TokenNotWhitelisted     => "token not whitelisted for contributions",
     MilestoneApprovalThresholdNotMet => "milestone approval threshold not met",
     MilestoneNotRequested   => "milestone release has not been proposed",
+    InvalidKycHash          => "invalid or empty KYC attestation hash",
 );
 
 #[cfg(test)]
@@ -115,7 +118,8 @@ CrowdfundError::MilestoneNotFound = {}\n\
 CrowdfundError::MilestoneNotReady = {}\n\
 CrowdfundError::MilestoneAlreadyReleased = {}\n\
 CrowdfundError::InvalidTokenPrice = {}\n\
-CrowdfundError::TokenNotWhitelisted = {}\n",
+CrowdfundError::TokenNotWhitelisted = {}\n\
+CrowdfundError::InvalidKycHash = {}\n",
             CrowdfundError::AlreadyInitialized as u32,
             CrowdfundError::NotInitialized as u32,
             CrowdfundError::DeadlinePassed as u32,
@@ -142,6 +146,7 @@ CrowdfundError::TokenNotWhitelisted = {}\n",
             CrowdfundError::MilestoneAlreadyReleased as u32,
             CrowdfundError::InvalidTokenPrice as u32,
             CrowdfundError::TokenNotWhitelisted as u32,
+            CrowdfundError::InvalidKycHash as u32,
         );
     }
 

@@ -193,6 +193,9 @@ fn validate_tranches(tranches: &Vec<(u32, u32)>, now: u32) -> Result<(), Vesting
 
 /// Enforce `now <= start <= cliff < end`.
 fn validate_bounds(start: u32, cliff: u32, end: u32, now: u32) -> Result<(), VestingError> {
+    if end <= start {
+        return Err(VestingError::InvalidScheduleDuration);
+    }
     if start < now || cliff < start || end <= cliff {
         return Err(VestingError::InvalidScheduleBounds);
     }
@@ -943,6 +946,45 @@ mod contract {
             env.storage()
                 .persistent()
                 .get(&DataKey::PendingRotation(current))
+        }
+
+        /// Move the caller's schedule to `new_beneficiary`, preserving all
+        /// vesting state (amount, claimed, tranches, milestones, ...).
+        ///
+        /// The current beneficiary must authorize the call. This is the
+        /// immediate counterpart to the timelocked rotation flow, intended for
+        /// beneficiaries who still control their key and want to migrate to a
+        /// fresh address.
+        ///
+        /// # Errors
+        /// - [`VestingError::ScheduleNotFound`] if `current_beneficiary` has no schedule.
+        /// - [`VestingError::InvalidBeneficiary`] if `new_beneficiary == current_beneficiary`.
+        /// - [`VestingError::BeneficiaryAlreadyExists`] if `new_beneficiary` already has a schedule.
+        pub fn change_beneficiary(
+            env: Env,
+            current_beneficiary: Address,
+            new_beneficiary: Address,
+        ) -> Result<(), VestingError> {
+            current_beneficiary.require_auth();
+            let schedule = load_schedule(&env, &current_beneficiary)?;
+            if new_beneficiary == current_beneficiary {
+                return Err(VestingError::InvalidBeneficiary);
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Schedule(new_beneficiary.clone()))
+            {
+                return Err(VestingError::BeneficiaryAlreadyExists);
+            }
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Schedule(current_beneficiary.clone()));
+            save_schedule(&env, &new_beneficiary, &schedule);
+
+            events::beneficiary_changed(&env, &current_beneficiary, &new_beneficiary);
+            Ok(())
         }
 
         // ── Views ───────────────────────────────────────────────────────────
