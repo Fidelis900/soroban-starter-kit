@@ -3,6 +3,21 @@
 
 use soroban_sdk::{Address, BytesN, contracttype};
 
+/// Minimum LP shares permanently locked to the dead address on the first
+/// liquidity provision, mirroring Uniswap V2's `MINIMUM_LIQUIDITY`.
+pub const MINIMUM_LIQUIDITY: i128 = 1_000;
+
+/// Returns the dead address used to permanently lock minimum liquidity.
+///
+/// The address is derived from a fixed byte pattern so every deployment burns
+/// to the same unrecoverable account.
+pub fn dead_address(env: &soroban_sdk::Env) -> Address {
+    Address::from_string(&soroban_sdk::String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
+}
+
 /// Configuration and persistent swap keys.
 ///
 /// Configuration and the monotonic counter are kept in instance storage. Each
@@ -19,6 +34,16 @@ pub enum DataKey {
     FeeBps,
     Swap(u32),
     BasketSwap(u32),
+    /// Cumulative price of token0 weighted by elapsed ledgers.
+    Price0Cumulative,
+    /// Cumulative price of token1 weighted by elapsed ledgers.
+    Price1Cumulative,
+    /// Ledger sequence at which the cumulative prices were last updated.
+    LastUpdateLedger,
+    /// Reserve of token0 in the pool.
+    Reserve0,
+    /// Reserve of token1 in the pool.
+    Reserve1,
 }
 
 #[contracttype]
@@ -95,4 +120,26 @@ pub struct SwapPage {
     /// The cursor to pass to the next call to continue scanning, or `None`
     /// if the end of the swap range has been reached.
     pub next_cursor: Option<u32>,
+}
+
+/// Cumulative price accumulator state for TWAP oracle queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CumulativePrices {
+    /// Cumulative price of token0 weighted by elapsed ledgers.
+    pub price_0_cumulative: i128,
+    /// Cumulative price of token1 weighted by elapsed ledgers.
+    pub price_1_cumulative: i128,
+    /// Ledger sequence at which the accumulators were last updated.
+    pub last_update_ledger: u32,
+}
+
+/// Event payload emitted when minimum liquidity is locked on pool creation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityLocked {
+    /// Amount of LP shares permanently locked to the dead address.
+    pub amount: i128,
+    /// The dead address receiving the locked shares.
+    pub to: Address,
 }

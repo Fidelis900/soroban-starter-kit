@@ -14,10 +14,12 @@ mod storage;
 pub use errors::NftError;
 pub use storage::{DataKey, RoyaltyInfo, TokenKey, TokenMetadata};
 
-use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
 use soroban_common::{
     LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee, extend_ttl_persistent,
 };
+
+/// Maximum royalty that may be configured, in basis points (15%).
+pub const MAX_ROYALTY_BPS: u32 = 1_500;
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -183,14 +185,13 @@ mod contract {
             royalty_recipient: Option<Address>,
             soulbound: bool,
         ) -> Result<(), NftError> {
-            if env.storage().instance().has(&Initialized) {
             if env.storage().instance().has(&DataKey::Initialized) {
                 return Err(NftError::AlreadyInitialized);
             }
 
             // Validate collection-level royalty parameters.
             if let Some(bps) = royalty_bps {
-                if bps > 10_000 {
+                if bps > MAX_ROYALTY_BPS {
                     return Err(NftError::InvalidRoyalty);
                 }
                 if bps > 0 && royalty_recipient.is_none() {
@@ -208,12 +209,6 @@ mod contract {
                 env.storage()
                     .instance()
                     .set(&DataKey::MaxSupply, &max_supply);
-            env.storage().instance().set(&Admin, &admin);
-            env.storage().instance().set(&Name, &name);
-            env.storage().instance().set(&Symbol, &symbol);
-            env.storage().instance().set(&DataKey::TotalSupply, &0u32);
-            if let Some(supply) = max_supply {
-                env.storage().instance().set(&DataKey::MaxSupply, &supply);
             }
             if let Some(bps) = royalty_bps {
                 env.storage().instance().set(&DataKey::RoyaltyBps, &bps);
@@ -223,7 +218,6 @@ mod contract {
                     .instance()
                     .set(&DataKey::RoyaltyRecipient, recipient);
             }
-            env.storage().instance().set(&Initialized, &true);
             env.storage().instance().set(&DataKey::NextTokenId, &1u32);
             env.storage().instance().set(&DataKey::Soulbound, &soulbound);
             env.storage().instance().set(&DataKey::Initialized, &true);
@@ -269,24 +263,17 @@ mod contract {
             let admin: Address = env
                 .storage()
                 .instance()
-                .get(&DataKey::TotalSupply)
-                .unwrap_or(0);
-            let token_id = total.checked_add(1).ok_or(NftError::SupplyCapReached)?;
                 .get(&DataKey::Admin)
                 .ok_or(NftError::NotInitialized)?;
             admin.require_auth();
 
             if env.storage().persistent().has(&TokenKey::Owner(token_id)) {
                 return Err(NftError::TokenAlreadyMinted);
-            if let Some(max) = env.storage().instance().get::<_, u32>(&DataKey::MaxSupply) {
-                if token_id > max {
-                    return Err(NftError::SupplyCapReached);
-                }
             }
 
             // Validate per-token royalty parameters.
             if let Some(bps) = token_royalty_bps {
-                if bps > 10_000 {
+                if bps > MAX_ROYALTY_BPS {
                     return Err(NftError::InvalidRoyalty);
                 }
                 if bps > 0 && token_royalty_recipient.is_none() {
@@ -317,7 +304,6 @@ mod contract {
                 .set(&TokenKey::Uri(token_id), &token_uri);
             env.storage()
                 .instance()
-                .set(&TokenKey::Uri(token_id), &token_uri);
                 .set(&DataKey::TotalSupply, &(total + 1));
             enumerable_add(&env, &to, token_id);
 
@@ -345,9 +331,6 @@ mod contract {
                 env.storage()
                     .instance()
                     .set(&DataKey::NextTokenId, &(token_id + 1));
-                let key = TokenKey::TokenRoyaltyRecipient(token_id);
-                env.storage().persistent().set(&key, recipient);
-                extend_ttl_persistent(&env, &key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
             }
 
             set_balance(&env, &to, balance(&env, &to).saturating_add(1));
@@ -360,7 +343,12 @@ mod contract {
             Ok(())
         }
 
-        /// Mint multiple NFTs to `to` with sequential id allocation.
+        /// Mint `count` NFTs to `to` with contiguous sequential id allocation.
+        ///
+        /// `uris` must contain exactly `count` metadata URIs. Token ids are
+        /// assigned contiguously starting from the current `NextTokenId`, the
+        /// counter is advanced once, and a single batch-mint event covering the
+        /// id range is emitted.
         ///
         /// Returns the list of newly minted token ids in order.
         ///
@@ -368,11 +356,13 @@ mod contract {
         ///
         /// Returns [`NftError::NotInitialized`] if the contract has not been set up.
         /// Returns [`NftError::NotAuthorized`] if the caller is not the admin.
+        /// Returns [`NftError::InvalidTokenId`] if `uris.len() != count`.
         /// Returns [`NftError::SupplyCapReached`] if minting would exceed the max supply.
         pub fn mint_batch(
             env: Env,
             to: Address,
-            token_uris: Vec<String>,
+            count: u32,
+            uris: Vec<String>,
         ) -> Result<Vec<u32>, NftError> {
             Self::require_initialized(&env)?;
 
@@ -383,7 +373,9 @@ mod contract {
                 .ok_or(NftError::NotInitialized)?;
             admin.require_auth();
 
-            let count = token_uris.len();
+            if uris.len() != count {
+                return Err(NftError::InvalidTokenId);
+            }
             if count == 0 {
                 return Ok(Vec::new(&env));
             }
@@ -411,7 +403,7 @@ mod contract {
             let mut minted = Vec::new(&env);
             let mut new_total = total;
 
-            for uri in token_uris.iter() {
+            for uri in uris.iter() {
                 // Skip any ids already taken by explicit mint.
                 while env.storage().persistent().has(&TokenKey::Owner(next)) {
                     next = next.checked_add(1).ok_or(NftError::SupplyCapReached)?;
@@ -430,7 +422,6 @@ mod contract {
                 enumerable_add(&env, &to, token_id);
                 bump_token(&env, &TokenKey::Owner(token_id));
                 bump_token(&env, &TokenKey::Uri(token_id));
-                events::minted(&env, &to, token_id);
                 minted.push_back(token_id);
             }
 
@@ -441,6 +432,14 @@ mod contract {
                 .instance()
                 .set(&DataKey::NextTokenId, &next);
             bump_instance(&env);
+
+            // Emit a single batch-mint event covering the contiguous id range.
+            let first_id = minted.first().unwrap_or(0);
+            let last_id = minted.last().unwrap_or(0);
+            let topics = (soroban_sdk::symbol_short!("mint_batch"), to.clone());
+            env.events()
+                .publish(&topics, (first_id, last_id, count));
+
             Ok(minted)
         }
 
@@ -535,13 +534,6 @@ mod contract {
                     return Ok(None);
                 }
                 let recipient = token_recipient.ok_or(NftError::RoyaltyRecipientMissing)?;
-                #[allow(
-                    clippy::arithmetic_side_effects,
-                    clippy::as_conversions,
-                    clippy::cast_possible_truncation,
-                    clippy::integer_division
-                )]
-                let amount = (sale_price * bps as i128) / 10_000;
                 let amount = apply_bps_fee(sale_price, bps).unwrap_or(0);
                 return Ok(Some(RoyaltyInfo { recipient, amount }));
             }
@@ -556,10 +548,7 @@ mod contract {
                 if bps == 0 {
                     return Ok(None);
                 }
-                #[allow(clippy::arithmetic_side_effects, clippy::as_conversions, clippy::cast_possible_truncation, clippy::integer_division)]
-                let amount = (sale_price * bps as i128) / 10_000;
-                #[allow(clippy::arithmetic_side_effects, clippy::integer_division)]
-                let amount = (sale_price * i128::from(bps)) / 10_000;
+                let amount = apply_bps_fee(sale_price, bps).unwrap_or(0);
                 return Ok(Some(RoyaltyInfo { recipient, amount }));
             }
 
@@ -715,27 +704,12 @@ mod contract {
             token_id: u32,
         ) -> Result<(), NftError> {
             owner.require_auth();
-                return Err(NftError::NotOwner);
-            }
 
-            enumerable_remove(&env, &from, token_id);
             env.storage()
                 .persistent()
-                .set(&TokenKey::Owner(token_id), &to);
-            // Clear any approval so the previous owner's spender cannot move the
-            // token away from the new owner.
-            env.storage()
-                .instance()
-                .remove(&TokenKey::Approved(token_id));
-            bump_instance(&env);
-            enumerable_add(&env, &to, token_id);
-            // Clear any existing approval on transfer.
-            env.storage()
-                .persistent()
-                .remove(&TokenKey::Approval(token_id));
-
-            bump_token(&env, &TokenKey::Owner(token_id));
-            events::transferred(&env, &from, &to, token_id);
+                .set(&TokenKey::Approval(token_id), &spender);
+            bump_token(&env, &TokenKey::Approval(token_id));
+            events::approved(&env, &owner, &spender, token_id);
 
             Ok(())
         }
@@ -756,15 +730,6 @@ mod contract {
                 .persistent()
                 .get(&TokenKey::Owner(token_id))
                 .ok_or(NftError::TokenNotFound)?;
-            if current_owner != owner {
-                return Err(NftError::NotAuthorized);
-            }
-
-            env.storage().instance().set(
-                &TokenKey::Approval(token_id),
-                &spender,
-            );
-
             if owner != from {
                 return Err(NftError::NotOwner);
             }
@@ -787,9 +752,6 @@ mod contract {
                 .instance()
                 .set(&DataKey::TotalSupply, &total.saturating_sub(1));
 
-            env.storage()
-                .instance()
-                .set(&TokenKey::Approved(token_id), &spender);
             bump_instance(&env);
             events::burned(&env, &from, token_id);
 
@@ -970,11 +932,6 @@ mod contract {
         pub fn is_soulbound(env: Env) -> bool {
             env.storage()
                 .instance()
-                .get(&TokenKey::Uri(token_id))
-                .ok_or(NftError::TokenNotFound)
-        }
-
-        /// Get active supply (minted minus burned).
                 .get(&DataKey::Soulbound)
                 .unwrap_or(false)
         }

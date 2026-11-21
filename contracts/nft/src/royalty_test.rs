@@ -80,3 +80,92 @@ fn royalty_info_per_token_and_collection_fallback() {
     assert_eq!(collection.recipient, collection_recipient);
     assert_eq!(collection.amount, 1_000i128);
 }
+
+/// Royalty amount scales linearly with the sale price: amount == price * bps / 10_000.
+#[test]
+fn royalty_info_calculation_across_sale_prices() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let recipient = Address::generate(&env);
+    let (client, _) = init_with_collection_royalty(&env, 500, &recipient);
+
+    let owner = Address::generate(&env);
+    let token_id = client.mint(&owner, &String::from_str(&env, "ipfs://scale"), &None, &None);
+
+    // Zero sale price yields zero royalty.
+    let zero = client.royalty_info(&token_id, &0i128).unwrap();
+    assert_eq!(zero.recipient, recipient);
+    assert_eq!(zero.amount, 0i128);
+
+    // Typical sale prices: 5% of the price, floored.
+    for price in [1_000i128, 10_000, 25_000, 100_000, 1_000_000] {
+        let info = client.royalty_info(&token_id, &price).unwrap();
+        assert_eq!(info.recipient, recipient);
+        assert_eq!(info.amount, price * 500 / 10_000);
+    }
+
+    // Rounding down on non-divisible prices.
+    let odd = client.royalty_info(&token_id, &333i128).unwrap();
+    assert_eq!(odd.amount, 333i128 * 500 / 10_000);
+}
+
+/// The maximum allowed royalty (15%) is accepted and computed correctly.
+#[test]
+fn royalty_info_at_max_basis_points() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let recipient = Address::generate(&env);
+    let (client, _) = init_with_collection_royalty(&env, 1_500, &recipient);
+
+    let owner = Address::generate(&env);
+    let token_id = client.mint(&owner, &String::from_str(&env, "ipfs://max"), &None, &None);
+
+    for price in [0i128, 1_000, 10_000, 123_456] {
+        let info = client.royalty_info(&token_id, &price).unwrap();
+        assert_eq!(info.recipient, recipient);
+        assert_eq!(info.amount, price * 1_500 / 10_000);
+    }
+}
+
+/// Basis points above the 15% cap are rejected at initialization.
+#[test]
+fn initialize_rejects_royalty_above_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let addr = env.register_contract(None, NftContract);
+    let client = NftContractClient::new(&env, &addr);
+
+    let result = client.try_initialize(
+        &admin,
+        &String::from_str(&env, "Royal"),
+        &String::from_str(&env, "ROY"),
+        &None,
+        &Some(1_501u32),
+        &Some(recipient.clone()),
+    );
+    assert!(result.is_err());
+}
+
+/// Per-token basis points above the 15% cap are rejected at mint.
+#[test]
+fn mint_rejects_per_token_royalty_above_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let recipient = Address::generate(&env);
+    let (client, _) = init_with_collection_royalty(&env, 500, &recipient);
+
+    let owner = Address::generate(&env);
+    let result = client.try_mint(
+        &owner,
+        &String::from_str(&env, "ipfs://over-cap"),
+        &Some(1_501u32),
+        &Some(recipient.clone()),
+    );
+    assert!(result.is_err());
+}
