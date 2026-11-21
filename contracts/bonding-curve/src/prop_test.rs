@@ -157,6 +157,15 @@ proptest! {
     #[test]
     fn prop_reserve_never_reaches_zero(
         buy_amount in 1i128..=1_000i128,
+    /// Property: quoting a buy must never overflow, even for supplies approaching the
+    /// i128 boundary, and the quoted price must be monotonically non-decreasing in supply.
+    ///
+    /// Closes #1464 – Exponential price curve invariant validation preventing integer overflow
+    #[test]
+    fn prop_high_supply_no_overflow_and_monotonic(
+        base_supply in 0i128..=1_000_000i128,
+        step in 1i128..=1_000_000i128,
+        repeats in 1usize..=8usize,
     ) {
         let env = Env::default();
         env.mock_all_auths();
@@ -201,6 +210,84 @@ proptest! {
     fn prop_protocol_fee_split(
         amount in 1i128..=10_000i128,
         fee_bps in 0u32..=1_000u32,
+        StellarAssetClient::new(&env, &token_addr).mint(&trader, &i128::MAX);
+
+        // Drive supply up towards the boundary; every quote must succeed without panicking.
+        let mut prev_price = client.get_price();
+        let mut supply = base_supply;
+        for _ in 0..repeats {
+            let quote = client.try_quote_buy(&step);
+            prop_assert!(quote.is_ok(), "quote_buy overflowed at supply={}", supply);
+            let price = quote.unwrap().unwrap();
+            prop_assert!(price >= 0, "negative price at supply={}", supply);
+            prop_assert!(
+                price >= prev_price,
+                "price decreased with supply: {} -> {} at supply={}",
+                prev_price,
+                price,
+                supply
+            );
+            prev_price = price;
+
+            // Attempt the buy; if the curve rejects it (e.g. cap/graduation) stop growing.
+            if client.try_buy(&trader, &step, &i128::MAX).is_err() {
+                break;
+            }
+            supply = client.get_supply();
+            env.ledger().with_mut(|l| {
+                l.sequence_number = l.sequence_number.saturating_add(200);
+            });
+        }
+
+        // Final sanity: reserve and supply remain non-negative and consistent.
+        prop_assert!(client.get_reserve() >= 0, "reserve went negative");
+        prop_assert!(client.get_supply() >= 0, "supply went negative");
+    }
+
+    /// Property: a buy with `min_tokens_out` above the achievable output must always revert
+    /// with `SlippageExceeded`, while a permissive bound succeeds.
+    ///
+    /// Closes #1465 – Maximum slippage protection on continuous buy and sell orders
+    #[test]
+    fn prop_buy_slippage_bound_enforced(
+        amount in 1i128..=1_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.timestamp = 1;
+            l.sequence_number = 100;
+        });
+
+        let (client, token_addr, _) = setup_bonding_curve(&env);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&trader, &10_000_000);
+
+        // A permissive bound (zero) must succeed.
+        let ok = client.try_buy(&trader, &amount, &0i128);
+        prop_assert!(ok.is_ok(), "permissive slippage bound rejected a valid buy");
+
+        // Advance past cooldown for the second attempt.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(200);
+        });
+
+        // An impossible bound (more tokens than could ever be minted) must revert.
+        let result = client.try_buy(&trader, &amount, &i128::MAX);
+        prop_assert!(result.is_err(), "buy accepted an impossible min_tokens_out");
+        prop_assert_eq!(
+            result.unwrap_err().unwrap(),
+            crate::BondingCurveError::SlippageExceeded
+        );
+    }
+
+    /// Property: a sell with `min_collateral_out` above the achievable output must always
+    /// revert with `SlippageExceeded`, while a permissive bound succeeds.
+    ///
+    /// Closes #1465 – Maximum slippage protection on continuous buy and sell orders
+    #[test]
+    fn prop_sell_slippage_bound_enforced(
+        amount in 1i128..=1_000i128,
     ) {
         let env = Env::default();
         env.mock_all_auths();
@@ -269,6 +356,40 @@ proptest! {
         prop_assert_eq!(treasury_after_sell - treasury_before_sell, expected_sell_fee,
             "Sell fee mismatch: expected={}, actual={}",
             expected_sell_fee, treasury_after_sell - treasury_before_sell);
+        let (client, token_addr, _) = setup_bonding_curve(&env);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&trader, &10_000_000);
+
+        // Acquire tokens to sell.
+        if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+            return Ok(());
+        }
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(200);
+        });
+
+        // A permissive bound (zero) must succeed.
+        let ok = client.try_sell(&trader, &amount, &0i128);
+        prop_assert!(ok.is_ok(), "permissive slippage bound rejected a valid sell");
+
+        // Re-acquire tokens for the strict-bound attempt.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(200);
+        });
+        if client.try_buy(&trader, &amount, &i128::MAX).is_err() {
+            return Ok(());
+        }
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(200);
+        });
+
+        // An impossible bound (more collateral than the reserve holds) must revert.
+        let result = client.try_sell(&trader, &amount, &i128::MAX);
+        prop_assert!(result.is_err(), "sell accepted an impossible min_collateral_out");
+        prop_assert_eq!(
+            result.unwrap_err().unwrap(),
+            crate::BondingCurveError::SlippageExceeded
+        );
     }
 }
 

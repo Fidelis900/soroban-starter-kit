@@ -22,7 +22,9 @@ pub fn migrated_to_amm(env: &Env, amm_pool: &Address, reserve: i128, supply: i12
     );
 }
 
-/// Detailed purchase telemetry: (trader, tokens_in, tokens_out, new_spot_price, fee_paid).
+/// Detailed purchase telemetry:
+/// (trader, tokens_in, tokens_out, new_spot_price, fee_paid, min_tokens_out).
+/// `min_tokens_out` is the caller-supplied slippage bound the trade satisfied.
 pub fn bought(
     env: &Env,
     buyer: &Address,
@@ -30,14 +32,17 @@ pub fn bought(
     tokens_out: i128,
     new_spot_price: i128,
     fee_paid: i128,
+    min_tokens_out: i128,
 ) {
     env.events().publish(
         (Symbol::new(env, "bought"), buyer.clone()),
-        (tokens_in, tokens_out, new_spot_price, fee_paid),
+        (tokens_in, tokens_out, new_spot_price, fee_paid, min_tokens_out),
     );
 }
 
-/// Detailed sale telemetry: (trader, tokens_in, tokens_out, new_spot_price, fee_paid).
+/// Detailed sale telemetry:
+/// (trader, tokens_in, tokens_out, new_spot_price, fee_paid, min_collateral_out).
+/// `min_collateral_out` is the caller-supplied slippage bound the trade satisfied.
 pub fn sold(
     env: &Env,
     seller: &Address,
@@ -45,10 +50,34 @@ pub fn sold(
     tokens_out: i128,
     new_spot_price: i128,
     fee_paid: i128,
+    min_collateral_out: i128,
 ) {
     env.events().publish(
         (Symbol::new(env, "sold"), seller.clone()),
-        (tokens_in, tokens_out, new_spot_price, fee_paid),
+        (
+            tokens_in,
+            tokens_out,
+            new_spot_price,
+            fee_paid,
+            min_collateral_out,
+        ),
+    );
+}
+
+/// Emitted when a trade is rejected because the executed amount violated the
+/// caller-supplied slippage bound. `is_buy` distinguishes the direction,
+/// `expected` is the minimum acceptable amount and `actual` is the amount the
+/// curve would have delivered.
+pub fn slippage_exceeded(
+    env: &Env,
+    trader: &Address,
+    is_buy: bool,
+    expected: i128,
+    actual: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "slip_exceeded"), trader.clone()),
+        (is_buy, expected, actual),
     );
 }
 

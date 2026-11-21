@@ -36,7 +36,7 @@ pub enum BondingCurveError {
     /// Returned when sigmoid curve parameters (midpoint / steepness) are
     /// invalid, e.g. a non-positive midpoint or a steepness that would make
     /// the fixed-point integral overflow.
-    InvalidSigmoidParameters = 13,
+    InvalidSigmoidParameters = 15,
     /// Returned when the dynamic exit-fee arithmetic overflows or produces an
     /// out-of-range fee.
     ExitFeeOverflow = 14,
@@ -44,6 +44,10 @@ pub enum BondingCurveError {
     /// permanent virtual reserve floor, which is locked in the contract to
     /// keep pricing formulas from dividing by zero.
     ReserveBelowFloor = 15,
+    ExitFeeOverflow = 16,
+    /// Returned when a buy or sell executes at a price worse than the
+    /// caller-supplied slippage bound (`min_tokens_out` / `min_collateral_out`).
+    SlippageExceeded = 17,
 }
 
 impl_display_error!(
@@ -65,6 +69,7 @@ impl_display_error!(
     InvalidSigmoidParameters => "invalid sigmoid curve parameters",
     ExitFeeOverflow      => "exit fee arithmetic overflow",
     ReserveBelowFloor    => "sell would reduce reserve below the virtual floor",
+    SlippageExceeded     => "slippage tolerance exceeded",
 );
 
 #[cfg(test)]
@@ -96,6 +101,7 @@ BondingCurveError::PriceSurgeDetected = {}\n\
 BondingCurveError::InvalidSigmoidParameters = {}\n\
 BondingCurveError::ExitFeeOverflow = {}\n\
 BondingCurveError::ReserveBelowFloor = {}\n",
+BondingCurveError::SlippageExceeded = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
             BondingCurveError::NotInitialized as u32,
             BondingCurveError::Unauthorized as u32,
@@ -113,6 +119,7 @@ BondingCurveError::ReserveBelowFloor = {}\n",
             BondingCurveError::InvalidSigmoidParameters as u32,
             BondingCurveError::ExitFeeOverflow as u32,
             BondingCurveError::ReserveBelowFloor as u32,
+            BondingCurveError::SlippageExceeded as u32,
         )
     }
 

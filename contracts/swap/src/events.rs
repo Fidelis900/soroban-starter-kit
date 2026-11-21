@@ -97,6 +97,25 @@ pub fn flash_swap(
     );
 }
 
+pub fn liquidity_locked(env: &Env, dead_address: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "liquidity_locked"), dead_address.clone()),
+        amount,
+    );
+}
+
+pub fn cumulative_prices_updated(
+    env: &Env,
+    price_0_cumulative: i128,
+    price_1_cumulative: i128,
+    last_update_ledger: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "cum_prices"), ()),
+        (price_0_cumulative, price_1_cumulative, last_update_ledger),
+    );
+}
+
 pub fn swap_expired(env: &Env, swap_id: u32, creator: &Address) {
     env.events().publish(
         (Symbol::new(env, "swap_expired"), creator.clone()),

@@ -1401,6 +1401,89 @@ fn test_flash_swap_insufficient_repayment_reverts() {
 
     // Atomic rollback: pool balance unchanged.
     assert_eq!(token_a_client.balance(&contract_addr), pool_balance_before);
+// Issue #1470: Minimum liquidity lockup on initial pool creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_initial_liquidity_locks_minimum_shares_to_dead_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    let deposit = MINIMUM_LIQUIDITY + 9_000;
+    let shares = client.provide_liquidity(&party_a, &token_a, &token_b, &deposit, &deposit);
+
+    // The dead address permanently holds exactly the minimum liquidity.
+    let dead = dead_address(&env);
+    assert_eq!(client.get_lp_balance(&dead), MINIMUM_LIQUIDITY);
+    // The creator receives the remainder of the minted shares.
+    assert_eq!(client.get_lp_balance(&party_a), shares - MINIMUM_LIQUIDITY);
+    assert_eq!(shares, deposit);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_initial_liquidity_below_minimum_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    // Deposit at or below the minimum -> InsufficientInitialLiquidity (#15)
+    client.provide_liquidity(&party_a, &token_a, &token_b, &MINIMUM_LIQUIDITY, &MINIMUM_LIQUIDITY);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1471: Cumulative price accumulator (TWAP oracle) tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cumulative_prices_increase_across_swaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    let deposit = MINIMUM_LIQUIDITY + 99_000;
+    client.provide_liquidity(&party_a, &token_a, &token_b, &deposit, &deposit);
+
+    let (p0_start, p1_start) = client.get_cumulative_prices(&token_a, &token_b);
+
+    // Advance time and perform a swap so the accumulators accrue.
+    env.ledger().with_mut(|l| l.sequence_number = 110);
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    client.accept_swap(&swap_id, &party_b);
+
+    let (p0_mid, p1_mid) = client.get_cumulative_prices(&token_a, &token_b);
+    assert!(p0_mid > p0_start);
+    assert!(p1_mid > p1_start);
+
+    // Advance further and swap again; accumulators must keep increasing.
+    env.ledger().with_mut(|l| l.sequence_number = 130);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    client.accept_swap(&swap_id, &party_b);
+
+    let (p0_end, p1_end) = client.get_cumulative_prices(&token_a, &token_b);
+    assert!(p0_end > p0_mid);
+    assert!(p1_end > p1_mid);
 }
 
 #[test]

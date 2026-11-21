@@ -551,6 +551,93 @@ fn test_mint_invalid_token_royalty_bps_fails() {
     );
 }
 
+/// Royalty calculation is correct across varying sale prices (zero, typical, large).
+#[test]
+fn test_royalty_info_across_sale_prices() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let addr = env.register_contract(None, NftContract);
+    let client = NftContractClient::new(&env, &addr);
+
+    // 5 % collection royalty
+    client.initialize(
+        &admin,
+        &String::from_str(&env, "Prices"),
+        &String::from_str(&env, "PRC"),
+        &0,
+        &Some(500u32),
+        &Some(recipient.clone()),
+        &false,
+    );
+
+    let owner = Address::generate(&env);
+    client.mint(
+        &owner,
+        &1,
+        &String::from_str(&env, "ipfs://1"),
+        &None,
+        &None,
+    );
+
+    // Zero sale price → zero royalty.
+    let zero = client.royalty_info(&1, &0i128).unwrap();
+    assert_eq!(zero.recipient, recipient);
+    assert_eq!(zero.amount, 0i128);
+
+    // Typical sale price.
+    let typical = client.royalty_info(&1, &1_000i128).unwrap();
+    assert_eq!(typical.amount, 50i128); // 5 % of 1 000
+
+    // Large sale price.
+    let large = client.royalty_info(&1, &1_000_000_000i128).unwrap();
+    assert_eq!(large.amount, 50_000_000i128); // 5 % of 1e9
+}
+
+/// initialize rejects royalty_bps above the 15 % (1 500 bps) cap.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_initialize_royalty_bps_above_cap_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let addr = env.register_contract(None, NftContract);
+    let client = NftContractClient::new(&env, &addr);
+
+    client.initialize(
+        &admin,
+        &String::from_str(&env, "Cap"),
+        &String::from_str(&env, "CAP"),
+        &0,
+        &Some(1_501u32), // above 15 % cap
+        &Some(recipient),
+        &false,
+    );
+}
+
+/// mint rejects token_royalty_bps above the 15 % (1 500 bps) cap.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_mint_token_royalty_bps_above_cap_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.mint(
+        &owner,
+        &1,
+        &String::from_str(&env, "ipfs://1"),
+        &Some(1_501u32), // above 15 % cap
+        &Some(recipient),
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // Persistent storage (#1185)
@@ -612,6 +699,54 @@ fn test_mint_batch_sequential_ids() {
     assert_eq!(client.total_supply(), 3);
     assert_eq!(client.owner_of(&2), owner);
     assert_eq!(client.token_uri(&3), String::from_str(&env, "ipfs://c"));
+}
+
+/// Batch mint assigns contiguous token IDs and correct ownership for every token.
+#[test]
+fn test_mint_batch_contiguous_ids_and_ownership() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    // Pre-existing token so the batch does not start at 1.
+    client.mint(&owner, &1, &String::from_str(&env, "ipfs://pre"), &None, &None);
+
+    let mut uris = soroban_sdk::Vec::new(&env);
+    for i in 0..5u32 {
+        uris.push_back(String::from_str(&env, "ipfs://batch"));
+        let _ = i;
+    }
+
+    let ids = client.mint_batch(&owner, &uris);
+    assert_eq!(ids.len(), 5);
+    for i in 0..5u32 {
+        let id = ids.get(i).unwrap();
+        assert_eq!(id, 2 + i); // contiguous, starting after existing supply
+        assert_eq!(client.owner_of(&id), owner);
+        assert_eq!(client.token_uri(&id), String::from_str(&env, "ipfs://batch"));
+    }
+    assert_eq!(client.total_supply(), 6);
+}
+
+/// Batch mint emits a single batch event rather than one event per token.
+#[test]
+fn test_mint_batch_emits_single_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let mut uris = soroban_sdk::Vec::new(&env);
+    uris.push_back(String::from_str(&env, "ipfs://a"));
+    uris.push_back(String::from_str(&env, "ipfs://b"));
+    uris.push_back(String::from_str(&env, "ipfs://c"));
+
+    client.mint_batch(&owner, &uris);
+
+    let events = env.events().all();
+    // Exactly one event emitted by the batch mint.
+    assert_eq!(events.len(), 1);
 }
 
 #[test]

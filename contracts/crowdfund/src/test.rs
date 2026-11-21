@@ -14,6 +14,10 @@ use soroban_sdk::{
     token::StellarAssetClient,
 };
 
+fn kyc_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[9u8; 32])
+}
+
 fn setup(env: &Env) -> (CrowdfundContractClient, Address, Address, Address, Address) {
     let creator = Address::generate(env);
     let contributor1 = Address::generate(env);
@@ -56,7 +60,7 @@ fn test_stretch_goals_unlock_dynamically() {
         max_backers: None,
     });
 
-    client.initialize(&creator, &token, &goal, &deadline, &tiers, &None, &None);
+    client.initialize(&creator, &token, &goal, &deadline, &tiers, &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &1_200, &None);
     let info = client.get_info();
@@ -92,6 +96,7 @@ fn test_post_update_emits_event() {
         &soroban_sdk::Vec::new(&env),
         &None,
         &None,
+        &kyc_hash(&env),
     );
 
     let hash = BytesN::from_array(&env, &[7u8; 32]);
@@ -107,7 +112,7 @@ fn test_goal_met_creator_claims() {
 
     let deadline = env.ledger().sequence() + 100;
     let goal = 5_000_i128;
-    client.initialize(&creator, &token, &goal, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &goal, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &3_000, &None);
     client.pledge(&c2, &2_500, &None);
@@ -130,7 +135,7 @@ fn test_pledge_increments_total() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 50;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &400, &None);
     assert_eq!(client.get_info().total_pledged, 400);
@@ -146,7 +151,7 @@ fn test_withdraw_before_deadline() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 50;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &3_000, &None);
     client.withdraw(&c1);
@@ -166,7 +171,7 @@ fn test_goal_not_met_contributors_refund() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &1_000, &None);
     client.pledge(&c2, &500, &None);
@@ -188,10 +193,48 @@ fn test_pledge_after_deadline_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.pledge(&c1, &500, &None);
+}
+
+#[test]
+fn test_pledge_after_deadline_returns_campaign_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 10;
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+
+    // Advance the ledger past the campaign deadline.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    assert_eq!(
+        client.try_pledge(&c1, &500, &None),
+        Err(Ok(CrowdfundError::CampaignExpired))
+    );
+    // No funds were accepted into the expired campaign.
+    assert_eq!(client.get_pledge(&c1), 0);
+    assert_eq!(client.get_info().total_pledged, 0);
+}
+
+#[test]
+fn test_pledge_just_before_deadline_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 10;
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+
+    // Last ledger before the deadline still accepts pledges.
+    env.ledger().with_mut(|l| l.sequence_number = deadline - 1);
+    client.pledge(&c1, &500, &None);
+
+    assert_eq!(client.get_pledge(&c1), 500);
+    assert_eq!(client.get_info().total_pledged, 500);
 }
 
 #[test]
@@ -202,7 +245,7 @@ fn test_claim_before_deadline_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
     client.pledge(&c1, &1_000, &None);
     // deadline not reached
     client.claim();
@@ -216,7 +259,7 @@ fn test_claim_goal_not_met_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
     client.pledge(&c1, &100, &None);
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.claim();
@@ -230,7 +273,7 @@ fn test_refund_when_goal_met_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &500, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
     client.pledge(&c1, &1_000, &None);
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.refund(&c1);
@@ -244,8 +287,8 @@ fn test_double_initialize_fails() {
     let (client, creator, _, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +302,7 @@ fn test_cancel_campaign_before_deadline() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &3_000, &None);
     client.pledge(&c2, &2_000, &None);
@@ -286,7 +329,7 @@ fn test_cancel_campaign_after_deadline_fails() {
     let (client, creator, _, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
     client.cancel_campaign();
@@ -300,7 +343,7 @@ fn test_pledge_after_cancel_fails() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.cancel_campaign();
     client.pledge(&c1, &1_000, &None);
@@ -329,7 +372,7 @@ fn test_tier_selection_and_tracking() {
         max_backers: None,
     });
 
-    client.initialize(&creator, &token, &10_000, &deadline, &tiers, &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &tiers, &None, &None, &kyc_hash(&env));
 
     // c1 claims tier 0 (Bronze)
     client.pledge(&c1, &1_000, &Some(0));
@@ -372,7 +415,7 @@ fn test_tier_capacity_exceeded() {
     let client = CrowdfundContractClient::new(&env, &addr);
     env.mock_all_auths();
 
-    client.initialize(&creator, &token_addr, &1_000, &deadline, &tiers, &None, &None);
+    client.initialize(&creator, &token_addr, &1_000, &deadline, &tiers, &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &100, &Some(0));
     client.pledge(&c2, &100, &Some(0));
@@ -388,7 +431,7 @@ fn test_invalid_tier_id() {
     let (client, creator, c1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &1_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     // Try to claim tier 5 when no tiers exist
     client.pledge(&c1, &100, &Some(5));
@@ -405,7 +448,7 @@ fn test_refund_batch() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 10;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &500, &None);
     client.pledge(&c2, &600, &None);
@@ -431,7 +474,7 @@ fn test_refund_batch_on_cancelled_campaign() {
     let (client, creator, c1, c2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &None, &kyc_hash(&env));
 
     client.pledge(&c1, &500, &None);
     client.pledge(&c2, &600, &None);
@@ -457,7 +500,7 @@ fn milestone_release_requires_majority_of_pledged_voting_power() {
     env.mock_all_auths();
     let (client, creator, c1, c2, token) = setup(&env);
     let deadline = env.ledger().sequence() + 100;
-    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None);
+    client.initialize(&creator, &token, &10_000, &deadline, &Vec::new(&env), &None, &kyc_hash(&env));
     client.pledge(&c1, &6_000, &None);
     client.pledge(&c2, &4_000, &None);
 
@@ -503,5 +546,158 @@ fn milestone_release_requires_majority_of_pledged_voting_power() {
     assert_eq!(
         client.try_claim(),
         Err(Ok(CrowdfundError::MilestoneNotReady))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1460: Soft-cap refund deadline triggering automatic claimable status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_soft_cap_missed_enables_permissionless_refunds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, c2, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let soft_cap = 5_000_i128;
+    client.initialize(
+        &creator,
+        &token,
+        &10_000,
+        &deadline,
+        &Vec::new(&env),
+        &Some(soft_cap),
+        &None,
+        &kyc_hash(&env),
+    );
+
+    client.pledge(&c1, &1_000, &None);
+    client.pledge(&c2, &500, &None);
+
+    // Before the deadline, refunds are not available.
+    assert!(client.try_refund(&c1).is_err());
+
+    // Once the deadline passes with total_raised < soft_cap, any contributor
+    // can refund without creator intervention.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    let token_client = token::Client::new(&env, &token);
+    let before = token_client.balance(&c1);
+    client.refund(&c1);
+    assert_eq!(token_client.balance(&c1), before + 1_000);
+    assert_eq!(client.get_pledge(&c1), 0);
+
+    // A third party can trigger the refund for another contributor.
+    let before2 = token_client.balance(&c2);
+    client.refund(&c2);
+    assert_eq!(token_client.balance(&c2), before2 + 500);
+    assert_eq!(client.get_pledge(&c2), 0);
+}
+
+#[test]
+fn test_soft_cap_met_rejects_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let soft_cap = 1_000_i128;
+    client.initialize(
+        &creator,
+        &token,
+        &10_000,
+        &deadline,
+        &Vec::new(&env),
+        &Some(soft_cap),
+        &None,
+        &kyc_hash(&env),
+    );
+
+    client.pledge(&c1, &1_500, &None);
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    assert_eq!(
+        client.try_refund(&c1),
+        Err(Ok(CrowdfundError::RefundNotAvailable))
+    );
+}
+
+#[test]
+fn test_claim_rejected_when_soft_cap_not_attained() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, c1, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let soft_cap = 5_000_i128;
+    client.initialize(
+        &creator,
+        &token,
+        &10_000,
+        &deadline,
+        &Vec::new(&env),
+        &Some(soft_cap),
+        &None,
+        &kyc_hash(&env),
+    );
+
+    client.pledge(&c1, &1_000, &None);
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+
+    assert_eq!(
+        client.try_claim(),
+        Err(Ok(CrowdfundError::SoftCapNotMet))
+    );
+    assert!(!client.get_info().claimed);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1461: Creator KYC and identity verification hash storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_initialize_stores_kyc_hash() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, _, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let hash = kyc_hash(&env);
+    client.initialize(
+        &creator,
+        &token,
+        &1_000,
+        &deadline,
+        &Vec::new(&env),
+        &None,
+        &None,
+        &hash,
+    );
+
+    assert_eq!(client.get_kyc_hash(), hash);
+    assert_eq!(client.get_info().kyc_hash, hash);
+}
+
+#[test]
+fn test_initialize_rejects_empty_kyc_hash() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, _, _, token) = setup(&env);
+
+    let deadline = env.ledger().sequence() + 100;
+    let empty = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        client.try_initialize(
+            &creator,
+            &token,
+            &1_000,
+            &deadline,
+            &Vec::new(&env),
+            &None,
+            &None,
+            &empty,
+        ),
+        Err(Ok(CrowdfundError::InvalidKycHash))
     );
 }

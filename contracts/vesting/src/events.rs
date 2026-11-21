@@ -75,3 +75,12 @@ pub fn rotation_executed(env: &Env, old: &Address, new_beneficiary: &Address) {
         new_beneficiary.clone(),
     );
 }
+
+/// The beneficiary was changed directly by the current beneficiary via
+/// `change_beneficiary`.
+pub fn beneficiary_changed(env: &Env, old: &Address, new_beneficiary: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "beneficiary_changed"), old.clone()),
+        new_beneficiary.clone(),
+    );
+}

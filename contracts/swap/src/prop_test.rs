@@ -556,6 +556,86 @@ proptest! {
                 "under-repayment should be detectable via invariant"
             );
         }
+    /// Property: Cumulative price accumulators are monotonically non-decreasing
+    /// across arbitrary sequences of swaps and ledger advances, and the locked
+    /// minimum liquidity remains at the dead address.
+    #[test]
+    fn prop_cumulative_price_monotonic_and_min_liquidity_locked(
+        amount_a in 1_000i128..=100_000i128,
+        amount_b in 1_000i128..=100_000i128,
+        steps in 1usize..=10usize,
+        ledger_advance in 1u32..=100u32,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a * steps as i128);
+        mint(&env, &token_b, &party_b, amount_b * steps as i128);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 1_000_000;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let mut prev_0 = client.get_price_0_cumulative();
+        let mut prev_1 = client.get_price_1_cumulative();
+
+        for _ in 0..steps {
+            env.ledger()
+                .with_mut(|l| l.sequence_number += ledger_advance);
+
+            let _ = client.try_accept_swap_partial(&party_b, &swap_id, &amount_a);
+
+            let cur_0 = client.get_price_0_cumulative();
+            let cur_1 = client.get_price_1_cumulative();
+
+            prop_assert!(
+                cur_0 >= prev_0,
+                "price_0_cumulative decreased: {} -> {}",
+                prev_0,
+                cur_0
+            );
+            prop_assert!(
+                cur_1 >= prev_1,
+                "price_1_cumulative decreased: {} -> {}",
+                prev_1,
+                cur_1
+            );
+
+            prev_0 = cur_0;
+            prev_1 = cur_1;
+        }
+
+        // The minimum liquidity lockup must remain permanently at the dead address.
+        prop_assert!(
+            client.get_locked_liquidity() >= 1_000,
+            "minimum liquidity lockup was not established"
+        );
+        prop_assert_eq!(
+            client.get_lp_balance(&crate::dead_address(&env)),
+            client.get_locked_liquidity(),
+            "locked liquidity must remain at the dead address"
+        );
     }
 
     /// Property: Batch cancellation refunds every escrowed balance and leaves

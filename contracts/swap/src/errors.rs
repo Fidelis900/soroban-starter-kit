@@ -33,6 +33,7 @@ pub enum SwapError {
     FeeZeroNotAllowed = 12,
     ExecutionDelayExceeded = 13,
     SwapExpired = 15,
+    InsufficientInitialLiquidity = 23,
 }
 
 impl_display_error!(
@@ -61,6 +62,7 @@ impl_display_error!(
     SecretNotRevealed      => "secret has not been revealed",
     InvariantViolated      => "swap would decrease the pool invariant",
     SwapExpired            => "swap has expired",
+    InsufficientInitialLiquidity => "insufficient initial liquidity",
 );
 
 #[cfg(test)]
@@ -91,6 +93,8 @@ SwapError::EmptyBatch = {}\n\
 SwapError::SecretNotRevealed = {}\n\
 SwapError::InvariantViolated = {}\n\
 SwapError::SwapExpired = {}\n",
+SwapError::SwapExpired = {}\n\
+SwapError::InsufficientInitialLiquidity = {}\n",
             SwapError::NotAuthorized as u32,
             SwapError::SwapNotFound as u32,
             SwapError::InvalidState as u32,
@@ -107,6 +111,7 @@ SwapError::SwapExpired = {}\n",
             SwapError::SecretNotRevealed as u32,
             SwapError::InvariantViolated as u32,
             SwapError::SwapExpired as u32,
+            SwapError::InsufficientInitialLiquidity as u32,
         )
     }
 

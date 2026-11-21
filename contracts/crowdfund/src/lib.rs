@@ -35,6 +35,12 @@ fn get_instance<T: soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val>>(
         .ok_or(CrowdfundError::NotInitialized)
 }
 
+/// A campaign is considered failed once the deadline has passed and the
+/// total raised is below the soft cap (which equals the funding goal).
+fn campaign_failed(env: &Env, deadline: u32, soft_cap: i128, total_raised: i128) -> bool {
+    env.ledger().sequence() >= deadline && total_raised < soft_cap
+}
+
 /// All-or-nothing crowdfunding contract.
 ///
 /// Lifecycle:
@@ -83,6 +89,7 @@ mod contract {
             tiers: Vec<FundingTier>,
             max_pledge_per_address: Option<i128>,
             claim_window: Option<u32>,
+            kyc_hash: BytesN<32>,
         ) -> Result<(), CrowdfundError> {
             if env.storage().instance().has(&DataKey::Creator) {
                 return Err(CrowdfundError::AlreadyInitialized);
@@ -92,6 +99,9 @@ mod contract {
             }
             if deadline <= env.ledger().sequence() {
                 return Err(CrowdfundError::InvalidDeadline);
+            }
+            if kyc_hash.iter().all(|b| b == 0) {
+                return Err(CrowdfundError::InvalidKycHash);
             }
             for tier in tiers.iter() {
                 if tier.threshold <= 0 {
@@ -116,6 +126,7 @@ mod contract {
             env.storage().instance().set(&DataKey::Claimed, &false);
             env.storage().instance().set(&DataKey::Cancelled, &false);
             env.storage().instance().set(&DataKey::Tiers, &tiers);
+            env.storage().instance().set(&DataKey::KycHash, &kyc_hash);
 
             let mut stretch_goals: Vec<StretchGoal> = Vec::new(&env);
             for tier in tiers.iter() {
@@ -171,7 +182,7 @@ mod contract {
 
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
             if env.ledger().sequence() > deadline {
-                return Err(CrowdfundError::DeadlinePassed);
+                return Err(CrowdfundError::CampaignExpired);
             }
 
             let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;
@@ -397,6 +408,10 @@ mod contract {
             if total < goal {
                 return Err(CrowdfundError::GoalNotMet);
             }
+            // Soft cap (== goal) must be attained before the creator may withdraw.
+            if campaign_failed(&env, deadline, goal, total) {
+                return Err(CrowdfundError::GoalNotMet);
+            }
 
             // With milestone governance enabled the creator cannot bypass
             // contributor voting by calling `claim`. Every milestone must have
@@ -458,11 +473,13 @@ mod contract {
             let goal: i128 = get_instance(&env, &DataKey::Goal)?;
             let total: i128 = get_instance(&env, &DataKey::TotalPledged)?;
             let claimed: bool = get_instance(&env, &DataKey::Claimed)?;
-            
-            // Allow refund if:
-            // 1. Goal not met, OR
-            // 2. Goal met BUT creator failed to claim within claim window
-            if !cancelled && total >= goal {
+
+            // Permissionless refunds: once the soft-cap deadline has passed and
+            // the soft cap (== goal) was not attained, the campaign is failed and
+            // any contributor may refund without creator intervention.
+            if !cancelled && campaign_failed(&env, deadline, goal, total) {
+                // fall through to refund below
+            } else if !cancelled && total >= goal {
                 if claimed {
                     // Funds already claimed by creator
                     return Err(CrowdfundError::GoalAlreadyMet);
@@ -1004,6 +1021,15 @@ mod contract {
                 .persistent()
                 .get(&DataKey::Pledge(pledger))
                 .unwrap_or(0)
+        }
+
+        /// Return the creator's KYC attestation hash stored at initialization.
+        ///
+        /// # Errors
+        ///
+        /// - [`CrowdfundError::NotInitialized`] if not set up.
+        pub fn get_kyc_hash(env: Env) -> Result<BytesN<32>, CrowdfundError> {
+            get_instance(&env, &DataKey::KycHash)
         }
     }
 }
