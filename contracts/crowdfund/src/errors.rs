@@ -39,6 +39,9 @@ pub enum CrowdfundError {
     MilestoneNotRequested = 28,
     /// The campaign deadline has passed; pledges are no longer accepted.
     CampaignExpired = 29,
+    MilestoneNotRequested = 25,
+    /// The KYC attestation hash supplied on campaign init is empty or invalid.
+    InvalidKycHash = 26,
 }
 
 impl_display_error!(
@@ -72,6 +75,7 @@ impl_display_error!(
     MilestoneApprovalThresholdNotMet => "milestone approval threshold not met",
     MilestoneNotRequested   => "milestone release has not been proposed",
     CampaignExpired         => "campaign has expired",
+    InvalidKycHash          => "invalid or empty KYC attestation hash",
 );
 
 #[cfg(test)]
@@ -115,6 +119,7 @@ CrowdfundError::TokenNotWhitelisted = {}\n\
 CrowdfundError::MilestoneApprovalThresholdNotMet = {}\n\
 CrowdfundError::MilestoneNotRequested = {}\n\
 CrowdfundError::CampaignExpired = {}\n",
+CrowdfundError::InvalidKycHash = {}\n",
             CrowdfundError::AlreadyInitialized as u32,
             CrowdfundError::NotInitialized as u32,
             CrowdfundError::DeadlinePassed as u32,
@@ -144,6 +149,7 @@ CrowdfundError::CampaignExpired = {}\n",
             CrowdfundError::MilestoneApprovalThresholdNotMet as u32,
             CrowdfundError::MilestoneNotRequested as u32,
             CrowdfundError::CampaignExpired as u32,
+            CrowdfundError::InvalidKycHash as u32,
         );
     }
 

@@ -36,6 +36,8 @@ pub enum DataKey {
     TokenPledge(Address, Address), // (pledger, token)
     TokenTotalPledged(Address),
     OracleAddress,
+    /// Off-chain identity verification hash / credential from an approved KYC oracle.
+    KycHash,
 }
 
 #[contracttype]
@@ -51,6 +53,8 @@ pub struct CrowdfundInfo {
     pub tiers: Vec<TierStatus>,
     pub stretch_goals: Vec<StretchGoalStatus>,
     pub max_pledge_per_address: Option<i128>,
+    /// Creator's KYC attestation hash, readable on-chain by contributors.
+    pub kyc_hash: String,
 }
 
 /// A funding tier (stretch goal) settable at initialize: crossing `threshold`

@@ -1,9 +1,22 @@
 use soroban_sdk::{Address, Env, Symbol};
 
-pub fn initialized(env: &Env, creator: &Address, goal: i128, deadline: u32) {
+pub fn initialized(
+    env: &Env,
+    creator: &Address,
+    goal: i128,
+    deadline: u32,
+    kyc_hash: &soroban_sdk::BytesN<32>,
+) {
     env.events().publish(
         (Symbol::new(env, "initialized"), creator.clone()),
-        (goal, deadline),
+        (goal, deadline, kyc_hash.clone()),
+    );
+}
+
+pub fn refund_activated(env: &Env, total_raised: i128, soft_cap: i128, deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "refund_activated"),),
+        (total_raised, soft_cap, deadline),
     );
 }
 
