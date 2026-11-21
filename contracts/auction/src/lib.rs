@@ -44,10 +44,20 @@
 //! (`AlreadyEnded`) calls; outbid and compensated bidders always recover their
 //! funds with `withdraw`.
 //!
-//! # Reserve price (issue #783)
+//! # Reserve price (issues #783, #1482)
 //! An optional `reserve_price` can be set at `start`. When set, `end()` will
 //! only transfer to the seller if `highest_bid >= reserve_price`; otherwise
-//! the highest bidder's funds are returned.
+//! the item is not delivered to the bidder, the highest bidder is refunded and
+//! the escrowed NFT is returned to the seller. If the refund transfer fails it
+//! is credited to the bidder's pending balance (claimable via `withdraw`) so
+//! settlement can never stall.
+//!
+//! # Instant outbid refunds (issue #1483)
+//! When a higher bid is accepted, the previous highest bidder is refunded in
+//! the same transaction. If that push transfer fails (e.g. the recipient is
+//! frozen or deauthorized), the refund is isolated into the bidder's pending
+//! balance instead, so the new bid is still accepted and the auction keeps
+//! progressing.
 //!
 //! # Checked arithmetic (issue #1070)
 //! Every bid, refund, credit, and price computation uses checked operations
@@ -67,9 +77,6 @@
 //! `start_dutch` configures a descending-price schedule. `get_current_price`
 //! returns the linearly decaying price and `buy` settles immediately at that
 //! price.
-
-#[cfg(test)]
-extern crate std;
 
 #[cfg(test)]
 extern crate std;
@@ -179,10 +186,48 @@ fn release_nft(env: &Env, to: &Address) {
     }
 }
 
+/// Credit `amount` to `bidder`'s pending refund (claimable via `withdraw`).
+fn queue_refund(env: &Env, bidder: &Address, amount: i128) -> Result<(), AuctionError> {
+    let new_pending = pending_of(env, bidder)
+        .checked_add(amount)
+        .ok_or(AuctionError::Overflow)?;
+    set_pending(env, bidder, new_pending);
+    events::refund_queued(env, bidder, amount);
+    Ok(())
+}
+
+/// Push `amount` held in escrow back to `bidder` right away.
+///
+/// A failing transfer (frozen, deauthorized or otherwise rejecting recipient)
+/// must not block the caller, so it is isolated with `try_transfer` and the
+/// amount falls back to the bidder's pending refund (pull-over-push).
+fn refund_now(
+    env: &Env,
+    token: &Address,
+    bidder: &Address,
+    amount: i128,
+) -> Result<(), AuctionError> {
+    if amount <= 0 {
+        return Ok(());
+    }
+    let sent = token::Client::new(env, token)
+        .try_transfer(&env.current_contract_address(), bidder, &amount)
+        .is_ok_and(|r| r.is_ok());
+    if sent {
+        events::refund_sent(env, bidder, amount);
+        Ok(())
+    } else {
+        events::refund_failed(env, bidder, amount);
+        queue_refund(env, bidder, amount)
+    }
+}
+
 /// Shared English-auction bidding path for `bid` and `bid_with_credit`.
 ///
 /// All balances are computed with checked arithmetic and all storage effects
-/// are applied before the single token transfer (checks-effects-interactions).
+/// are applied before any token transfer (checks-effects-interactions): the
+/// outbid refund and the new bidder's payment both happen after the new
+/// highest bid is recorded.
 fn place_bid(
     env: &Env,
     bidder: &Address,
@@ -223,13 +268,20 @@ fn place_bid(
 
     bidder.require_auth();
 
-    // Queue previous highest bidder's refund
+    let token: Address = get_instance(env, &DataKey::Token)?;
+
+    // The previous highest bidder is refunded as soon as this bid is recorded
+    // (issue #1483). A bidder raising their own lead with `bid_with_credit`
+    // keeps the old bid as credit toward the new one instead.
     let prev_bidder: Option<Address> = env.storage().instance().get(&DataKey::HighestBidder);
+    let mut outbid_refund: Option<Address> = None;
     if let Some(prev) = prev_bidder {
-        let new_pending = pending_of(env, &prev)
-            .checked_add(highest_bid)
-            .ok_or(AuctionError::Overflow)?;
-        set_pending(env, &prev, new_pending);
+        events::outbid(env, &prev, highest_bid, amount);
+        if use_credit && prev == *bidder {
+            queue_refund(env, &prev, highest_bid)?;
+        } else {
+            outbid_refund = Some(prev);
+        }
     }
 
     // Apply pending refund credit (read after queueing so a bidder raising their
@@ -249,6 +301,11 @@ fn place_bid(
         .set(&DataKey::HighestBidder, bidder);
     env.storage().instance().set(&DataKey::HighestBid, &amount);
 
+    // Effects are recorded; now return the outbid funds still held in escrow.
+    if let Some(prev) = outbid_refund {
+        refund_now(env, &token, &prev, highest_bid)?;
+    }
+
     // Check for buy-it-now immediate settlement (issue #1294)
     let buy_it_now_price: Option<i128> = env.storage().instance().get(&DataKey::BuyItNowPrice);
     if let Some(bin_price) = buy_it_now_price {
@@ -256,12 +313,10 @@ fn place_bid(
             // Immediate settlement: mark as settled before any external calls
             env.storage().instance().set(&DataKey::Settled, &true);
             bump_instance(env);
-            
+
             let seller: Address = get_instance(env, &DataKey::Seller)?;
-            let token: Address = get_instance(env, &DataKey::Token)?;
-            
-            // Refund previous bidders (if credit was not used, transfer was already made)
-            // Transfer winning bid to seller
+
+            // Pull the winning bid into escrow, then pay it out to the seller.
             if required_transfer > 0 {
                 token::Client::new(env, &token).transfer(
                     bidder,
@@ -269,7 +324,7 @@ fn place_bid(
                     &required_transfer,
                 );
             }
-            
+
             token::Client::new(env, &token).transfer(
                 &env.current_contract_address(),
                 &seller,
@@ -315,7 +370,6 @@ fn place_bid(
     bump_instance(env);
 
     if required_transfer > 0 {
-        let token: Address = get_instance(env, &DataKey::Token)?;
         token::Client::new(env, &token).transfer(
             bidder,
             &env.current_contract_address(),
@@ -334,8 +388,9 @@ fn place_bid(
 ///   deadline, an optional `reserve_price`, an optional anti-sniping extension window,
 ///   and an optional custodial NFT.
 /// - Bidders call `bid` (or `bid_with_credit`) with increasing amounts. The previous
-///   highest bidder's funds are held as a pending refund, collectable via `withdraw`
-///   or reusable via `bid_with_credit`.
+///   highest bidder is refunded immediately; if that transfer fails the funds are
+///   held as a pending refund, collectable via `withdraw` or reusable via
+///   `bid_with_credit`.
 /// - If no bid has been placed, the seller may call `cancel` to abort the auction.
 ///   After bids exist, the seller may still cancel inside the configured
 ///   cancellation grace window by compensating the top bidder with
@@ -425,6 +480,9 @@ mod contract {
                 return Err(AuctionError::AlreadyInitialized);
             }
             if start_price <= 0 || min_increment <= 0 || cancellation_fee < 0 {
+                return Err(AuctionError::InvalidAmount);
+            }
+            if reserve_price.is_some_and(|rp| rp < 0) {
                 return Err(AuctionError::InvalidAmount);
             }
             if deadline <= env.ledger().sequence() || max_deadline < deadline {
@@ -562,26 +620,6 @@ mod contract {
             Ok(())
         }
 
-            // Queue previous highest bidder's refund
-            let prev_bidder: Option<Address> =
-                env.storage().instance().get(&DataKey::HighestBidder);
-            if let Some(prev) = prev_bidder {
-                let pending: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Pending(prev.clone()))
-                    .unwrap_or(0);
-                let new_pending = pending + highest_bid;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Pending(prev.clone()), &new_pending);
-                env.storage().persistent().extend_ttl(
-                    &DataKey::Pending(prev.clone()),
-                    LEDGER_LIFETIME_THRESHOLD,
-                    LEDGER_BUMP_AMOUNT,
-                );
-                events::outbid(&env, &prev, highest_bid, amount);
-                events::refund_queued(&env, &prev, highest_bid);
         /// Return the current Dutch auction price (issue #1071).
         ///
         /// `start_price - (start_price - floor_price) * (now - start_ledger) / duration_ledgers`,
@@ -648,7 +686,10 @@ mod contract {
         }
 
         /// Place a bid. The bid must be at least `highest_bid + min_increment`.
-        /// The previous highest bidder's funds are queued as a pending refund.
+        ///
+        /// The previous highest bidder is refunded in the same transaction
+        /// (issue #1483). If that refund transfer fails, it is credited to their
+        /// pending balance (claimable via `withdraw`) and the bid still succeeds.
         ///
         /// If the bid arrives within `extension_window` ledgers of the deadline,
         /// the deadline is extended by `extension_window` ledgers (anti-sniping).
@@ -693,9 +734,8 @@ mod contract {
         ///   refund is credited with `highest_bid + cancellation_fee`, claimable via
         ///   `withdraw`. Emits `cancelled_with_compensation` carrying
         ///   [`AuctionCancelledWithCompensation`].
-        /// Cancel the auction. Only callable by the seller and only before any bid
-        /// has been placed (English) or before the item is bought (Dutch). An
-        /// escrowed NFT is returned to the seller.
+        ///
+        /// Any escrowed NFT is returned to the seller.
         ///
         /// # Errors
         ///
@@ -740,13 +780,6 @@ mod contract {
                 .get(&DataKey::StartLedger)
                 .unwrap_or(0);
             if grace == 0 || env.ledger().sequence() > start_ledger.saturating_add(grace) {
-            // Reject if a bid has already been placed (highest_bidder is set).
-            let has_bidder: bool = env.storage().instance().has(&DataKey::HighestBidder);
-            let start_price: i128 = get_instance(&env, &DataKey::StartPrice)?;
-            let highest_bid: i128 = get_instance(&env, &DataKey::HighestBid)?;
-            // highest_bid is initialised below start_price; if it equals start_price or
-            // higher, at least one real bid was placed.
-            if has_bidder || highest_bid >= start_price {
                 return Err(AuctionError::BidAlreadyPlaced);
             }
 
@@ -804,9 +837,10 @@ mod contract {
         ///
         /// - If no bids were placed, emits `ended_no_bids`, and any escrowed NFT is
         ///   returned to the seller.
-        /// - If a reserve price was set and `highest_bid < reserve_price`, the highest
-        ///   bidder's funds are returned, the NFT goes back to the seller, and the item is
-        ///   left unsold (emits `ended_reserve_not_met`).
+        /// - If a reserve price was set and `highest_bid < reserve_price`, the item is
+        ///   not delivered to the bidder: the highest bidder is refunded (or credited a
+        ///   pending refund if the transfer fails), the NFT goes back to the seller, and
+        ///   the item is left unsold (emits `ended_reserve_not_met`).
         /// - Otherwise the seller receives the winning bid and the winner receives the
         ///   NFT in the same transaction (emits `ended`).
         ///
@@ -858,16 +892,14 @@ mod contract {
 
             let token: Address = get_instance(&env, &DataKey::Token)?;
 
-            // Reserve price check
+            // Reserve price floor (issue #1482): a bid below the reserve never wins.
+            // The asset is not delivered to the bidder, the bidder is refunded, and
+            // the escrowed NFT goes back to the seller. `Settled` is already set, so
+            // this branch runs at most once.
             let reserve_price: Option<i128> = env.storage().instance().get(&DataKey::ReservePrice);
             if let Some(rp) = reserve_price {
                 if highest_bid < rp {
-                    // Return funds to the highest bidder and the item to the seller
-                    token::Client::new(&env, &token).transfer(
-                        &env.current_contract_address(),
-                        &winner,
-                        &highest_bid,
-                    );
+                    refund_now(&env, &token, &winner, highest_bid)?;
                     release_nft(&env, &seller);
                     events::ended_reserve_not_met(&env, &winner, highest_bid, rp);
                     return Ok(());
@@ -1110,14 +1142,17 @@ mod contract {
             }
 
             bump_instance(&env);
-            events::auctions_cancelled_batch(&env, &seller, &auction_ids);
+            events::cancelled_batch(&env, &seller, &auction_ids);
             Ok(())
         }
-=======
     }
 }
 
+#[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod reserve_refund_tests;
 
 #[cfg(test)]
 mod prop_test;

@@ -45,6 +45,19 @@ pub fn refund_queued(env: &Env, bidder: &Address, amount: i128) {
         .publish((Symbol::new(env, "refund_queued"), bidder.clone()), amount);
 }
 
+/// Emitted when an outbid (or below-reserve) bidder is refunded immediately.
+pub fn refund_sent(env: &Env, bidder: &Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "refund_sent"), bidder.clone()), amount);
+}
+
+/// Emitted when an immediate refund transfer fails and the amount is credited
+/// to the bidder's pending balance instead.
+pub fn refund_failed(env: &Env, bidder: &Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "refund_failed"), bidder.clone()), amount);
+}
+
 pub fn ended(env: &Env, winner: &Address, amount: i128) {
     env.events()
         .publish((Symbol::new(env, "ended"), winner.clone()), amount);

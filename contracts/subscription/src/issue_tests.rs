@@ -31,7 +31,7 @@ fn mint_and_approve(
     let admin = token::StellarAssetClient::new(env, token_id);
     admin.mint(subscriber, &amount);
     let tc = token::Client::new(env, token_id);
-    tc.approve(subscriber, contract_id, &amount, &10000);
+    tc.approve(subscriber, contract_id, &amount, &200_000);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn test_grandfathered_rate_and_approval_required_for_increase() {
 
     client.register_plan(&plan, &100, &10, &0, &0);
     mint_and_approve(&env, &contract_id, &token_id, &subscriber, 1_000);
-    client.subscribe(&subscriber, &plan, &None, &None);
+    client.subscribe(&subscriber, &plan, &None, &None, &None);
 
     client.update_plan_amount(&plan, &150);
     let info = client.get_subscription(&subscriber, &plan).unwrap();
@@ -53,7 +53,8 @@ fn test_grandfathered_rate_and_approval_required_for_increase() {
     let outcome = client.charge(&subscriber, &plan);
     assert_eq!(outcome, ChargeOutcome::Charged);
     let tc = token::Client::new(&env, &token_id);
-    assert_eq!(tc.balance(&_provider), 100);
+    assert_eq!(tc.balance(&contract_id), 100);
+    assert_eq!(client.get_provider_revenue(&_provider), 100);
 
     client.approve_price_increase(&subscriber, &plan);
     let info = client.get_subscription(&subscriber, &plan).unwrap();
@@ -69,7 +70,7 @@ fn test_can_charge_validates_timing_balance_and_allowance() {
 
     client.register_plan(&plan, &100, &10, &0, &0);
     // subscribe but do not fund/approve
-    client.subscribe(&subscriber, &plan, &None, &None);
+    client.subscribe(&subscriber, &plan, &None, &None, &None);
 
     env.ledger().with_mut(|l| l.sequence_number += 10);
     assert!(!client.can_charge(&subscriber, &plan), "no balance/allowance");
@@ -81,6 +82,6 @@ fn test_can_charge_validates_timing_balance_and_allowance() {
     // create a fresh case for not-due check
     let subscriber2 = Address::generate(&env);
     mint_and_approve(&env, &contract_id, &token_id, &subscriber2, 1_000);
-    client.subscribe(&subscriber2, &plan, &None, &None);
+    client.subscribe(&subscriber2, &plan, &None, &None, &None);
     assert!(!client.can_charge(&subscriber2, &plan), "interval not elapsed yet");
 }
