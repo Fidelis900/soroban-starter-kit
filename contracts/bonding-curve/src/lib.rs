@@ -30,7 +30,7 @@ use storage::{BPS_DENOMINATOR, MAX_FEE_BPS, MIN_CONNECTOR_WEIGHT_BPS};
 
 use soroban_common::math::{FixedPoint, FixedPointError, apply_bps_fee};
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, extend_ttl_instance};
-use storage::{BUY_COOLDOWN_LEDGERS, CurveState, MAX_BUYS_PER_LEDGER};
+use storage::{BUY_COOLDOWN_LEDGERS, MAX_BUYS_PER_LEDGER};
 ```
 use storage::{BUY_COOLDOWN_LEDGERS, MAX_BUYS_PER_LEDGER};
 

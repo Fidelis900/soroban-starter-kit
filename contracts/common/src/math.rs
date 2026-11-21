@@ -292,6 +292,128 @@ pub fn fixed_sqrt_scaled(val: i128, scale: i128) -> Result<i128, FixedPointError
     Ok(x)
 }
 
+/// The canonical scale factor used by the Bancor-style bonding-curve helpers:
+/// `10^18`, i.e. 18 decimal places of precision.
+pub const BANCOR_SCALE: i128 = 1_000_000_000_000_000_000;
+
+/// Maximum exponent accepted by [`bancor_pow`].
+///
+/// Exponents above this bound are rejected with
+/// [`FixedPointError::Overflow`] because the repeated-squaring loop would
+/// otherwise be able to run for an unbounded number of iterations.
+pub const BANCOR_MAX_EXPONENT: u32 = 128;
+
+/// Computes `base^exponent` in the fixed-point domain, i.e. returns
+/// `(base / scale)^exponent * scale` truncated toward zero.
+///
+/// This is the core primitive for Bancor-style exponential bonding curves,
+/// where the price is `reserve_ratio^(supply / max_supply)` or similar. The
+/// computation uses exponentiation by squaring with every intermediate
+/// multiplication routed through [`scale_mul`], so all arithmetic is checked
+/// and an overflow is reported as [`FixedPointError::Overflow`] rather than
+/// panicking.
+///
+/// # Errors
+///
+/// Returns [`FixedPointError::InvalidScale`] if `scale` is not strictly
+/// positive, [`FixedPointError::NegativeInput`] if `base` is negative, and
+/// [`FixedPointError::Overflow`] if `exponent` exceeds
+/// [`BANCOR_MAX_EXPONENT`] or any intermediate product overflows `i128`.
+pub fn bancor_pow(base: i128, exponent: u32, scale: i128) -> Result<i128, FixedPointError> {
+    if scale <= 0 {
+        return Err(FixedPointError::InvalidScale);
+    }
+    if base < 0 {
+        return Err(FixedPointError::NegativeInput);
+    }
+    if exponent > BANCOR_MAX_EXPONENT {
+        return Err(FixedPointError::Overflow);
+    }
+
+    // `result` starts at 1.0 in the fixed-point domain.
+    let mut result = scale;
+    let mut factor = base;
+    let mut exp = exponent;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = scale_mul(result, factor, scale)?;
+        }
+        exp >>= 1;
+        if exp > 0 {
+            factor = scale_mul(factor, factor, scale)?;
+        }
+    }
+    Ok(result)
+}
+
+/// Computes the Bancor-style spot price for a given `supply`.
+///
+/// The curve is parameterised by a `base` price (in `scale`) and an
+/// `exponent` applied to the normalised supply. Concretely the price is
+/// `base * (1 + supply / scale)^exponent`, evaluated in the fixed-point
+/// domain. Because `1 + supply / scale` is non-negative and non-decreasing in
+/// `supply`, and `base` is non-negative, the resulting price is guaranteed to
+/// be non-decreasing in `supply` — the monotonic pricing invariant.
+///
+/// # Errors
+///
+/// Returns [`FixedPointError::InvalidScale`] if `scale` is not strictly
+/// positive, [`FixedPointError::NegativeInput`] if `base` or `supply` is
+/// negative, and [`FixedPointError::Overflow`] if the exponent is out of range
+/// or any intermediate product overflows `i128`.
+pub fn bancor_price(
+    base: i128,
+    supply: i128,
+    exponent: u32,
+    scale: i128,
+) -> Result<i128, FixedPointError> {
+    if scale <= 0 {
+        return Err(FixedPointError::InvalidScale);
+    }
+    if base < 0 || supply < 0 {
+        return Err(FixedPointError::NegativeInput);
+    }
+    // Normalised growth factor: 1.0 + supply (in scale).
+    let growth = supply.checked_add(scale).ok_or(FixedPointError::Overflow)?;
+    let factor = bancor_pow(growth, exponent, scale)?;
+    scale_mul(base, factor, scale)
+}
+
+/// Computes the Bancor-style integral (area under the curve) from `0` to
+/// `supply`, used to derive the reserve/collateral required to mint `supply`
+/// tokens.
+///
+/// For a curve `price(s) = base * (1 + s)^exponent` the integral is
+/// `base * (1 + supply)^(exponent + 1) / (exponent + 1)`. The division is
+/// performed with [`mul_div`] so the intermediate product is checked.
+///
+/// # Errors
+///
+/// Returns [`FixedPointError::InvalidScale`] if `scale` is not strictly
+/// positive, [`FixedPointError::NegativeInput`] if `base` or `supply` is
+/// negative, and [`FixedPointError::Overflow`] if the exponent is out of range
+/// or any intermediate product overflows `i128`.
+pub fn bancor_integral(
+    base: i128,
+    supply: i128,
+    exponent: u32,
+    scale: i128,
+) -> Result<i128, FixedPointError> {
+    if scale <= 0 {
+        return Err(FixedPointError::InvalidScale);
+    }
+    if base < 0 || supply < 0 {
+        return Err(FixedPointError::NegativeInput);
+    }
+    let next_exponent = exponent.checked_add(1).ok_or(FixedPointError::Overflow)?;
+    let growth = supply.checked_add(scale).ok_or(FixedPointError::Overflow)?;
+    let factor = bancor_pow(growth, next_exponent, scale)?;
+    // base * factor / (exponent + 1), all in the fixed-point domain.
+    let numerator = scale_mul(base, factor, scale)?;
+    let divisor = i128::from(next_exponent);
+    mul_div(numerator, scale, divisor)
+}
+
 /// A fixed-point value represented as an `i128` mantissa together with an
 /// `i128` scale factor.
 ///
@@ -588,5 +710,144 @@ mod tests {
         let result = fixed_sqrt_scaled(val, scale).unwrap();
         let expected = (val as f64).sqrt();
         assert!((result as f64 - expected).abs() <= 2.0);
+    }
+
+    #[test]
+    fn bancor_pow_basic() {
+        let scale = BANCOR_SCALE;
+        // Anything to the zeroth power is 1.0.
+        assert_eq!(bancor_pow(2 * scale, 0, scale), Ok(scale));
+        // 2.0^1 = 2.0.
+        assert_eq!(bancor_pow(2 * scale, 1, scale), Ok(2 * scale));
+        // 2.0^2 = 4.0.
+        assert_eq!(bancor_pow(2 * scale, 2, scale), Ok(4 * scale));
+        // 2.0^10 = 1024.0.
+        assert_eq!(bancor_pow(2 * scale, 10, scale), Ok(1024 * scale));
+        // 1.0^n = 1.0.
+        assert_eq!(bancor_pow(scale, 50, scale), Ok(scale));
+        // 0.0^n = 0.0 for n > 0.
+        assert_eq!(bancor_pow(0, 5, scale), Ok(0));
+    }
+
+    #[test]
+    fn bancor_pow_error_cases() {
+        let scale = BANCOR_SCALE;
+        assert_eq!(bancor_pow(scale, 1, 0), Err(FixedPointError::InvalidScale));
+        assert_eq!(bancor_pow(scale, 1, -1), Err(FixedPointError::InvalidScale));
+        assert_eq!(bancor_pow(-1, 1, scale), Err(FixedPointError::NegativeInput));
+        assert_eq!(
+            bancor_pow(scale, BANCOR_MAX_EXPONENT + 1, scale),
+            Err(FixedPointError::Overflow)
+        );
+        // 2.0^128 overflows i128.
+        assert_eq!(bancor_pow(2 * scale, 128, scale), Err(FixedPointError::Overflow));
+    }
+
+    #[test]
+    fn bancor_price_basic() {
+        let scale = BANCOR_SCALE;
+        // At zero supply the price equals the base price.
+        assert_eq!(bancor_price(scale, 0, 2, scale), Ok(scale));
+        // Linear curve: price = base * (1 + supply).
+        assert_eq!(bancor_price(scale, scale, 1, scale), Ok(2 * scale));
+        assert_eq!(bancor_price(scale, 2 * scale, 1, scale), Ok(3 * scale));
+        // Quadratic curve: price = base * (1 + supply)^2.
+        assert_eq!(bancor_price(scale, scale, 2, scale), Ok(4 * scale));
+    }
+
+    #[test]
+    fn bancor_price_error_cases() {
+        let scale = BANCOR_SCALE;
+        assert_eq!(bancor_price(scale, 0, 1, 0), Err(FixedPointError::InvalidScale));
+        assert_eq!(bancor_price(-1, 0, 1, scale), Err(FixedPointError::NegativeInput));
+        assert_eq!(bancor_price(scale, -1, 1, scale), Err(FixedPointError::NegativeInput));
+        assert_eq!(
+            bancor_price(scale, 0, BANCOR_MAX_EXPONENT + 1, scale),
+            Err(FixedPointError::Overflow)
+        );
+    }
+
+    #[test]
+    fn bancor_integral_basic() {
+        let scale = BANCOR_SCALE;
+        // Integral of the constant curve price = base over [0, supply] is
+        // base * supply.
+        assert_eq!(bancor_integral(scale, 0, 0, scale), Ok(0));
+        assert_eq!(bancor_integral(scale, scale, 0, scale), Ok(scale));
+        // Integral of the linear curve base * (1 + s) over [0, s] is
+        // base * (s + s^2 / 2); for s = 1 this is 1.5 * base.
+        assert_eq!(
+            bancor_integral(scale, scale, 1, scale),
+            Ok(scale + scale / 2)
+        );
+    }
+
+    #[test]
+    fn bancor_integral_error_cases() {
+        let scale = BANCOR_SCALE;
+        assert_eq!(bancor_integral(scale, 0, 1, 0), Err(FixedPointError::InvalidScale));
+        assert_eq!(bancor_integral(-1, 0, 1, scale), Err(FixedPointError::NegativeInput));
+        assert_eq!(bancor_integral(scale, -1, 1, scale), Err(FixedPointError::NegativeInput));
+        assert_eq!(
+            bancor_integral(scale, 0, BANCOR_MAX_EXPONENT, scale),
+            Err(FixedPointError::Overflow)
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The Bancor price is monotonically non-decreasing in supply.
+        #[test]
+        fn bancor_price_monotonic(
+            base in 1i128..1_000_000_000,
+            s1 in 0i128..1_000_000_000,
+            delta in 0i128..1_000_000_000,
+            exponent in 0u32..8,
+        ) {
+            let scale = 1_000_000_000i128;
+            let s2 = s1 + delta;
+            let p1 = bancor_price(base, s1, exponent, scale).unwrap();
+            let p2 = bancor_price(base, s2, exponent, scale).unwrap();
+            prop_assert!(p1 <= p2, "price decreased: p1={} p2={}", p1, p2);
+        }
+
+        /// The Bancor integral is monotonically non-decreasing in supply.
+        #[test]
+        fn bancor_integral_monotonic(
+            base in 1i128..1_000_000_000,
+            s1 in 0i128..1_000_000_000,
+            delta in 0i128..1_000_000_000,
+            exponent in 0u32..6,
+        ) {
+            let scale = 1_000_000_000i128;
+            let s2 = s1 + delta;
+            let i1 = bancor_integral(base, s1, exponent, scale).unwrap();
+            let i2 = bancor_integral(base, s2, exponent, scale).unwrap();
+            prop_assert!(i1 <= i2, "integral decreased: i1={} i2={}", i1, i2);
+        }
+
+        /// `bancor_pow` never panics on extreme inputs; it either returns a
+        /// value or an error.
+        #[test]
+        fn bancor_pow_never_panics(
+            base in prop_oneof![Just(0i128), Just(1i128), Just(i128::MAX), Just(i128::MAX / 2), Just(BANCOR_SCALE)],
+            exponent in 0u32..=BANCOR_MAX_EXPONENT,
+        ) {
+            let scale = BANCOR_SCALE;
+            let _ = bancor_pow(base, exponent, scale);
+        }
+
+        /// `bancor_price` and `bancor_integral` never panic on extreme
+        /// supplies; they either return a value or an error.
+        #[test]
+        fn bancor_curve_never_panics(
+            supply in prop_oneof![Just(0i128), Just(1i128), Just(i128::MAX), Just(i128::MAX / 2), Just(BANCOR_SCALE)],
+            exponent in 0u32..=BANCOR_MAX_EXPONENT,
+        ) {
+            let scale = BANCOR_SCALE;
+            let _ = bancor_price(scale, supply, exponent, scale);
+            let _ = bancor_integral(scale, supply, exponent, scale);
+        }
     }
 }

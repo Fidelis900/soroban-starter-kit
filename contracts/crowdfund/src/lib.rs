@@ -182,7 +182,7 @@ mod contract {
 
             let deadline: u32 = get_instance(&env, &DataKey::Deadline)?;
             if env.ledger().sequence() > deadline {
-                return Err(CrowdfundError::DeadlinePassed);
+                return Err(CrowdfundError::CampaignExpired);
             }
 
             let cancelled: bool = get_instance(&env, &DataKey::Cancelled)?;

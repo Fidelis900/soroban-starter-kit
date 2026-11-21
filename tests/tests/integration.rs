@@ -630,6 +630,134 @@ fn test_marketplace_cancel_listing() {
 
 use soroban_auction_template::{AuctionContract, AuctionContractClient};
 
+// ── #1462 / #1463: crowdfund milestone tranches & deadline enforcement ───────
+
+use soroban_crowdfund_template::{
+    CampaignStatus, ContractError, CrowdfundContract, CrowdfundContractClient, Milestone,
+};
+
+fn deploy_crowdfund<'a>(env: &'a Env) -> (CrowdfundContractClient<'a>, Address) {
+    let addr = env.register_contract(None, CrowdfundContract);
+    let client = CrowdfundContractClient::new(env, &addr);
+    (client, addr)
+}
+
+/// Full milestone-gated disbursement flow (#1462) plus post-deadline pledge
+/// rejection (#1463).
+///
+/// Verifies that:
+/// - Backers can pledge into a live campaign and funds are held by the contract.
+/// - A milestone release request opens a weighted backer vote.
+/// - Votes accumulate until the required quorum is reached.
+/// - Releasing the tranche pays the creator exactly the tranche amount while the
+///   remaining raised capital stays locked in the contract.
+/// - A pledge submitted after the campaign deadline is rejected with
+///   `ContractError::CampaignExpired`.
+#[test]
+fn test_crowdfund_milestone_approval_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let backer1 = Address::generate(&env);
+    let backer2 = Address::generate(&env);
+    let backer3 = Address::generate(&env);
+
+    // SAC token used for pledges and disbursements
+    let sac = env.register_stellar_asset_contract_v2(creator.clone());
+    let token_addr = sac.address();
+    let sac_client = StellarAssetClient::new(&env, &token_addr);
+    let token = soroban_sdk::token::Client::new(&env, &token_addr);
+
+    let pledge1 = 4_000i128;
+    let pledge2 = 3_000i128;
+    let pledge3 = 3_000i128;
+    let total_raised = pledge1 + pledge2 + pledge3; // 10 000
+    sac_client.mint(&backer1, &pledge1);
+    sac_client.mint(&backer2, &pledge2);
+    sac_client.mint(&backer3, &pledge3);
+
+    let (crowdfund, crowdfund_addr) = deploy_crowdfund(&env);
+
+    // Two milestones: 40 % then 60 % of the raise.
+    let tranche1 = 4_000i128;
+    let tranche2 = 6_000i128;
+    let mut milestones = SorobanVec::new(&env);
+    milestones.push_back(Milestone {
+        description: String::from_str(&env, "Prototype"),
+        amount: tranche1,
+        approved: false,
+        released: false,
+    });
+    milestones.push_back(Milestone {
+        description: String::from_str(&env, "Production"),
+        amount: tranche2,
+        approved: false,
+        released: false,
+    });
+
+    let deadline = env.ledger().timestamp() + 1_000;
+    let quorum_bps = 5_000u32; // 50 % of pledged weight must approve
+
+    crowdfund.initialize(
+        &creator,
+        &token_addr,
+        &total_raised,
+        &deadline,
+        &milestones,
+        &quorum_bps,
+    );
+
+    // ── Backers pledge while the campaign is live ────────────────────────
+    crowdfund.pledge(&backer1, &pledge1);
+    crowdfund.pledge(&backer2, &pledge2);
+    crowdfund.pledge(&backer3, &pledge3);
+
+    assert_eq!(token.balance(&crowdfund_addr), total_raised);
+    assert_eq!(token.balance(&creator), 0);
+    assert_eq!(crowdfund.get_status(), CampaignStatus::Funded);
+
+    // ── Request release of the first milestone tranche ───────────────────
+    crowdfund.request_milestone_release(&creator, &0u32);
+
+    // Weighted votes: backer1 (40 %) alone is below the 50 % quorum.
+    crowdfund.vote_milestone(&backer1, &0u32, &true);
+    assert!(!crowdfund.is_milestone_approved(&0u32));
+
+    // backer2 (30 %) pushes approval weight to 70 % → quorum reached.
+    crowdfund.vote_milestone(&backer2, &0u32, &true);
+    assert!(crowdfund.is_milestone_approved(&0u32));
+
+    // ── Release the approved tranche ─────────────────────────────────────
+    crowdfund.release_milestone(&creator, &0u32);
+
+    // Creator receives exactly the first tranche; the rest stays locked.
+    assert_eq!(token.balance(&creator), tranche1);
+    assert_eq!(token.balance(&crowdfund_addr), total_raised - tranche1);
+    assert_eq!(token.balance(&crowdfund_addr), tranche2);
+
+    // ── Second tranche still requires its own approval ───────────────────
+    crowdfund.request_milestone_release(&creator, &1u32);
+    crowdfund.vote_milestone(&backer3, &1u32, &true);
+    assert!(!crowdfund.is_milestone_approved(&1u32));
+    crowdfund.vote_milestone(&backer1, &1u32, &true);
+    assert!(crowdfund.is_milestone_approved(&1u32));
+
+    crowdfund.release_milestone(&creator, &1u32);
+    assert_eq!(token.balance(&creator), total_raised);
+    assert_eq!(token.balance(&crowdfund_addr), 0);
+
+    // ── #1463: pledges after the deadline are rejected ───────────────────
+    env.ledger().with_mut(|l| l.timestamp = deadline + 1);
+
+    let late_backer = Address::generate(&env);
+    sac_client.mint(&late_backer, &1_000i128);
+    let late = crowdfund.try_pledge(&late_backer, &1_000i128);
+    assert_eq!(late, Err(Ok(ContractError::CampaignExpired)));
+    assert_eq!(token.balance(&late_backer), 1_000);
+    assert_eq!(token.balance(&crowdfund_addr), 0);
+}
+
 fn deploy_auction<'a>(env: &'a Env) -> (AuctionContractClient<'a>, Address) {
     let addr = env.register_contract(None, AuctionContract);
     let client = AuctionContractClient::new(env, &addr);
