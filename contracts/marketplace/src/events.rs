@@ -1,4 +1,34 @@
-use soroban_sdk::{Address, Env, Symbol};
+// `#[contracttype]` generates undocumented public associated items.
+#![allow(missing_docs)]
+
+use soroban_sdk::{Address, Env, Symbol, contracttype};
+
+/// Payload of the `bid_cancelled` event (issue #1477), emitted when a bidder
+/// cancels an escrowed offer and the escrow is refunded.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BidCancelled {
+    /// The listing the bid was made on.
+    pub listing_id: u64,
+    /// The bidder whose escrow was refunded.
+    pub bidder: Address,
+    /// The escrowed amount returned to the bidder.
+    pub refunded_amount: i128,
+}
+
+/// Emitted when an escrowed bid is cancelled and refunded in full.
+/// Topics: (Symbol, Address) — `bid_cancelled`, bidder
+/// Data: [`BidCancelled`]
+pub fn bid_cancelled(env: &Env, listing_id: u64, bidder: &Address, refunded_amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "bid_cancelled"), bidder.clone()),
+        BidCancelled {
+            listing_id,
+            bidder: bidder.clone(),
+            refunded_amount,
+        },
+    );
+}
 
 pub fn listed(env: &Env, listing_id: u64, seller: &Address, price: i128) {
     env.events().publish(
@@ -96,6 +126,8 @@ pub fn payment_token_allowed(env: &Env, token: &Address, allowed: bool) {
 pub fn whitelist_enabled(env: &Env, enabled: bool) {
     env.events()
         .publish((Symbol::new(env, "whitelist_enabled"),), enabled);
+}
+
 pub fn collection_offer_made(
     env: &Env,
     offer_id: u64,
@@ -153,16 +185,10 @@ pub fn dutch_listed(
     );
 }
 
-pub fn dutch_sold(
-    env: &Env,
-    listing_id: u64,
-    buyer: &Address,
-    price_paid: i128,
-    refund: i128,
-) {
+pub fn dutch_sold(env: &Env, listing_id: u64, buyer: &Address, price_paid: i128) {
     env.events().publish(
         (Symbol::new(env, "dutch_sold"), listing_id),
-        (buyer.clone(), price_paid, refund),
+        (buyer.clone(), price_paid),
     );
 }
 

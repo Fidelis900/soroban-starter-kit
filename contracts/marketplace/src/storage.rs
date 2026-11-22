@@ -37,6 +37,13 @@ pub enum DataKey {
     NextBundleId,
     /// Per-bundle listing details (persistent).
     Bundle(u64),
+    /// Optional staking contract used to compute fee discounts (instance).
+    StakingContract,
+    /// Minimum counter-offer increment over the current highest offer, in
+    /// basis points, e.g. 500 = +5 % (instance).
+    MinCounterOfferBps,
+    /// Highest offer amount seen on a listing, for the counter-offer check (persistent).
+    HighestOffer(u64),
 }
 
 /// Pricing model of a listing.
@@ -45,23 +52,23 @@ pub enum DataKey {
 pub enum ListingType {
     /// A fixed asking price.
     Fixed,
-    /// A Dutch auction whose price decays linearly from `start_price` at
-    /// `start_ledger` down to `end_price` at `end_ledger`.
-    Dutch {
-        /// Price at `start_ledger`.
-        start_price: i128,
-        /// Price at (and after) `end_ledger`.
-        end_price: i128,
-        /// Ledger sequence at which the auction starts.
-        start_ledger: u32,
-        /// Ledger sequence at which the price reaches `end_price`.
-        end_ledger: u32,
-    },
-    /// Optional staking contract used to compute fee discounts (instance).
-    StakingContract,
-    /// Minimum counter-offer increment over the current highest offer, in
-    /// basis points, e.g. 500 = +5 % (instance).
-    MinCounterOfferBps,
+    /// A Dutch auction whose price decays linearly; see [`DutchConfig`].
+    Dutch(DutchConfig),
+}
+
+/// Price-decay schedule of a Dutch listing: the price falls linearly from
+/// `start_price` at `start_ledger` down to `end_price` at `end_ledger`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DutchConfig {
+    /// Price at `start_ledger`.
+    pub start_price: i128,
+    /// Price at (and after) `end_ledger`.
+    pub end_price: i128,
+    /// Ledger sequence at which the auction starts.
+    pub start_ledger: u32,
+    /// Ledger sequence at which the price reaches `end_price`.
+    pub end_ledger: u32,
 }
 
 /// An escrowed offer on a specific listing.
@@ -103,6 +110,9 @@ pub struct Listing {
     pub active: bool,
     /// Optional ledger sequence after which the listing can no longer be bought.
     pub expires_at: Option<u32>,
+    /// Optional ledger timestamp (Unix seconds) after which the listing can no
+    /// longer be bought: a purchase requires `env.ledger().timestamp() <= expiration`.
+    pub expiration: Option<u64>,
     /// Pricing model of the listing. `Fixed` listings use `price` directly;
     /// `Dutch` listings compute the spot price from the elapsed ledgers.
     pub listing_type: ListingType,
@@ -144,8 +154,6 @@ pub struct ListingParams {
     pub payment_token: Address,
     /// Optional ledger sequence after which the listing can no longer be bought.
     pub expires_at: Option<u32>,
-    /// Pricing model of the listing. Defaults to `Fixed` when omitted.
-    pub listing_type: ListingType,
 }
 
 /// A bundle listing selling several NFTs of one collection atomically.

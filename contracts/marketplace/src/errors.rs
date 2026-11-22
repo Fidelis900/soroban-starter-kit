@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketplaceError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
@@ -15,6 +15,7 @@ pub enum MarketplaceError {
     ListingInactive = 6,
     InvalidRoyalty = 7,
     InvalidExpiry = 8,
+    /// The listing's expiry (ledger sequence or timestamp) has passed.
     ListingExpired = 9,
     ListingNotExpired = 10,
     InvalidOfferAmount = 11,
@@ -25,19 +26,25 @@ pub enum MarketplaceError {
     EmptyBatch = 16,
     ListingStillActive = 17,
     Reentrant = 18,
-    PriceExceedsMax = 13,
-    CollectionOfferNotFound = 14,
-    CollectionOfferExpired = 15,
     InvalidDutchParams = 19,
     DutchNotStarted = 20,
     EmptyBundle = 21,
     DuplicateTokenId = 22,
     BundleNotFound = 23,
     BundleInactive = 24,
-    OfferExpired = 16,
-    CounterOfferTooLow = 17,
-    InvalidMinCounterOfferBps = 18,
+    PriceExceedsMax = 25,
+    CollectionOfferNotFound = 26,
+    CollectionOfferExpired = 27,
+    OfferExpired = 28,
+    CounterOfferTooLow = 29,
+    InvalidMinCounterOfferBps = 30,
+    /// `expire_offer` was called before the offer's expiration ledger.
+    OfferNotExpired = 31,
 }
+
+/// Name used by the issue tracker and external integrations for this contract's
+/// error type.
+pub type ContractError = MarketplaceError;
 
 impl_display_error!(
     MarketplaceError,
@@ -59,18 +66,19 @@ impl_display_error!(
     EmptyBatch          => "empty batch",
     ListingStillActive  => "listing still active",
     Reentrant           => "reentrant call",
-    PriceExceedsMax     => "listing price exceeds buyer max price",
-    CollectionOfferNotFound => "collection offer not found",
-    CollectionOfferExpired  => "collection offer expired",
     InvalidDutchParams  => "invalid dutch auction parameters",
     DutchNotStarted     => "dutch auction has not started",
     EmptyBundle         => "empty bundle",
     DuplicateTokenId    => "duplicate token id in bundle",
     BundleNotFound      => "bundle not found",
     BundleInactive      => "bundle inactive",
+    PriceExceedsMax     => "listing price exceeds buyer max price",
+    CollectionOfferNotFound => "collection offer not found",
+    CollectionOfferExpired  => "collection offer expired",
     OfferExpired        => "offer expired",
     CounterOfferTooLow  => "counter offer below minimum increment",
     InvalidMinCounterOfferBps => "invalid minimum counter offer bps",
+    OfferNotExpired     => "offer not expired",
 );
 
 #[cfg(test)]
@@ -102,19 +110,20 @@ MarketplaceError::SellerNotOwner = {}\n\
 MarketplaceError::BatchTooLarge = {}\n\
 MarketplaceError::EmptyBatch = {}\n\
 MarketplaceError::ListingStillActive = {}\n\
-MarketplaceError::Reentrant = {}\n",
-MarketplaceError::PriceExceedsMax = {}\n\
-MarketplaceError::CollectionOfferNotFound = {}\n\
-MarketplaceError::CollectionOfferExpired = {}\n\
+MarketplaceError::Reentrant = {}\n\
 MarketplaceError::InvalidDutchParams = {}\n\
 MarketplaceError::DutchNotStarted = {}\n\
 MarketplaceError::EmptyBundle = {}\n\
 MarketplaceError::DuplicateTokenId = {}\n\
 MarketplaceError::BundleNotFound = {}\n\
-MarketplaceError::BundleInactive = {}\n",
+MarketplaceError::BundleInactive = {}\n\
+MarketplaceError::PriceExceedsMax = {}\n\
+MarketplaceError::CollectionOfferNotFound = {}\n\
+MarketplaceError::CollectionOfferExpired = {}\n\
 MarketplaceError::OfferExpired = {}\n\
 MarketplaceError::CounterOfferTooLow = {}\n\
-MarketplaceError::InvalidMinCounterOfferBps = {}\n",
+MarketplaceError::InvalidMinCounterOfferBps = {}\n\
+MarketplaceError::OfferNotExpired = {}\n",
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
             MarketplaceError::NotAuthorized as u32,
@@ -133,18 +142,19 @@ MarketplaceError::InvalidMinCounterOfferBps = {}\n",
             MarketplaceError::EmptyBatch as u32,
             MarketplaceError::ListingStillActive as u32,
             MarketplaceError::Reentrant as u32,
-            MarketplaceError::PriceExceedsMax as u32,
-            MarketplaceError::CollectionOfferNotFound as u32,
-            MarketplaceError::CollectionOfferExpired as u32,
             MarketplaceError::InvalidDutchParams as u32,
             MarketplaceError::DutchNotStarted as u32,
             MarketplaceError::EmptyBundle as u32,
             MarketplaceError::DuplicateTokenId as u32,
             MarketplaceError::BundleNotFound as u32,
             MarketplaceError::BundleInactive as u32,
+            MarketplaceError::PriceExceedsMax as u32,
+            MarketplaceError::CollectionOfferNotFound as u32,
+            MarketplaceError::CollectionOfferExpired as u32,
             MarketplaceError::OfferExpired as u32,
             MarketplaceError::CounterOfferTooLow as u32,
             MarketplaceError::InvalidMinCounterOfferBps as u32,
+            MarketplaceError::OfferNotExpired as u32,
         )
     }
 
