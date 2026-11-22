@@ -42,9 +42,14 @@ pub fn withdrawn(env: &Env, bidder: &Address, amount: i128) {
         .publish((Symbol::new(env, "withdrawn"), bidder.clone()), amount);
 }
 
-pub fn deadline_extended(env: &Env, new_deadline: u32) {
-    env.events()
-        .publish((Symbol::new(env, "deadline_extended"),), new_deadline);
+/// Emitted when a late bid pushes the deadline back (anti-sniping). Each
+/// auction is its own contract instance, so the contract address is the
+/// auction ID.
+pub fn auction_extended(env: &Env, auction_id: &Address, new_deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "AuctionExtended"), auction_id.clone()),
+        new_deadline,
+    );
 }
 
 pub fn cancelled(env: &Env, seller: &Address) {

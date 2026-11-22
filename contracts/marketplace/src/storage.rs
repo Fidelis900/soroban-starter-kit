@@ -20,6 +20,49 @@ pub enum DataKey {
     Listing(u64),
     /// Escrowed offer amount for (listing_id, buyer) (persistent).
     Offer(u64, Address),
+    /// Platform fee in basis points taken on every sale (instance).
+    PlatformFeeBps,
+    /// Platform fee recipient address (instance).
+    PlatformFeeRecipient,
+    /// Dutch auction pricing for a listing, if it is one (persistent).
+    DutchAuction(u64),
+}
+
+/// Descending-price (Dutch auction) parameters attached to a listing.
+///
+/// The price decays linearly from `starting_price` at `start_time` to
+/// `reserve_price` at `start_time + duration`, and stays at `reserve_price`
+/// afterwards.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DutchAuction {
+    /// Price at `start_time`.
+    pub starting_price: i128,
+    /// Floor price, reached once `duration` seconds have elapsed.
+    pub reserve_price: i128,
+    /// Ledger timestamp (seconds) at which the decay starts.
+    pub start_time: u64,
+    /// Length of the decay in seconds.
+    pub duration: u64,
+}
+
+/// How a sale price is divided between seller, creator, and platform.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaleSplit {
+    /// Total paid by the buyer.
+    pub sale_price: i128,
+    /// Royalty paid to `creator`.
+    pub creator_royalty: i128,
+    /// Royalty recipient (NFT-level royalty if set, otherwise the marketplace default).
+    pub creator: Address,
+    /// Fee paid to `platform`.
+    pub platform_fee: i128,
+    /// Platform fee recipient, or `None` when no platform fee is configured.
+    pub platform: Option<Address>,
+    /// Exact remainder paid to the seller:
+    /// `sale_price - creator_royalty - platform_fee`.
+    pub seller_amount: i128,
 }
 
 /// State of a single NFT listing.

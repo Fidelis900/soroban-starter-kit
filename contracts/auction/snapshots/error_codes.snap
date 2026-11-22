@@ -11,3 +11,5 @@ AuctionError::InvalidDeadline = 10
 AuctionError::NothingToWithdraw = 11
 AuctionError::ReserveNotMet = 12
 AuctionError::BidAlreadyPlaced = 13
+AuctionError::BidIncrementTooLow = 14
+AuctionError::ArithmeticOverflow = 15

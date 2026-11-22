@@ -139,7 +139,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Ended (no bids) | `ended_no_bids` | `(Symbol,)` → event name | `()` | `end()` called with no bids |
 | Ended (reserve not met) | `ended_reserve_not_met` | `(Symbol, Address)` → event name, highest bidder | `(i128, i128)` → highest bid, reserve price | `end()` called, bid < reserve |
 | Bid Withdrawn | `withdrawn` | `(Symbol, Address)` → event name, bidder | `i128` → amount returned | `withdraw()` called by losing bidder |
-| Deadline Extended | `deadline_extended` | `(Symbol,)` → event name | `u32` → new deadline ledger | Anti-snipe window triggered during `bid()` |
+| Auction Extended | `AuctionExtended` | `(Symbol, Address)` → event name, auction ID (contract address) | `u32` → new deadline ledger | `bid()` lands within the anti-snipe window (default: final 10 ledgers, +20 ledgers) |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, seller | `()` | `cancel()` called by seller (no bids placed) |
 
 ---
@@ -203,6 +203,9 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Offer Made | `offered` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, offer amount | `make_offer()` called |
 | Offer Accepted | `offracc` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, accepted amount | `accept_offer()` called by seller |
 | Offer Cancelled | `offrcncl` | `(Symbol, u64)` → event name, listing ID | `Address` → buyer | `cancel_offer()` called by buyer |
+| Dutch Listed | `dutch_listed` | `(Symbol, u64)` → event name, listing ID | `(Address, i128, i128, u64)` → seller, starting price, reserve price, duration (s) | `list_dutch()` called |
+| Sale Split | `sale_split` | `(Symbol, u64)` → event name, listing ID | `(i128, i128, i128)` → seller amount, creator royalty, platform fee | `buy()` or `accept_offer()` settles |
+| Platform Fee Set | `platform_fee_set` | `(Symbol,)` → event name | `(u32, Address)` → fee bps, recipient | `set_platform_fee()` called by admin |
 
 > **Note:** The `cancel`, `offracc`, and `offrcncl` symbols are abbreviated to fit Soroban's 9-byte `symbol_short!` limit.
 

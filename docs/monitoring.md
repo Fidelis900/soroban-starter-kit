@@ -216,10 +216,10 @@ Events emitted by `contracts/auction`:
 | `ended_no_bids` | `Symbol("ended_no_bids")` | — | `()` |
 | `ended_reserve_not_met` | `Symbol("ended_reserve_not_met")` | `Address` (highest bidder) | `(i128 highest_bid, i128 reserve_price)` |
 | `withdrawn` | `Symbol("withdrawn")` | `Address` (bidder) | `i128` (amount) |
-| `deadline_extended` | `Symbol("deadline_extended")` | — | `u32` (new deadline) |
+| `AuctionExtended` | `Symbol("AuctionExtended")` | `Address` (auction contract) | `u32` (new deadline) |
 | `cancelled` | `Symbol("cancelled")` | `Address` (seller) | `()` |
 
-`deadline_extended` fires whenever a bid lands inside the anti-sniping `extension_window`; a monitoring job tracking auction end times should re-read `get_info().deadline` after each `bid_placed` rather than caching the value from `started`.
+`AuctionExtended` fires whenever a bid lands inside the anti-sniping window (by default the final 10 ledgers, extending the deadline by 20; a non-zero `extension_window` overrides both); a monitoring job tracking auction end times should re-read `get_info().deadline` after each `bid_placed` rather than caching the value from `started`.
 
 ### Ballot Contract Events
 

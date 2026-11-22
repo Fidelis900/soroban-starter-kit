@@ -6,6 +6,17 @@
 //! payment to the seller and the asset to the buyer in one transaction.
 //! Sellers may also set an optional expiry on a listing, and buyers may
 //! propose a lower price via an escrowed offer that the seller can accept.
+//!
+//! # Dutch auctions
+//! `list_dutch` creates a descending-price listing whose price decays linearly
+//! from `starting_price` to `reserve_price` over `duration` seconds of ledger
+//! time, then stays at `reserve_price`. `buy` charges the current price.
+//!
+//! # 3-way sale split
+//! Every sale (`buy` or `accept_offer`) is split atomically between the creator
+//! royalty (NFT-level `royalty_info`, falling back to the marketplace default),
+//! an optional platform fee configured via `set_platform_fee`, and the seller,
+//! who receives the exact remainder so no funds are stranded by rounding.
 
 use soroban_sdk::{Address, Env, Vec, contract, contractclient, contractimpl, contracttype, token};
 
@@ -14,11 +25,55 @@ mod events;
 mod storage;
 
 pub use errors::MarketplaceError;
-pub use storage::{DataKey, Listing, ListingEntry, ListingPage};
+pub use storage::{DataKey, DutchAuction, Listing, ListingEntry, ListingPage, SaleSplit};
 
 /// Maximum number of listings a single [`MarketplaceContract::get_active_listings`] call
 /// may return, regardless of the requested `limit`.
 pub const MAX_LISTINGS_PAGE_SIZE: u32 = 50;
+
+/// Basis-point denominator (10 000 bps = 100 %).
+const BPS_DENOMINATOR: i128 = 10_000;
+
+/// `amount * bps / 10_000`, rounded down, with checked arithmetic.
+fn bps_of(amount: i128, bps: u32) -> Result<i128, MarketplaceError> {
+    amount
+        .checked_mul(i128::from(bps))
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .ok_or(MarketplaceError::ArithmeticOverflow)
+}
+
+/// Current price of a Dutch auction at ledger timestamp `now`.
+///
+/// - At or before `start_time` the price is `starting_price`.
+/// - Between `start_time` and `start_time + duration` it decays linearly
+///   (rounded down towards `reserve_price`).
+/// - Once `duration` has elapsed it is clamped to `reserve_price`.
+///
+/// # Errors
+///
+/// Returns [`MarketplaceError::ArithmeticOverflow`] if an intermediate value overflows.
+pub fn dutch_auction_price(auction: &DutchAuction, now: u64) -> Result<i128, MarketplaceError> {
+    let elapsed = now.saturating_sub(auction.start_time);
+    if elapsed == 0 {
+        return Ok(auction.starting_price);
+    }
+    if elapsed >= auction.duration {
+        return Ok(auction.reserve_price);
+    }
+    let span = auction
+        .starting_price
+        .checked_sub(auction.reserve_price)
+        .ok_or(MarketplaceError::ArithmeticOverflow)?;
+    // duration > elapsed > 0 here, so the division is well defined.
+    let decay = span
+        .checked_mul(i128::from(elapsed))
+        .and_then(|v| v.checked_div(i128::from(auction.duration)))
+        .ok_or(MarketplaceError::ArithmeticOverflow)?;
+    auction
+        .starting_price
+        .checked_sub(decay)
+        .ok_or(MarketplaceError::ArithmeticOverflow)
+}
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
 
@@ -31,6 +86,14 @@ fn bump_instance(env: &Env) {
 fn bump_listing(env: &Env, id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::Listing(id),
+        LEDGER_LIFETIME_THRESHOLD,
+        LEDGER_BUMP_AMOUNT,
+    );
+}
+
+fn bump_dutch(env: &Env, id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::DutchAuction(id),
         LEDGER_LIFETIME_THRESHOLD,
         LEDGER_BUMP_AMOUNT,
     );
@@ -222,10 +285,152 @@ mod contract {
             Ok(id)
         }
 
+        /// Set the platform fee taken on every sale. Admin only.
+        ///
+        /// `fee_bps` is in basis points (0 disables the fee, 10 000 = 100 %).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not initialized.
+        /// Returns [`MarketplaceError::NotAuthorized`] if `admin` is not the marketplace admin.
+        /// Returns [`MarketplaceError::InvalidPlatformFee`] if `fee_bps > 10_000`.
+        pub fn set_platform_fee(
+            env: Env,
+            admin: Address,
+            fee_bps: u32,
+            recipient: Address,
+        ) -> Result<(), MarketplaceError> {
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(MarketplaceError::NotInitialized)?;
+            if admin != stored_admin {
+                return Err(MarketplaceError::NotAuthorized);
+            }
+            if fee_bps > 10_000 {
+                return Err(MarketplaceError::InvalidPlatformFee);
+            }
+
+            admin.require_auth();
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PlatformFeeBps, &fee_bps);
+            env.storage()
+                .instance()
+                .set(&DataKey::PlatformFeeRecipient, &recipient);
+            bump_instance(&env);
+
+            events::platform_fee_set(&env, fee_bps, &recipient);
+            Ok(())
+        }
+
+        /// Return the platform fee in basis points and its recipient, if configured.
+        pub fn get_platform_fee(env: Env) -> (u32, Option<Address>) {
+            (
+                env.storage()
+                    .instance()
+                    .get(&DataKey::PlatformFeeBps)
+                    .unwrap_or(0),
+                env.storage().instance().get(&DataKey::PlatformFeeRecipient),
+            )
+        }
+
+        /// List an NFT as a Dutch (descending-price) auction.
+        ///
+        /// The price starts at `starting_price` at the current ledger timestamp and decays
+        /// linearly to `reserve_price` over `duration` seconds, after which it stays at
+        /// `reserve_price` until bought or cancelled. The stored listing's `price` is
+        /// `starting_price`; use `get_current_price` for the live price.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::NotInitialized`] if not yet initialized.
+        /// Returns [`MarketplaceError::InvalidDutchAuction`] if `reserve_price <= 0`,
+        /// `starting_price <= reserve_price`, or `duration == 0`.
+        pub fn list_dutch(
+            env: Env,
+            seller: Address,
+            nft_contract: Address,
+            token_id: u32,
+            starting_price: i128,
+            reserve_price: i128,
+            duration: u64,
+        ) -> Result<u64, MarketplaceError> {
+            if reserve_price <= 0 || starting_price <= reserve_price || duration == 0 {
+                return Err(MarketplaceError::InvalidDutchAuction);
+            }
+
+            let id = Self::list_impl(
+                env.clone(),
+                seller.clone(),
+                nft_contract,
+                token_id,
+                starting_price,
+                None,
+            )?;
+
+            let auction = DutchAuction {
+                starting_price,
+                reserve_price,
+                start_time: env.ledger().timestamp(),
+                duration,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::DutchAuction(id), &auction);
+            bump_dutch(&env, id);
+
+            events::dutch_listed(&env, id, &seller, starting_price, reserve_price, duration);
+            Ok(id)
+        }
+
+        /// Return the Dutch auction parameters of `listing_id`, or `None` if it is a
+        /// fixed-price listing (or does not exist).
+        pub fn get_dutch_auction(env: Env, listing_id: u64) -> Option<DutchAuction> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::DutchAuction(listing_id))
+        }
+
+        /// Return the price `buy` would charge for `listing_id` right now: the decayed
+        /// price for a Dutch auction, otherwise the fixed listing price.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::ListingNotFound`] if the listing does not exist.
+        pub fn get_current_price(env: Env, listing_id: u64) -> Result<i128, MarketplaceError> {
+            let listing: Listing = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Listing(listing_id))
+                .ok_or(MarketplaceError::ListingNotFound)?;
+            Self::current_price(&env, listing_id, &listing)
+        }
+
+        /// Preview how a sale of `listing_id` at its current price would be split
+        /// between creator, platform, and seller.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MarketplaceError::ListingNotFound`] if the listing does not exist, and
+        /// any error [`MarketplaceContract::buy`] would return while computing the split.
+        pub fn get_sale_split(env: Env, listing_id: u64) -> Result<SaleSplit, MarketplaceError> {
+            let listing: Listing = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Listing(listing_id))
+                .ok_or(MarketplaceError::ListingNotFound)?;
+            let price = Self::current_price(&env, listing_id, &listing)?;
+            Self::compute_sale_split(&env, &listing, price)
+        }
+
         /// Buy the NFT in listing `listing_id`.
         ///
-        /// Transfers payment (minus royalty) to the seller and the royalty portion to the royalty
-        /// recipient, then transfers the NFT to the buyer.
+        /// Charges the current price (the decayed price for a Dutch auction) and splits it
+        /// atomically: creator royalty to the royalty recipient, platform fee to the platform,
+        /// and the exact remainder to the seller. Then transfers the NFT to the buyer.
         ///
         /// # Errors
         ///
@@ -233,21 +438,13 @@ mod contract {
         /// Returns [`MarketplaceError::ListingNotFound`] if `listing_id` does not exist.
         /// Returns [`MarketplaceError::ListingInactive`] if the listing was cancelled or already sold.
         /// Returns [`MarketplaceError::ListingExpired`] if the listing's expiry has passed.
+        /// Returns [`MarketplaceError::InvalidRoyalty`] if the NFT reports a negative royalty.
+        /// Returns [`MarketplaceError::PayoutExceedsPrice`] if royalty plus fee exceed the price.
         pub fn buy(env: Env, buyer: Address, listing_id: u64) -> Result<(), MarketplaceError> {
             let payment_token: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::PaymentToken)
-                .ok_or(MarketplaceError::NotInitialized)?;
-            let royalty_bps: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::RoyaltyBps)
-                .unwrap_or(0);
-            let royalty_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::RoyaltyRecipient)
                 .ok_or(MarketplaceError::NotInitialized)?;
 
             buyer.require_auth();
@@ -267,6 +464,8 @@ mod contract {
                 }
             }
 
+            let price = Self::current_price(&env, listing_id, &listing)?;
+
             // Checks-effects-interactions: mark inactive before external calls.
             listing.active = false;
             env.storage()
@@ -275,23 +474,9 @@ mod contract {
             bump_listing(&env, listing_id);
             bump_instance(&env);
 
-            let price = listing.price;
-            let (royalty, royalty_recipient) = Self::resolve_royalty(
-                &env,
-                &listing.nft_contract,
-                listing.token_id,
-                price,
-                royalty_bps,
-                &royalty_recipient,
-            );
-            #[allow(clippy::arithmetic_side_effects)]
-            let seller_amount = price - royalty;
-
-            let tok = token::Client::new(&env, &payment_token);
-            tok.transfer(&buyer, &listing.seller, &seller_amount);
-            if royalty > 0 {
-                tok.transfer(&buyer, &royalty_recipient, &royalty);
-            }
+            let split = Self::compute_sale_split(&env, &listing, price)?;
+            Self::disburse(&env, &payment_token, &buyer, &listing.seller, &split);
+            events::sale_split(&env, listing_id, &split);
 
             // Transfer the NFT from seller to buyer.
             NftClient::new(&env, &listing.nft_contract).transfer_from(
@@ -428,7 +613,8 @@ mod contract {
             if !listing.active {
                 return Err(MarketplaceError::ListingInactive);
             }
-            if amount <= 0 || amount >= listing.price {
+            let current_price = Self::current_price(&env, listing_id, &listing)?;
+            if amount <= 0 || amount >= current_price {
                 return Err(MarketplaceError::InvalidOfferAmount);
             }
 
@@ -454,9 +640,9 @@ mod contract {
             Ok(())
         }
 
-        /// Accept a buyer's escrowed offer, re-checking it at accept time. Transfers the escrowed
-        /// amount (minus royalty) to the seller and the royalty portion to the royalty recipient,
-        /// then transfers the NFT to the buyer. Only the original seller may accept.
+        /// Accept a buyer's escrowed offer, re-checking it at accept time. Splits the escrowed
+        /// amount between creator royalty, platform fee, and seller (exact remainder), then
+        /// transfers the NFT to the buyer. Only the original seller may accept.
         ///
         /// # Errors
         ///
@@ -471,16 +657,6 @@ mod contract {
             listing_id: u64,
             buyer: Address,
         ) -> Result<(), MarketplaceError> {
-            let royalty_bps: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::RoyaltyBps)
-                .unwrap_or(0);
-            let royalty_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::RoyaltyRecipient)
-                .ok_or(MarketplaceError::NotInitialized)?;
             let payment_token: Address = env
                 .storage()
                 .instance()
@@ -517,26 +693,15 @@ mod contract {
             env.storage().persistent().remove(&offer_key);
             bump_instance(&env);
 
-            let (royalty, royalty_recipient) = Self::resolve_royalty(
+            let split = Self::compute_sale_split(&env, &listing, amount)?;
+            Self::disburse(
                 &env,
-                &listing.nft_contract,
-                listing.token_id,
-                amount,
-                royalty_bps,
-                &royalty_recipient,
-            );
-            #[allow(clippy::arithmetic_side_effects)]
-            let seller_amount = amount - royalty;
-
-            let tok = token::Client::new(&env, &payment_token);
-            tok.transfer(
+                &payment_token,
                 &env.current_contract_address(),
                 &listing.seller,
-                &seller_amount,
+                &split,
             );
-            if royalty > 0 {
-                tok.transfer(&env.current_contract_address(), &royalty_recipient, &royalty);
-            }
+            events::sale_split(&env, listing_id, &split);
 
             // Transfer the NFT from seller to buyer.
             NftClient::new(&env, &listing.nft_contract).transfer_from(
@@ -648,27 +813,123 @@ mod contract {
             }
         }
 
+        /// Price `buy` charges right now: the decayed Dutch auction price if the listing
+        /// is one, otherwise the fixed listing price.
+        fn current_price(
+            env: &Env,
+            listing_id: u64,
+            listing: &Listing,
+        ) -> Result<i128, MarketplaceError> {
+            match env
+                .storage()
+                .persistent()
+                .get::<_, DutchAuction>(&DataKey::DutchAuction(listing_id))
+            {
+                Some(auction) => dutch_auction_price(&auction, env.ledger().timestamp()),
+                None => Ok(listing.price),
+            }
+        }
+
         /// Resolve the royalty amount and recipient for a token sale.
         ///
         /// Priority order:
         /// 1. Per-token/collection royalty from the NFT contract (`royalty_info`), if set.
         /// 2. Marketplace-wide royalty (from initialize).
+        ///
+        /// A zero royalty from either source is valid and results in no creator payout.
         fn resolve_royalty(
             env: &Env,
             nft_contract: &Address,
             token_id: u32,
             sale_price: i128,
-            marketplace_royalty_bps: u32,
-            marketplace_royalty_recipient: &Address,
-        ) -> (i128, Address) {
-            if let Some(nft_royalty) = NftClient::new(env, nft_contract)
-                .royalty_info(&token_id, &sale_price)
+        ) -> Result<(i128, Address), MarketplaceError> {
+            if let Some(nft_royalty) =
+                NftClient::new(env, nft_contract).royalty_info(&token_id, &sale_price)
             {
-                return (nft_royalty.amount, nft_royalty.recipient);
+                if nft_royalty.amount < 0 {
+                    return Err(MarketplaceError::InvalidRoyalty);
+                }
+                return Ok((nft_royalty.amount, nft_royalty.recipient));
             }
-            #[allow(clippy::arithmetic_side_effects, clippy::as_conversions, clippy::cast_possible_truncation, clippy::integer_division)] // royalty BPS validated <= 10_000 at init
-            let marketplace_royalty = (sale_price * marketplace_royalty_bps as i128) / 10_000;
-            (marketplace_royalty, marketplace_royalty_recipient.clone())
+            let royalty_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoyaltyBps)
+                .unwrap_or(0);
+            let royalty_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoyaltyRecipient)
+                .ok_or(MarketplaceError::NotInitialized)?;
+            Ok((bps_of(sale_price, royalty_bps)?, royalty_recipient))
+        }
+
+        /// Split `sale_price` into creator royalty, platform fee, and seller remainder.
+        ///
+        /// Royalty and fee are rounded down; the seller receives exactly
+        /// `sale_price - creator_royalty - platform_fee`, so the three parts always sum
+        /// to `sale_price`.
+        fn compute_sale_split(
+            env: &Env,
+            listing: &Listing,
+            sale_price: i128,
+        ) -> Result<SaleSplit, MarketplaceError> {
+            let (creator_royalty, creator) =
+                Self::resolve_royalty(env, &listing.nft_contract, listing.token_id, sale_price)?;
+
+            let platform: Option<Address> =
+                env.storage().instance().get(&DataKey::PlatformFeeRecipient);
+            let platform_fee = match platform {
+                Some(_) => {
+                    let fee_bps: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::PlatformFeeBps)
+                        .unwrap_or(0);
+                    bps_of(sale_price, fee_bps)?
+                }
+                None => 0,
+            };
+
+            let seller_amount = sale_price
+                .checked_sub(creator_royalty)
+                .and_then(|v| v.checked_sub(platform_fee))
+                .ok_or(MarketplaceError::ArithmeticOverflow)?;
+            if seller_amount < 0 {
+                return Err(MarketplaceError::PayoutExceedsPrice);
+            }
+
+            Ok(SaleSplit {
+                sale_price,
+                creator_royalty,
+                creator,
+                platform_fee,
+                platform,
+                seller_amount,
+            })
+        }
+
+        /// Pay out a computed split from `payer`. Runs inside the calling transaction, so
+        /// any failed transfer reverts the whole sale.
+        fn disburse(
+            env: &Env,
+            payment_token: &Address,
+            payer: &Address,
+            seller: &Address,
+            split: &SaleSplit,
+        ) {
+            let tok = token::Client::new(env, payment_token);
+            if split.seller_amount > 0 {
+                tok.transfer(payer, seller, &split.seller_amount);
+            }
+            if split.creator_royalty > 0 {
+                tok.transfer(payer, &split.creator, &split.creator_royalty);
+            }
+            if let Some(platform) = &split.platform
+                && split.platform_fee > 0
+            {
+                tok.transfer(payer, platform, &split.platform_fee);
+            }
         }
     }
 }

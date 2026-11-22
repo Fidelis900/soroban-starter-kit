@@ -38,6 +38,7 @@ pub struct AuctionInfo {
     pub settled: bool,
     /// Optional reserve price set at start.
     pub reserve_price: Option<i128>,
-    /// Anti-sniping extension window in ledgers (0 = disabled).
+    /// Custom anti-sniping window/extension in ledgers (0 = default 10-ledger
+    /// window with a 20-ledger extension).
     pub extension_window: u32,
 }

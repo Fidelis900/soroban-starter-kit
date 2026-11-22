@@ -22,6 +22,11 @@ pub enum AuctionError {
     ReserveNotMet = 12,
     /// `cancel` was called after at least one bid has been placed.
     BidAlreadyPlaced = 13,
+    /// The bid does not exceed the current highest bid by at least
+    /// [`crate::MIN_BID_INCREMENT_BPS`].
+    BidIncrementTooLow = 14,
+    /// A checked arithmetic operation overflowed.
+    ArithmeticOverflow = 15,
 }
 
 impl_display_error!(
@@ -39,6 +44,8 @@ impl_display_error!(
     NothingToWithdraw  => "nothing to withdraw",
     ReserveNotMet      => "reserve price not met",
     BidAlreadyPlaced   => "cannot cancel after a bid has been placed",
+    BidIncrementTooLow => "bid below minimum percentage increment",
+    ArithmeticOverflow => "arithmetic overflow",
 );
 
 #[cfg(test)]
@@ -65,7 +72,9 @@ AuctionError::InvalidAmount = {}\n\
 AuctionError::InvalidDeadline = {}\n\
 AuctionError::NothingToWithdraw = {}\n\
 AuctionError::ReserveNotMet = {}\n\
-AuctionError::BidAlreadyPlaced = {}\n",
+AuctionError::BidAlreadyPlaced = {}\n\
+AuctionError::BidIncrementTooLow = {}\n\
+AuctionError::ArithmeticOverflow = {}\n",
             AuctionError::AlreadyInitialized as u32,
             AuctionError::NotInitialized as u32,
             AuctionError::AuctionEnded as u32,
@@ -79,6 +88,8 @@ AuctionError::BidAlreadyPlaced = {}\n",
             AuctionError::NothingToWithdraw as u32,
             AuctionError::ReserveNotMet as u32,
             AuctionError::BidAlreadyPlaced as u32,
+            AuctionError::BidIncrementTooLow as u32,
+            AuctionError::ArithmeticOverflow as u32,
         )
     }
 
