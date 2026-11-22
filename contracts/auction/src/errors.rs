@@ -50,7 +50,6 @@ impl_display_error!(
     NothingToWithdraw  => "nothing to withdraw",
     ReserveNotMet      => "reserve price not met",
     BidAlreadyPlaced   => "cannot cancel after a bid outside the grace window",
-    BidAlreadyPlaced   => "cannot cancel after a bid has been placed",
     Overflow           => "arithmetic overflow",
     WrongMode          => "operation not supported in this auction mode",
     AuctionNotStarted  => "auction has not started",

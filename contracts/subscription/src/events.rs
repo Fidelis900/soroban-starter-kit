@@ -212,6 +212,9 @@ pub fn voucher_applied(
     env.events().publish(
         (Symbol::new(env, "voucher_used"), subscriber.clone()),
         (code.clone(), discount_bps, gross, net),
+    );
+}
+
 /// Emitted when a subscription is due (or about to be due) for renewal.
 /// Topics: (Symbol, Address, Symbol) — event name, subscriber, plan
 /// Data: (next_billing_ledger, current_ledger)
@@ -237,5 +240,75 @@ pub fn subscription_expired(env: &Env, subscriber: &Address, plan_id: &Symbol) {
     env.events().publish(
         (Symbol::new(env, "subscription_expired"), subscriber.clone()),
         plan_id.clone(),
+    );
+}
+
+/// Emitted when a failed charge opens a subscription's grace period (issue #1485).
+/// Topics: (Symbol, Address) — event name, subscriber
+/// Data: (plan_id, grace_period_end_ledger)
+pub fn grace_period_started(env: &Env, subscriber: &Address, plan_id: &Symbol, ends_at: u32) {
+    env.events().publish(
+        (Symbol::new(env, "grace_period_started"), subscriber.clone()),
+        (plan_id.clone(), ends_at),
+    );
+}
+
+/// Emitted when a retried charge succeeds during the grace period.
+/// Topics: (Symbol, Address) — event name, subscriber
+/// Data: (plan_id, failed attempts before recovery)
+pub fn grace_period_recovered(
+    env: &Env,
+    subscriber: &Address,
+    plan_id: &Symbol,
+    failed_charges_count: u32,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "grace_period_recovered"),
+            subscriber.clone(),
+        ),
+        (plan_id.clone(), failed_charges_count),
+    );
+}
+
+/// Emitted when the provider registers a keeper bot (issue #1484).
+/// Topics: (Symbol, Address) — event name, keeper
+pub fn keeper_registered(env: &Env, keeper: &Address) {
+    env.events()
+        .publish((Symbol::new(env, "keeper_registered"), keeper.clone()), ());
+}
+
+/// Emitted when the provider removes a keeper bot.
+/// Topics: (Symbol, Address) — event name, keeper
+pub fn keeper_removed(env: &Env, keeper: &Address) {
+    env.events()
+        .publish((Symbol::new(env, "keeper_removed"), keeper.clone()), ());
+}
+
+/// Emitted when the provider updates the keeper bounty (basis points).
+/// Topics: (Symbol,) — event name
+pub fn keeper_bounty_updated(env: &Env, bounty_bps: u32) {
+    env.events()
+        .publish((Symbol::new(env, "keeper_bounty_updated"),), bounty_bps);
+}
+
+/// Emitted after a keeper-initiated `charge_subscriber` call.
+/// Topics: (Symbol, Address, Address) — event name, keeper, subscriber
+/// Data: (plan_id, amount charged, bounty paid to the keeper)
+pub fn keeper_charged(
+    env: &Env,
+    keeper: &Address,
+    subscriber: &Address,
+    plan_id: &Symbol,
+    charged: i128,
+    bounty: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "keeper_charged"),
+            keeper.clone(),
+            subscriber.clone(),
+        ),
+        (plan_id.clone(), charged, bounty),
     );
 }

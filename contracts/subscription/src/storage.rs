@@ -4,8 +4,10 @@
 use soroban_sdk::{Address, Bytes, Symbol, Vec, contracttype};
 
 /// Default grace period applied when the provider has not configured one:
-/// ~7 days at ~5 seconds per ledger.
-pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 120_960;
+/// 3 days at ~5 seconds per ledger (`3 * 24 * 60 * 60 / 5`). During this window
+/// a subscriber whose recurring charge failed keeps access and the charge can be
+/// retried before the subscription is suspended (issue #1485).
+pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 51_840;
 
 /// Top-level storage keys used by [`SubscriptionContract`](crate::SubscriptionContract).
 #[contracttype]
@@ -38,6 +40,10 @@ pub enum DataKey {
     NotificationWindow,
     /// Index of all (subscriber, plan) pairs for keeper queries.
     SubscriptionIndex,
+    /// Registered keeper bot allowed to call `charge_subscriber` (persistent).
+    Keeper(Address),
+    /// Keeper gas bounty in basis points of each charged amount (instance).
+    KeeperBountyBps,
 }
 
 /// Plan configuration that can be registered by the admin.

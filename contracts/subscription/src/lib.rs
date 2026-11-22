@@ -61,7 +61,6 @@ fn discounted_charge(
     Ok((discounted, Some(voucher)))
 }
 
-fn bump_subscription(env: &Env, subscriber: &Address) {
 fn bump_subscription(env: &Env, subscriber: &Address, plan_id: &Symbol) {
     env.storage().persistent().extend_ttl(
         &DataKey::Subscription(subscriber.clone(), plan_id.clone()),
@@ -83,6 +82,50 @@ fn grace_period(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::GracePeriod)
         .unwrap_or(DEFAULT_GRACE_PERIOD_LEDGERS)
+}
+
+/// Ledger at which the grace period of a delinquent subscription runs out, or
+/// `None` when the subscription is not delinquent (issue #1485).
+fn grace_period_end(info: &SubscriptionInfo, grace_period_ledgers: u32) -> Option<u32> {
+    info.delinquent_since_ledger
+        .map(|since| since.saturating_add(grace_period_ledgers))
+}
+
+/// Whether the subscriber may still use the service.
+///
+/// A failed charge does not revoke access: while the subscription is within
+/// its grace period it stays usable and the charge can be retried. Access ends
+/// only on cancellation, expiry, suspension, or once the grace period lapses.
+fn access_active(info: &SubscriptionInfo, grace_period_ledgers: u32, current_ledger: u32) -> bool {
+    if !info.active || info.suspended || info.status == SubscriptionStatus::Expired {
+        return false;
+    }
+    match grace_period_end(info, grace_period_ledgers) {
+        Some(end) => current_ledger < end,
+        None => true,
+    }
+}
+
+fn is_registered_keeper(env: &Env, keeper: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Keeper(keeper.clone()))
+        .unwrap_or(false)
+}
+
+fn keeper_bounty_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::KeeperBountyBps)
+        .unwrap_or(0)
+}
+
+/// Share of `charged` paid to the keeper: `charged * bounty_bps / 10_000`.
+fn keeper_bounty(charged: i128, bounty_bps: u32) -> Result<i128, SubscriptionError> {
+    charged
+        .checked_mul(i128::from(bounty_bps))
+        .and_then(|v| v.checked_div(i128::from(BPS_DENOMINATOR)))
+        .ok_or(SubscriptionError::ArithmeticOverflow)
 }
 
 /// Charge a single (subscriber, plan) subscription. Authorization is the
@@ -151,28 +194,26 @@ fn charge_one(
     // it can be recorded as a delinquency instead of aborting the transaction.
     // Soroban forbids contract re-entrancy, so writing state after the call is safe.
     let (charge_amount, applied_voucher) = discounted_charge(env, subscriber, info.amount)?;
-    let transfer = token_client.try_transfer_from(
-        &env.current_contract_address(),
-        subscriber,
-        provider,
-        &charge_amount,
     // Revenue is accumulated in contract escrow instead of being paid out on
     // every charge, avoiding a micro-transfer per billing cycle.
     let transfer = token_client.try_transfer_from(
         &env.current_contract_address(),
         subscriber,
         &env.current_contract_address(),
-        &info.amount,
+        &charge_amount,
     );
 
     if matches!(transfer, Ok(Ok(()))) {
         info.billing_cycles = info.billing_cycles.saturating_add(1);
         let revenue_key = DataKey::ProviderRevenue(provider.clone());
         let accumulated: i128 = env.storage().persistent().get(&revenue_key).unwrap_or(0);
-        env.storage().persistent().set(
-            &revenue_key,
-            &accumulated.saturating_add(info.amount),
-        );
+        let new_revenue = accumulated
+            .checked_add(charge_amount)
+            .ok_or(SubscriptionError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&revenue_key, &new_revenue);
+        if info.delinquent_since_ledger.is_some() {
+            events::grace_period_recovered(env, subscriber, plan_id, info.failed_charges_count);
+        }
         info.last_charged_ledger = current_ledger;
         info.failed_charges_count = 0;
         info.delinquent_since_ledger = None;
@@ -194,9 +235,20 @@ fn charge_one(
         return Ok((ChargeOutcome::Charged, charge_amount));
     }
 
+    // A failed charge opens (or continues) the grace period: access stays
+    // active and the charge may be retried until it lapses (issue #1485).
     info.failed_charges_count = info.failed_charges_count.saturating_add(1);
+    let first_failure = info.delinquent_since_ledger.is_none();
     let delinquent_since = info.delinquent_since_ledger.unwrap_or(current_ledger);
     info.delinquent_since_ledger = Some(delinquent_since);
+    if first_failure && grace_period_ledgers > 0 {
+        events::grace_period_started(
+            env,
+            subscriber,
+            plan_id,
+            delinquent_since.saturating_add(grace_period_ledgers),
+        );
+    }
 
     if current_ledger >= delinquent_since.saturating_add(grace_period_ledgers) {
         info.active = false;
@@ -1180,6 +1232,8 @@ mod contract {
             let allowance = token_client.allowance(&subscriber, &env.current_contract_address());
             let _ = provider;
             balance >= amount && allowance >= amount
+        }
+
         /// Set the minimum accumulated revenue required before the provider
         /// may withdraw. Provider-only.
         pub fn set_min_payout_threshold(
@@ -1303,6 +1357,204 @@ mod contract {
             }
             due
         }
+
+        /// Return `true` while the subscriber may use the service for `plan_id`.
+        ///
+        /// Access stays active during the grace period that follows a failed
+        /// charge, so a temporary payment problem does not lock the subscriber
+        /// out while retries are pending (issue #1485). It ends once the
+        /// subscription is cancelled, expired or suspended, or once the grace
+        /// period has lapsed without a successful charge.
+        pub fn has_access(env: Env, subscriber: Address, plan_id: Symbol) -> bool {
+            env.storage()
+                .persistent()
+                .get::<_, SubscriptionInfo>(&DataKey::Subscription(subscriber, plan_id))
+                .is_some_and(|info| {
+                    access_active(&info, grace_period(&env), env.ledger().sequence())
+                })
+        }
+
+        /// Return the ledger at which the current grace period ends, or `None`
+        /// if the subscription does not exist or is not delinquent.
+        pub fn get_grace_period_end(env: Env, subscriber: Address, plan_id: Symbol) -> Option<u32> {
+            env.storage()
+                .persistent()
+                .get::<_, SubscriptionInfo>(&DataKey::Subscription(subscriber, plan_id))
+                .and_then(|info| grace_period_end(&info, grace_period(&env)))
+        }
+
+        /// Register `keeper` as a bot allowed to call `charge_subscriber`.
+        /// Only the provider can call this (issue #1484).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
+        pub fn register_keeper(env: Env, keeper: Address) -> Result<(), SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            provider.require_auth();
+
+            let key = DataKey::Keeper(keeper.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                LEDGER_LIFETIME_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+            bump_instance(&env);
+
+            events::keeper_registered(&env, &keeper);
+            Ok(())
+        }
+
+        /// Revoke a keeper's permission to call `charge_subscriber`.
+        /// Only the provider can call this.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
+        /// Returns [`SubscriptionError::KeeperNotRegistered`] if `keeper` is not registered.
+        pub fn remove_keeper(env: Env, keeper: Address) -> Result<(), SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            provider.require_auth();
+
+            if !is_registered_keeper(&env, &keeper) {
+                return Err(SubscriptionError::KeeperNotRegistered);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Keeper(keeper.clone()));
+            bump_instance(&env);
+
+            events::keeper_removed(&env, &keeper);
+            Ok(())
+        }
+
+        /// Set the share of each keeper-collected charge paid to the keeper as a
+        /// gas bounty, in basis points of the charged amount (`0` disables it).
+        /// The bounty is deducted from the provider's accumulated revenue.
+        /// Only the provider can call this.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
+        /// Returns [`SubscriptionError::InvalidBounty`] if `bounty_bps` > 10_000.
+        pub fn set_keeper_bounty(env: Env, bounty_bps: u32) -> Result<(), SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            provider.require_auth();
+
+            if bounty_bps > BPS_DENOMINATOR {
+                return Err(SubscriptionError::InvalidBounty);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::KeeperBountyBps, &bounty_bps);
+            bump_instance(&env);
+
+            events::keeper_bounty_updated(&env, bounty_bps);
+            Ok(())
+        }
+
+        /// Return `true` if `keeper` is a registered keeper bot.
+        pub fn is_keeper(env: Env, keeper: Address) -> bool {
+            is_registered_keeper(&env, &keeper)
+        }
+
+        /// Return the keeper gas bounty in basis points of the charged amount.
+        pub fn get_keeper_bounty(env: Env) -> u32 {
+            keeper_bounty_bps(&env)
+        }
+
+        /// Registered keeper bot collects a due recurring charge for
+        /// (`subscriber`, `plan_id`) on the provider's behalf (issue #1484).
+        ///
+        /// Billing rules are identical to [`SubscriptionContract::charge`]: the
+        /// charge is only accepted once the billing interval has fully elapsed,
+        /// so premature or duplicate calls are rejected with
+        /// [`SubscriptionError::IntervalNotElapsed`]. Failed payments open the
+        /// grace period instead of cancelling the subscription, and remain
+        /// retryable until it lapses.
+        ///
+        /// On a successful charge the keeper receives `charged * bounty_bps /
+        /// 10_000` from the billing fee (see `set_keeper_bounty`). If the bounty
+        /// transfer fails it is skipped and the full fee stays with the provider,
+        /// so a misbehaving keeper account can never block billing.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
+        /// Returns [`SubscriptionError::KeeperNotRegistered`] if `keeper` is not registered.
+        /// Returns [`SubscriptionError::NotSubscribed`] if no subscription exists for the pair.
+        /// Returns [`SubscriptionError::SubscriptionSuspended`] if the subscription was suspended.
+        /// Returns [`SubscriptionError::SubscriptionInactive`] if the subscription was cancelled.
+        /// Returns [`SubscriptionError::IntervalNotElapsed`] if the charge interval has not passed.
+        pub fn charge_subscriber(
+            env: Env,
+            keeper: Address,
+            subscriber: Address,
+            plan_id: Symbol,
+        ) -> Result<ChargeOutcome, SubscriptionError> {
+            let provider: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider)
+                .ok_or(SubscriptionError::NotInitialized)?;
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(SubscriptionError::NotInitialized)?;
+
+            keeper.require_auth();
+            if !is_registered_keeper(&env, &keeper) {
+                return Err(SubscriptionError::KeeperNotRegistered);
+            }
+
+            let token_client = token::Client::new(&env, &token_addr);
+            let (outcome, charged) = charge_one(
+                &env,
+                &provider,
+                &token_client,
+                grace_period(&env),
+                &subscriber,
+                &plan_id,
+            )?;
+
+            let mut bounty = 0i128;
+            if outcome == ChargeOutcome::Charged && charged > 0 {
+                let owed = keeper_bounty(charged, keeper_bounty_bps(&env))?;
+                if owed > 0 {
+                    let revenue_key = DataKey::ProviderRevenue(provider.clone());
+                    let accumulated: i128 =
+                        env.storage().persistent().get(&revenue_key).unwrap_or(0);
+                    let remaining = accumulated
+                        .checked_sub(owed)
+                        .ok_or(SubscriptionError::ArithmeticOverflow)?;
+                    let paid = token_client
+                        .try_transfer(&env.current_contract_address(), &keeper, &owed)
+                        .is_ok_and(|r| r.is_ok());
+                    if paid {
+                        env.storage().persistent().set(&revenue_key, &remaining);
+                        bounty = owed;
+                    }
+                }
+            }
+
+            bump_instance(&env);
+            events::keeper_charged(&env, &keeper, &subscriber, &plan_id, charged, bounty);
+            Ok(outcome)
+        }
     }
 }
 
@@ -1314,3 +1566,6 @@ mod contract {
 
 #[cfg(test)]
 mod issue_tests;
+
+#[cfg(test)]
+mod grace_keeper_tests;
