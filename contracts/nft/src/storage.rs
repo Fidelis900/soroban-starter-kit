@@ -27,7 +27,8 @@ pub enum DataKey {
     Burned,
     /// Persistent: collection-wide operator approval `(owner, operator) -> bool`.
     OperatorApproval(Address, Address),
-    /// Persistent: number of tokens owned by an address.
+    /// Persistent: number of tokens owned by an address. Always equals the
+    /// length of the owner's `OwnerTokens` list.
     Balance(Address),
     /// Next token id for sequential batch minting.
     NextTokenId,
@@ -50,6 +51,8 @@ pub enum TokenKey {
     TokenRoyaltyBps(u32),
     /// Optional per-token royalty recipient override.
     TokenRoyaltyRecipient(u32),
+    /// Present (`true`) when the token was minted soulbound (non-transferable).
+    Soulbound(u32),
 }
 
 #[contracttype]

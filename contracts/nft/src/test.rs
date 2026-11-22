@@ -8,7 +8,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{Address, Env, String, testutils::Address as _};
+use soroban_sdk::{
+    Address, Env, String,
+    testutils::{Address as _, Events as _},
+};
 
 // ---------------------------------------------------------------------------
 // Helpers

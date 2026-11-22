@@ -10,15 +10,16 @@ fn init_with_collection_royalty<'a>(
     recipient: &Address,
 ) -> (NftContractClient<'a>, Address) {
     let admin = Address::generate(env);
-    let addr = env.register_contract(None, NftContract);
+    let addr = env.register(NftContract, ());
     let client = NftContractClient::new(env, &addr);
     client.initialize(
         &admin,
         &String::from_str(env, "Royal"),
         &String::from_str(env, "ROY"),
-        &None,
+        &0,
         &Some(bps),
         &Some(recipient.clone()),
+        &false,
     );
     (client, admin)
 }
@@ -35,8 +36,10 @@ fn royalty_info_returns_per_token_royalty() {
     let (client, _) = init_with_collection_royalty(&env, 1_000, &collection_recipient);
 
     let owner = Address::generate(&env);
-    let token_id = client.mint(
+    let token_id = 1u32;
+    client.mint(
         &owner,
+        &token_id,
         &String::from_str(&env, "ipfs://1"),
         &Some(250u32),
         &Some(token_recipient.clone()),
@@ -59,14 +62,18 @@ fn royalty_info_per_token_and_collection_fallback() {
     let (client, _) = init_with_collection_royalty(&env, 500, &collection_recipient);
 
     let owner = Address::generate(&env);
-    let overridden = client.mint(
+    let overridden = 1u32;
+    client.mint(
         &owner,
+        &overridden,
         &String::from_str(&env, "ipfs://overridden"),
         &Some(100u32),
         &Some(token_recipient.clone()),
     );
-    let fallback = client.mint(
+    let fallback = 2u32;
+    client.mint(
         &owner,
+        &fallback,
         &String::from_str(&env, "ipfs://fallback"),
         &None,
         &None,
@@ -91,7 +98,8 @@ fn royalty_info_calculation_across_sale_prices() {
     let (client, _) = init_with_collection_royalty(&env, 500, &recipient);
 
     let owner = Address::generate(&env);
-    let token_id = client.mint(&owner, &String::from_str(&env, "ipfs://scale"), &None, &None);
+    let token_id = 1u32;
+    client.mint(&owner, &token_id, &String::from_str(&env, "ipfs://scale"), &None, &None);
 
     // Zero sale price yields zero royalty.
     let zero = client.royalty_info(&token_id, &0i128).unwrap();
@@ -120,7 +128,8 @@ fn royalty_info_at_max_basis_points() {
     let (client, _) = init_with_collection_royalty(&env, 1_500, &recipient);
 
     let owner = Address::generate(&env);
-    let token_id = client.mint(&owner, &String::from_str(&env, "ipfs://max"), &None, &None);
+    let token_id = 1u32;
+    client.mint(&owner, &token_id, &String::from_str(&env, "ipfs://max"), &None, &None);
 
     for price in [0i128, 1_000, 10_000, 123_456] {
         let info = client.royalty_info(&token_id, &price).unwrap();
@@ -137,16 +146,17 @@ fn initialize_rejects_royalty_above_cap() {
 
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let addr = env.register_contract(None, NftContract);
+    let addr = env.register(NftContract, ());
     let client = NftContractClient::new(&env, &addr);
 
     let result = client.try_initialize(
         &admin,
         &String::from_str(&env, "Royal"),
         &String::from_str(&env, "ROY"),
-        &None,
+        &0,
         &Some(1_501u32),
         &Some(recipient.clone()),
+        &false,
     );
     assert!(result.is_err());
 }
@@ -163,6 +173,7 @@ fn mint_rejects_per_token_royalty_above_cap() {
     let owner = Address::generate(&env);
     let result = client.try_mint(
         &owner,
+        &1u32,
         &String::from_str(&env, "ipfs://over-cap"),
         &Some(1_501u32),
         &Some(recipient.clone()),
