@@ -15,8 +15,8 @@ mod storage;
 
 pub use errors::SubscriptionError;
 pub use storage::{
-    BatchChargeResult, ChargeOutcome, DEFAULT_GRACE_PERIOD_LEDGERS, DataKey, Plan, SubscriptionInfo,
-    SubscriptionStatus,
+    BatchChargeResult, ChargeOutcome, DEFAULT_GRACE_PERIOD_LEDGERS, DataKey, Plan,
+    PRICE_NOTICE_LEDGERS, SubscriptionInfo, SubscriptionStatus,
 };
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
@@ -97,7 +97,7 @@ fn grace_period_end(info: &SubscriptionInfo, grace_period_ledgers: u32) -> Optio
 /// its grace period it stays usable and the charge can be retried. Access ends
 /// only on cancellation, expiry, suspension, or once the grace period lapses.
 fn access_active(info: &SubscriptionInfo, grace_period_ledgers: u32, current_ledger: u32) -> bool {
-    if !info.active || info.suspended || info.status == SubscriptionStatus::Expired {
+    if !info.active || info.suspended || info.paused || info.status == SubscriptionStatus::Expired {
         return false;
     }
     match grace_period_end(info, grace_period_ledgers) {
@@ -153,6 +153,11 @@ fn charge_one(
     if !info.active || info.status == SubscriptionStatus::Expired {
         return Err(SubscriptionError::SubscriptionInactive);
     }
+    // A paused subscription is not billed: the caller is told so and no
+    // deduction is made. The billing interval is frozen by `resume_subscription`.
+    if info.paused {
+        return Err(SubscriptionError::SubscriptionPaused);
+    }
 
     // Fixed-term subscriptions stop billing once their cycle limit is reached.
     if let Some(limit) = info.max_billing_cycles {
@@ -166,6 +171,28 @@ fn charge_one(
     }
 
     let current_ledger = env.ledger().sequence();
+
+    // Apply a scheduled price increase whose notice window has elapsed. The
+    // increase takes effect for this subscriber at their first charge on or
+    // after the effective ledger; the pending record is retained so every
+    // existing subscriber migrates on their next charge.
+    if let Some((new_amount, effective_ledger)) = env
+        .storage()
+        .persistent()
+        .get::<_, (i128, u32)>(&DataKey::PendingIncrease(info.plan_id.clone()))
+    {
+        if current_ledger >= effective_ledger && new_amount > info.amount {
+            info.amount = new_amount;
+            let plan_key = DataKey::Plan(info.plan_id.clone());
+            if let Some(mut plan) = env.storage().persistent().get::<_, Plan>(&plan_key) {
+                if plan.amount < new_amount {
+                    plan.amount = new_amount;
+                    env.storage().persistent().set(&plan_key, &plan);
+                }
+            }
+            events::price_increase_applied(env, &info.plan_id, new_amount);
+        }
+    }
 
     // Check if trial period is still active
     if !info.trial_completed {
@@ -623,6 +650,8 @@ mod contract {
                 billing_cycles: 0,
                 max_billing_cycles,
                 status: SubscriptionStatus::Active,
+                paused: false,
+                paused_at_ledger: None,
             };
 
             save_subscription(&env, &subscriber, &info);
@@ -957,6 +986,8 @@ mod contract {
                 billing_cycles: old.billing_cycles,
                 max_billing_cycles: old.max_billing_cycles,
                 status: old.status,
+                paused: false,
+                paused_at_ledger: None,
             };
 
             old.active = false;
@@ -1065,6 +1096,99 @@ mod contract {
             Ok(())
         }
 
+        /// Pause a subscription's recurring billing without cancelling it.
+        ///
+        /// The subscriber keeps their plan configuration but is not charged while
+        /// paused, and the billing interval is frozen: on
+        /// [`Self::resume_subscription`] the paid period is shifted forward by the
+        /// pause duration so the subscriber does not lose paid days. Service
+        /// access ([`Self::has_access`]) is withdrawn while paused.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotSubscribed`] if the subscriber has no subscription.
+        /// Returns [`SubscriptionError::SubscriptionInactive`] if the subscription is not active.
+        /// Returns [`SubscriptionError::AlreadyPaused`] if it is already paused.
+        pub fn pause_subscription(
+            env: Env,
+            subscriber: Address,
+            plan_id: Symbol,
+        ) -> Result<(), SubscriptionError> {
+            subscriber.require_auth();
+
+            let key = DataKey::Subscription(subscriber.clone(), plan_id.clone());
+            let mut info: SubscriptionInfo = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(SubscriptionError::NotSubscribed)?;
+
+            if !info.active {
+                return Err(SubscriptionError::SubscriptionInactive);
+            }
+            if info.paused {
+                return Err(SubscriptionError::AlreadyPaused);
+            }
+
+            info.paused = true;
+            info.paused_at_ledger = Some(env.ledger().sequence());
+            save_subscription(&env, &subscriber, &info);
+            bump_instance(&env);
+
+            events::paused(&env, &subscriber, &plan_id);
+            Ok(())
+        }
+
+        /// Resume a paused subscription. The billing interval is shifted forward
+        /// by the number of ledgers spent paused, so the paid period interrupted
+        /// by the pause resumes where it left off and the subscriber is not
+        /// charged for the paused period.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotSubscribed`] if the subscriber has no subscription.
+        /// Returns [`SubscriptionError::NotPaused`] if the subscription is not paused.
+        pub fn resume_subscription(
+            env: Env,
+            subscriber: Address,
+            plan_id: Symbol,
+        ) -> Result<(), SubscriptionError> {
+            subscriber.require_auth();
+
+            let key = DataKey::Subscription(subscriber.clone(), plan_id.clone());
+            let mut info: SubscriptionInfo = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(SubscriptionError::NotSubscribed)?;
+
+            if !info.paused {
+                return Err(SubscriptionError::NotPaused);
+            }
+
+            let paused_for = info
+                .paused_at_ledger
+                .map(|at| env.ledger().sequence().saturating_sub(at))
+                .unwrap_or(0);
+            info.last_charged_ledger = info.last_charged_ledger.saturating_add(paused_for);
+            info.paused = false;
+            info.paused_at_ledger = None;
+            save_subscription(&env, &subscriber, &info);
+            bump_instance(&env);
+
+            events::resumed(&env, &subscriber, &plan_id, paused_for);
+            Ok(())
+        }
+
+        /// Returns the scheduled price increase pending for `plan_id`, if any:
+        /// `(new_amount, effective_ledger)`. `None` once the increase has taken
+        /// effect or no increase is scheduled.
+        pub fn get_pending_price_increase(env: Env, plan_id: Symbol) -> Option<(i128, u32)> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::PendingIncrease(plan_id))
+        }
+
         /// Return the subscription details for (`subscriber`, `plan_id`), or `None`
         /// if the subscriber never subscribed to that plan.
         pub fn get_subscription(
@@ -1097,10 +1221,23 @@ mod contract {
             grace_period(&env)
         }
 
-        /// Update a plan's base amount for new subscribers.
+        /// Update a plan's base amount.
         ///
-        /// Existing subscribers remain grandfathered on their subscription amount and
-        /// must explicitly approve any increase before it is applied.
+        /// A price **increase** does not take effect immediately: it is scheduled
+        /// with a 30-day advance-notice window ([`PRICE_NOTICE_LEDGERS`]) before it
+        /// takes effect, during which existing subscribers keep their current rate
+        /// and may cancel without penalty. The new price applies to each subscriber
+        /// at their first charge on or after the effective ledger, and to new
+        /// subscribers once it has taken effect. A price **decrease** (or an
+        /// unchanged amount) applies immediately for new subscribers and clears
+        /// any pending increase.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotInitialized`] if the contract is not initialized.
+        /// Returns [`SubscriptionError::PlanNotFound`] if no plan exists with this ID.
+        /// Returns [`SubscriptionError::InvalidAmount`] if `new_amount <= 0`.
+        /// Returns [`SubscriptionError::ArithmeticOverflow`] if the effective ledger overflows.
         pub fn update_plan_amount(
             env: Env,
             plan_id: Symbol,
@@ -1124,16 +1261,51 @@ mod contract {
                 .get(&key)
                 .ok_or(SubscriptionError::PlanNotFound)?;
 
-            plan.amount = new_amount;
-            env.storage().persistent().set(&key, &plan);
+            if new_amount > plan.amount {
+                // Increase: enforce the advance-notice window. The plan's amount
+                // is left untouched until the window elapses (applied lazily on
+                // the first eligible charge), so subscribers are never charged the
+                // higher rate during the notice period.
+                let effective_ledger = env
+                    .ledger()
+                    .sequence()
+                    .checked_add(PRICE_NOTICE_LEDGERS)
+                    .ok_or(SubscriptionError::ArithmeticOverflow)?;
+                env.storage().persistent().set(
+                    &DataKey::PendingIncrease(plan_id.clone()),
+                    &(new_amount, effective_ledger),
+                );
+                events::price_increase_scheduled(
+                    &env,
+                    &plan_id,
+                    plan.amount,
+                    new_amount,
+                    effective_ledger,
+                );
+            } else {
+                // Decrease or unchanged: apply immediately for new subscribers.
+                plan.amount = new_amount;
+                env.storage().persistent().set(&key, &plan);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::PendingIncrease(plan_id.clone()));
+                events::plan_amount_updated(&env, &plan_id, new_amount);
+            }
+
             bump_instance(&env);
             Ok(())
         }
 
-        /// Subscriber approves applying the plan's current amount to their subscription.
+        /// Subscriber consents to a pending plan price increase, applying the new
+        /// rate to their subscription immediately (ahead of the notice window that
+        /// would otherwise auto-apply it on their next charge).
         ///
-        /// Required before an increased subscription fee can take effect for an
-        /// existing (grandfathered) subscriber.
+        /// # Errors
+        ///
+        /// Returns [`SubscriptionError::NotSubscribed`] if the subscriber has no subscription.
+        /// Returns [`SubscriptionError::PlanNotFound`] if the plan does not exist.
+        /// Returns [`SubscriptionError::InvalidAmount`] if no price increase is pending
+        /// for this subscriber, or the new rate is not greater than their current rate.
         pub fn approve_price_increase(
             env: Env,
             subscriber: Address,
@@ -1153,15 +1325,23 @@ mod contract {
                 .get(&DataKey::Plan(plan_id.clone()))
                 .ok_or(SubscriptionError::PlanNotFound)?;
 
-            if plan.amount <= sub.amount {
+            // The rate a subscriber may approve is the pending scheduled increase
+            // (if any), or the plan's current amount otherwise.
+            let pending: Option<(i128, u32)> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingIncrease(plan_id.clone()));
+            let target = pending.map(|(amount, _)| amount).unwrap_or(plan.amount);
+
+            if target <= sub.amount {
                 return Err(SubscriptionError::InvalidAmount);
             }
 
-            sub.amount = plan.amount;
+            sub.amount = target;
             save_subscription(&env, &subscriber, &sub);
             env.storage().persistent().set(
                 &DataKey::ApprovedAmount(subscriber, plan_id),
-                &plan.amount,
+                &target,
             );
             bump_instance(&env);
             Ok(())
@@ -1188,7 +1368,7 @@ mod contract {
                 None => return false,
             };
 
-            if !info.active || info.suspended {
+            if !info.active || info.suspended || info.paused {
                 return false;
             }
 

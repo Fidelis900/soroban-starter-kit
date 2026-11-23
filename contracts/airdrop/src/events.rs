@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Bytes, Env, symbol_short};
+use soroban_sdk::{Address, Bytes, Env, Symbol, symbol_short};
 
 pub fn root_set(env: &Env, root: &Bytes) {
     env.events()
@@ -30,7 +30,6 @@ pub fn decay_remainder(env: &Env, treasury: &Address, token: &Address, amount: i
     );
 }
 
-pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128) {
 /// Emitted on every successful claim. The tier id is included both as a topic
 /// (so indexers can filter claims per tier) and in the data payload.
 pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128, tier: u32) {

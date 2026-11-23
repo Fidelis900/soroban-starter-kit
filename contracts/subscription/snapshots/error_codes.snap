@@ -8,3 +8,6 @@ SubscriptionError::NotSubscribed = 7
 SubscriptionError::SubscriptionInactive = 8
 SubscriptionError::IntervalNotElapsed = 9
 SubscriptionError::InsufficientAllowance = 10
+SubscriptionError::PlanAlreadyExists = 11
+SubscriptionError::PlanNotFound = 12
+SubscriptionError::PlanInactive = 13

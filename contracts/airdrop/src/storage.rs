@@ -8,8 +8,10 @@ use soroban_sdk::{Address, contracttype};
 pub enum DataKey {
     /// Admin address (instance).
     Admin,
-    /// Merkle root as a 32-byte value stored as Bytes (instance).
-    MerkleRoot,
+    /// Merkle root as a 32-byte value stored as Bytes, keyed by campaign epoch
+    /// (instance). Epoch 0 is the root set by `set_root`; governance updates
+    /// install later epochs while keeping prior ones for history.
+    MerkleRoot(u32),
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
     /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).

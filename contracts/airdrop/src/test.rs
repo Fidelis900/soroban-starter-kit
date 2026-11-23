@@ -366,7 +366,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     client.set_paused(&true);
     assert!(client.is_paused());
     assert_eq!(
-        client.try_claim(&recipient, &token, &100, &proof),
+        client.try_claim(&recipient, &token, &100, &TIER_1, &proof),
         Err(Ok(AirdropError::Paused))
     );
 
@@ -374,7 +374,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     assert!(!client.is_paused());
     // With claims resumed the pause error is gone (the root is not set yet).
     assert_eq!(
-        client.try_claim(&recipient, &token, &100, &proof),
+        client.try_claim(&recipient, &token, &100, &TIER_1, &proof),
         Err(Ok(AirdropError::RootNotSet))
     );
 }
@@ -416,16 +416,16 @@ fn decayed_payout_and_treasury_remainder() {
 
     // Inside the full-reward window: the whole allocation is claimable.
     env.ledger().with_mut(|li| li.sequence_number = 50);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (1_000, 0));
 
     // Three decay steps elapsed: 70% to claimant, 30% back to the treasury.
     env.ledger().with_mut(|li| li.sequence_number = 130);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (700, 300));
     assert_eq!(decay_bps(&config, 130), 7_000);
 
     // The schedule never pays less than the configured floor.
     env.ledger().with_mut(|li| li.sequence_number = 500);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (500, 500));
     assert_eq!(decay_bps(&config, 500), 5_000);
 }
 

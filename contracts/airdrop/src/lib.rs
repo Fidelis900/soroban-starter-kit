@@ -71,6 +71,14 @@ fn bump_instance(env: &Env) {
         .extend_ttl(LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
 }
 
+/// Current campaign epoch (0 before the first governance root update).
+fn current_epoch(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get::<_, u32>(&DataKey::Epoch)
+        .unwrap_or(0)
+}
+
 fn bump_persistent(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
@@ -152,7 +160,7 @@ fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
     let root_bytes: Bytes = env
         .storage()
         .instance()
-        .get(&DataKey::MerkleRoot)
+        .get(&DataKey::MerkleRoot(current_epoch(env)))
         .ok_or(AirdropError::RootNotSet)?;
 
     let deadline: u32 = env
@@ -177,7 +185,7 @@ fn decay_bps(cfg: &DecayConfig, now: u32) -> u32 {
     let reduction = steps
         .saturating_mul(cfg.decay_bps_per_step)
         .min(BPS_DENOMINATOR as u32 - cfg.floor_bps);
-    (BPS_DENOMINATOR as u32 - cfg.floor_bps - reduction).max(cfg.floor_bps)
+    (BPS_DENOMINATOR as u32 - reduction).max(cfg.floor_bps)
 }
 
 /// Apply the configured time decay to `amount`, returning the claimant's share
@@ -271,7 +279,6 @@ fn settle_claim(
         events::decay_remainder(env, &treasury, token, remainder);
     }
 
-    events::claimed(env, recipient, token, claimable);
     events::claimed(env, recipient, token, amount, tier);
     Ok(())
 }
@@ -378,7 +385,7 @@ mod contract {
             let root_bytes = Bytes::from(root.clone());
             env.storage()
                 .instance()
-                .set(&DataKey::MerkleRoot, &root_bytes);
+                .set(&DataKey::MerkleRoot(current_epoch(&env)), &root_bytes);
             bump_instance(&env);
 
             events::root_set(&env, &root_bytes);
@@ -482,17 +489,17 @@ mod contract {
             let epoch: u32 = env
                 .storage()
                 .instance()
-                .get(&DataKey::Epoch)
+                .get::<_, u32>(&DataKey::Epoch)
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or(AirdropError::ArithmeticOverflow)?;
 
             let root_bytes = Bytes::from(new_root);
-            let key = DataKey::MerkleRoot(epoch);
-            env.storage().instance().set(&key, &root_bytes);
+            // The new root is installed under the new epoch; claims read the
+            // root for the current epoch, so this becomes the active root.
             env.storage()
                 .instance()
-                .set(&DataKey::MerkleRoot, &root_bytes);
+                .set(&DataKey::MerkleRoot(epoch), &root_bytes);
             env.storage().instance().set(&DataKey::Epoch, &epoch);
             env.storage()
                 .instance()
@@ -715,7 +722,9 @@ mod contract {
 
         /// Returns the current merkle root, or `None` if not set.
         pub fn get_root(env: Env) -> Option<Bytes> {
-            env.storage().instance().get(&DataKey::MerkleRoot)
+            env.storage()
+                .instance()
+                .get(&DataKey::MerkleRoot(current_epoch(&env)))
         }
 
         /// Returns the vesting configuration, or `None` if claims are fully liquid.
