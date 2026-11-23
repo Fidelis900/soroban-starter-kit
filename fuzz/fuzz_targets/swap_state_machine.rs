@@ -20,14 +20,18 @@ enum SwapOp {
     Propose,
     Accept,
     Cancel,
+    FillPartial,
+    CancelBatch,
 }
 
 /// Extract operation from byte.
 fn byte_to_op(byte: u8) -> SwapOp {
-    match byte % 3 {
+    match byte % 5 {
         0 => SwapOp::Propose,
         1 => SwapOp::Accept,
-        _ => SwapOp::Cancel,
+        2 => SwapOp::Cancel,
+        3 => SwapOp::FillPartial,
+        _ => SwapOp::CancelBatch,
     }
 }
 
@@ -100,6 +104,9 @@ fuzz_target!(|data: &[u8]| {
     // Register swap contract
     let swap_addr = env.register_contract(None, SwapContract);
     let swap = soroban_swap_template::SwapContractClient::new(&env, &swap_addr);
+    let swap_admin = Address::generate(&env);
+    let swap_treasury = Address::generate(&env);
+    let _ = swap.try_initialize(&swap_admin, &swap_treasury, &0u32);
 
     // Create a pool of addresses
     let pool = [
@@ -148,6 +155,19 @@ fuzz_target!(|data: &[u8]| {
                 env.ledger().set_sequence_number(1000);
                 let deadline = 1000 + (deadline_offset % 10000) + 1;
 
+                // Derive partial-fill and hash-lock configuration from fuzz input
+                let allow_partial_fills = (data[data_offset] & 1) == 1;
+                data_offset += 1;
+
+                let use_hash_lock = (data[data_offset] & 1) == 1;
+                data_offset += 1;
+
+                let hash_lock = if use_hash_lock {
+                    Some(soroban_sdk::BytesN::from_array(&env, &[0u8; 32]))
+                } else {
+                    None
+                };
+
                 // Try to propose swap
                 let result = swap.try_propose_swap(
                     &party_a,
@@ -156,6 +176,8 @@ fuzz_target!(|data: &[u8]| {
                     &token_b_addr,
                     &amount_b,
                     &deadline,
+                    &allow_partial_fills,
+                    &hash_lock,
                 );
 
                 if let Ok(Ok(swap_id)) = result {
@@ -196,8 +218,8 @@ fuzz_target!(|data: &[u8]| {
                     if let Ok(Ok(swap_info)) = swap.try_get_swap(&swap_id) {
                         assert_eq!(
                             swap_info.state,
-                            soroban_swap_template::SwapState::Completed,
-                            "swap should be in Completed state after accept"
+                            soroban_swap_template::SwapState::Executed,
+                            "swap should be in Executed state after accept"
                         );
                     }
 
@@ -207,6 +229,104 @@ fuzz_target!(|data: &[u8]| {
                         second_accept.is_err(),
                         "should not be able to accept a swap twice"
                     );
+                }
+            }
+
+            SwapOp::FillPartial => {
+                if proposed_swaps.is_empty() {
+                    data_offset += 9; // Skip bytes
+                    continue;
+                }
+
+                let swap_idx = (data[data_offset] as usize) % proposed_swaps.len();
+                let swap_id = proposed_swaps[swap_idx];
+                data_offset += 1;
+
+                let party_b_idx = (data[data_offset] as usize) % pool.len();
+                let party_b = pool[party_b_idx].clone();
+                data_offset += 1;
+
+                let fill_amount = bytes_to_amount(data, data_offset);
+                data_offset += 8;
+
+                // Record remaining amount before the fill (if retrievable)
+                let remaining_before = swap
+                    .try_get_swap(&swap_id)
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .map(|info| info.remaining_amount);
+
+                let result = swap.try_fill_swap_partial(&swap_id, &party_b, &fill_amount);
+
+                if result.is_ok() {
+                    // Invariant: remaining amount must monotonically decrease
+                    if let (Some(before), Ok(Ok(swap_info))) =
+                        (remaining_before, swap.try_get_swap(&swap_id))
+                    {
+                        assert!(
+                            swap_info.remaining_amount <= before,
+                            "remaining_amount should not increase after partial fill"
+                        );
+                        assert!(
+                            swap_info.remaining_amount >= 0,
+                            "remaining_amount should never be negative"
+                        );
+                        // Invariant: state transitions are consistent
+                        if swap_info.remaining_amount == 0 {
+                            assert_eq!(
+                                swap_info.state,
+                                soroban_swap_template::SwapState::Executed,
+                                "swap should be Executed once fully filled"
+                            );
+                        } else {
+                            assert_eq!(
+                                swap_info.state,
+                                soroban_swap_template::SwapState::Open,
+                                "partially filled swap should remain Open"
+                            );
+                        }
+                    }
+                }
+            }
+
+            SwapOp::CancelBatch => {
+                if proposed_swaps.is_empty() {
+                    data_offset += 1; // Skip byte
+                    continue;
+                }
+
+                let creator = pool[(data[data_offset] as usize) % pool.len()].clone();
+                data_offset += 1;
+
+                let batch_len = ((data[data_offset] as usize) % proposed_swaps.len()) + 1;
+                data_offset += 1;
+
+                let mut batch: std::vec::Vec<u32> = std::vec::Vec::new();
+                for i in 0..batch_len {
+                    let idx = (data.get(data_offset + i).copied().unwrap_or(0) as usize)
+                        % proposed_swaps.len();
+                    batch.push(proposed_swaps[idx]);
+                }
+                data_offset += batch_len;
+
+                let mut batch_ids = soroban_sdk::Vec::new(&env);
+                for id in &batch {
+                    batch_ids.push_back(*id);
+                }
+
+                let result = swap.try_cancel_swaps_batch(&creator, &batch_ids);
+
+                if result.is_ok() {
+                    // Invariant: all batch swaps should be Cancelled
+                    for id in &batch {
+                        if let Ok(Ok(swap_info)) = swap.try_get_swap(id) {
+                            assert_eq!(
+                                swap_info.state,
+                                soroban_swap_template::SwapState::Cancelled,
+                                "swap should be Cancelled after batch cancel"
+                            );
+                        }
+                    }
                 }
             }
 

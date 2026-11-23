@@ -44,6 +44,10 @@ pub enum DataKey {
     DisputeTimeoutLedgers,
     /// Ledger sequence at which the current dispute was raised (`u32`).
     DisputeRaisedAt,
+    /// Grace period in ledgers after mark_delivered before buyer can claim expiration refund (`u32`).
+    GracePeriodLedgers,
+    /// Ledger sequence at which mark_delivered was called (`u32`).
+    DeliveryMarkedAt,
     /// List of milestones for multi-milestone escrows (`Vec<Milestone>`).
     /// Only present when the escrow was initialized with milestones.
     Milestones,
@@ -52,6 +56,35 @@ pub enum DataKey {
     FeeBps,
     /// Treasury [`Address`] that receives the deducted fee on each release.
     Treasury,
+    /// Reentrancy guard flag (`bool`). Set to `true` while a token transfer is
+    /// in progress; any reentrant call that hits [`require_not_locked`] will
+    /// immediately return [`EscrowError::NotAuthorized`].
+    Locked,
+    /// Ordered list of token contract [`Address`]es for a multi-token escrow.
+    /// Only present when the escrow was initialized with
+    /// [`EscrowContract::initialize_with_tokens`].
+    TokenContracts,
+    /// Parallel list of amounts for each entry in [`DataKey::TokenContracts`].
+    TokenAmounts,
+    /// Number of ledgers after the deadline before an abandoned funded escrow
+    /// can be refunded by its buyer.
+    AbandonmentBuffer,
+    /// Arbiter fee in basis points (0–2 000) deducted from the disputed amount
+    /// and paid to the arbiter(s) upon dispute resolution (`Option<u32>`).
+    /// `None` means no arbiter fee is charged.
+    ArbiterFeeBps,
+    /// Distinct arbiter approvals collected for the current dispute direction
+    /// (`Vec<Address>`).  Each arbiter may approve at most once per direction;
+    /// once the configured threshold is reached the dispute can be resolved.
+    DisputeApprovals,
+    /// Percentage-based staged milestone schedule (`Vec<StagedMilestone>`) with
+    /// a per-milestone dispute window (#1437). Only present when the escrow was
+    /// initialized with
+    /// [`EscrowContract::initialize_with_milestone_schedule`](crate::EscrowContract::initialize_with_milestone_schedule).
+    StagedMilestones,
+    /// Ledger timestamp (`u64`, seconds) before which no funds may be released
+    /// to the seller. Absent means no lockup is enforced.
+    LockupDeadline,
 }
 
 /// Lifecycle states of an escrow.
@@ -76,6 +109,8 @@ pub enum EscrowState {
     Refunded = 5,
     /// Escrow was cancelled before funding.
     Cancelled = 6,
+    /// The buyer reclaimed funds after the abandonment window elapsed.
+    ExpiredRefunded = 7,
 }
 
 impl Default for EscrowState {
@@ -94,9 +129,41 @@ impl core::fmt::Display for EscrowState {
             EscrowState::Completed => "completed",
             EscrowState::Refunded => "refunded",
             EscrowState::Cancelled => "cancelled",
+            EscrowState::ExpiredRefunded => "expired_refunded",
         })
     }
 }
+
+// ─── Reentrancy guard (#1190) ─────────────────────────────────────────────────
+
+/// Acquire the reentrancy lock.
+///
+/// Sets [`DataKey::Locked`] to `true` in instance storage.  Must be paired
+/// with a call to [`release_lock`] once the protected section (token transfer)
+/// is complete.
+///
+/// # Errors
+/// Returns [`EscrowError::NotAuthorized`] if the lock is already held,
+/// i.e., a reentrant call is detected.
+pub fn acquire_lock(env: &Env) -> Result<(), crate::errors::EscrowError> {
+    if env
+        .storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::Locked)
+        .unwrap_or(false)
+    {
+        return Err(crate::errors::EscrowError::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::Locked, &true);
+    Ok(())
+}
+
+/// Release the reentrancy lock acquired by [`acquire_lock`].
+pub fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::Locked, &false);
+}
+
+// ─── State guard ──────────────────────────────────────────────────────────────
 
 /// Reads the current [`EscrowState`] from instance storage and returns
 /// `Err(EscrowError::InvalidState)` when it does not match `expected`.
@@ -148,6 +215,9 @@ mod tests {
             deadline: 500u32,
             state: EscrowState::Created,
             metadata_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+            arbiter_fee_bps: Some(250u32),
+            arbiters: soroban_sdk::Vec::new(&env),
+            threshold: 0u32,
         };
 
         // Round-trip: encode → decode must produce the same value.
@@ -161,7 +231,7 @@ mod tests {
             "EscrowInfo XDR round-trip produced a different value"
         );
 
-        // Structural snapshot: the XDR map must have exactly these 7 keys,
+        // Structural snapshot: the XDR map must have exactly these keys,
         // in alphabetical order.  Hard-coded here as the stored snapshot.
         // Changing this list is a breaking on-chain ABI change.
         let sc_val = ScVal::try_from_val(&env, &val).expect("Val → ScVal failed");
@@ -183,11 +253,14 @@ mod tests {
             [
                 "amount",
                 "arbiter",
+                "arbiter_fee_bps",
+                "arbiters",
                 "buyer",
                 "deadline",
                 "metadata_hash",
                 "seller",
                 "state",
+                "threshold",
                 "token_contract"
             ],
             "EscrowInfo XDR field names changed — breaking on-chain ABI"
@@ -249,9 +322,21 @@ mod discriminant_tests {
             DataKey::MetadataHash => 14,
             DataKey::DisputeTimeoutLedgers => 15,
             DataKey::DisputeRaisedAt => 16,
-            DataKey::Milestones => 17,
-            DataKey::FeeBps => 18,
-            DataKey::Treasury => 19,
+            DataKey::GracePeriodLedgers => 17,
+            DataKey::DeliveryMarkedAt => 18,
+            DataKey::Milestones => 19,
+            DataKey::FeeBps => 20,
+            DataKey::Treasury => 21,
+            DataKey::Locked => 22,
+            DataKey::TokenContracts => 23,
+            DataKey::TokenAmounts => 24,
+            DataKey::AbandonmentBuffer => 25,
+            DataKey::ArbiterFeeBps => 26,
+            DataKey::DisputeApprovals => 27,
+            DataKey::StagedMilestones => 28,
+            DataKey::ArbiterFeeBps => 25,
+            DataKey::DisputeApprovals => 26,
+            DataKey::LockupDeadline => 27,
         }
     }
 
@@ -274,9 +359,21 @@ mod discriminant_tests {
         assert_eq!(escrow_data_key_index(&DataKey::MetadataHash), 14);
         assert_eq!(escrow_data_key_index(&DataKey::DisputeTimeoutLedgers), 15);
         assert_eq!(escrow_data_key_index(&DataKey::DisputeRaisedAt), 16);
-        assert_eq!(escrow_data_key_index(&DataKey::Milestones), 17);
-        assert_eq!(escrow_data_key_index(&DataKey::FeeBps), 18);
-        assert_eq!(escrow_data_key_index(&DataKey::Treasury), 19);
+        assert_eq!(escrow_data_key_index(&DataKey::GracePeriodLedgers), 17);
+        assert_eq!(escrow_data_key_index(&DataKey::DeliveryMarkedAt), 18);
+        assert_eq!(escrow_data_key_index(&DataKey::Milestones), 19);
+        assert_eq!(escrow_data_key_index(&DataKey::FeeBps), 20);
+        assert_eq!(escrow_data_key_index(&DataKey::Treasury), 21);
+        assert_eq!(escrow_data_key_index(&DataKey::Locked), 22);
+        assert_eq!(escrow_data_key_index(&DataKey::TokenContracts), 23);
+        assert_eq!(escrow_data_key_index(&DataKey::TokenAmounts), 24);
+        assert_eq!(escrow_data_key_index(&DataKey::AbandonmentBuffer), 25);
+        assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 26);
+        assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 27);
+        assert_eq!(escrow_data_key_index(&DataKey::StagedMilestones), 28);
+        assert_eq!(escrow_data_key_index(&DataKey::ArbiterFeeBps), 25);
+        assert_eq!(escrow_data_key_index(&DataKey::DisputeApprovals), 26);
+        assert_eq!(escrow_data_key_index(&DataKey::LockupDeadline), 27);
     }
 }
 
@@ -304,7 +401,8 @@ pub struct Milestone {
 /// `EscrowInfo` is serialised on-chain as an XDR map whose entries are keyed by
 /// field name and sorted alphabetically.  The stable key order is:
 ///
-/// `amount`, `arbiter`, `buyer`, `deadline`, `metadata_hash`, `seller`, `state`, `token_contract`
+/// `amount`, `arbiter`, `arbiter_fee_bps`, `arbiters`, `buyer`, `deadline`,
+/// `metadata_hash`, `seller`, `state`, `threshold`, `token_contract`
 ///
 /// **Renaming, adding, or removing any field is a breaking on-chain ABI change.**
 /// Off-chain clients (SDKs, indexers, test harnesses) that decode this type from
@@ -337,4 +435,79 @@ pub struct EscrowInfo {
     /// ScVal`, not the infallible `From` the generated `Option<T>` glue
     /// requires).
     pub metadata_hash: soroban_sdk::BytesN<32>,
+    /// Arbiter fee in basis points (0–2 000) charged on dispute resolution.
+    /// `None` means no arbiter fee is charged.
+    pub arbiter_fee_bps: Option<u32>,
+    /// Arbiter committee configured for this escrow (`Vec<Address>`).
+    /// Empty when the escrow uses the single-arbiter model.
+    pub arbiters: soroban_sdk::Vec<Address>,
+    /// Number of distinct arbiter approvals required to resolve a dispute
+    /// (`u32`). Zero when the escrow uses the single-arbiter model.
+    pub threshold: u32,
+}
+
+// ─── Staged (percentage-based) milestones (#1437) ────────────────────────────
+
+/// Input describing one stage of a percentage-based milestone schedule.
+///
+/// Passed to
+/// [`EscrowContract::initialize_with_milestone_schedule`](crate::EscrowContract::initialize_with_milestone_schedule).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneStage {
+    /// Share of the total escrow amount allocated to this stage, in basis
+    /// points (1–10 000). All stages must sum to exactly 10 000.
+    pub percentage_bps: u32,
+    /// Number of ledgers after the seller submits this stage during which the
+    /// buyer may escalate a dispute. Once the window elapses without a dispute
+    /// the stage can be claimed by the seller automatically. Must be non-zero.
+    pub dispute_window_ledgers: u32,
+}
+
+/// Lifecycle of a single staged milestone.
+///
+/// `Pending → Submitted → (Released | Disputed → (Released | Refunded))`.
+/// The buyer may also approve a `Pending` stage directly.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MilestoneStatus {
+    /// Work not yet submitted by the seller.
+    Pending = 0,
+    /// Seller submitted the deliverable; the dispute window is running.
+    Submitted = 1,
+    /// Buyer escalated a dispute within the window; awaiting the arbiter.
+    Disputed = 2,
+    /// Funds for this stage were paid to the seller.
+    Released = 3,
+    /// Funds for this stage were returned to the buyer by the arbiter.
+    Refunded = 4,
+}
+
+/// One stage of a percentage-based milestone schedule as stored on-chain.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedMilestone {
+    /// Share of the total escrow amount, in basis points.
+    pub percentage_bps: u32,
+    /// Token amount allocated to this stage, derived from `percentage_bps`.
+    /// The final stage absorbs any integer-division remainder so the stage
+    /// amounts always sum to the escrowed total.
+    pub amount: i128,
+    /// Dispute window for this stage, in ledgers.
+    pub dispute_window_ledgers: u32,
+    /// Current status of the stage.
+    pub status: MilestoneStatus,
+    /// Ledger sequence at which the seller submitted the stage (0 if never).
+    pub submitted_at: u32,
+}
+
+impl StagedMilestone {
+    /// Returns `true` once the stage has been paid out to either party.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        matches!(
+            self.status,
+            MilestoneStatus::Released | MilestoneStatus::Refunded
+        )
+    }
 }

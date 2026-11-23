@@ -15,7 +15,7 @@ This document catalogues, per contract, who is trusted, what each trusted role c
 
 | Role | Can do | Cannot do | Compromise blast radius |
 |------|--------|-----------|--------------------------|
-| Seller | `start`, `cancel` (only before any bid) | Cancel after a bid lands, alter bids | Low — cannot touch bidder funds; at most disrupts their own auction pre-bid |
+| Seller | `start`, `cancel` (before any bid, or within the cancellation grace window by paying `cancellation_fee` to the top bidder) | Cancel after the grace window once a bid lands, alter bids, collect a cancelled auction's bid | Low — cannot touch bidder funds; a grace-window cancel refunds the top bid in full plus compensation |
 | Bidder | `bid`, `withdraw` (own outbid funds) | Withdraw another bidder's funds | Limited to that bidder's own pending/escrowed bid amount |
 | Anyone | `end()` (permissionless settlement) | — | None — settlement logic is fixed regardless of caller |
 

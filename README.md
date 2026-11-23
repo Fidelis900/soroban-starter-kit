@@ -10,6 +10,8 @@ A curated collection of production-ready Soroban smart contract templates. These
 
 ## 🚀 Quick Start
 
+> **New to Soroban?** Follow the [Getting Started Tutorial](docs/getting-started-tutorial.md) for an end-to-end walkthrough: setting up your toolchain, writing storage types and contract logic, testing, and deploying your first custom contract.
+
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/soroban-contract-templates.git
@@ -376,6 +378,8 @@ A special thanks to all our [contributors](CONTRIBUTORS.md) who have helped make
 - [Deployment Guide](docs/deployment-guide.md)
 - [Testing Strategy](docs/testing-strategy.md) — Coverage matrix (unit/property/fuzz/integration) by contract
 - [Gas / Compute Unit Costs](docs/gas-costs.md) — Measured and estimated CU costs per contract function
+- [Getting Started Tutorial](docs/getting-started-tutorial.md) — End-to-end guide to building, testing, optimizing, and deploying your first custom contract
+- [Storage, TTL & State Archival Runbook](docs/storage-ttl-runbook.md) — Instance vs persistent TTL management, rent cost estimation, TTL renewal patterns, and archive restoration procedures
 - [Soroban Documentation](https://soroban.stellar.org/docs)
 - [Stellar Developer Discord](https://discord.gg/stellardev)
 - [Soroban Examples](https://github.com/stellar/soroban-examples)
@@ -393,3 +397,15 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 ---
 
 **Ready to build on Soroban?** Start with any template and customize it for your use case! 🚀
+
+## Handsoff notes
+
+<!-- handsoff-issue-1025 -->
+- #1025: Root Cargo.toml lists "contracts/ballot" as a workspace member twice
+<!-- handsoff-issue-1030 -->
+- #1030: CONTRIBUTING.md contains two entire, inconsistent contributing guides concatenated together — the first ~220 lines are an orphaned pre-19-contract-era version
+<!-- handsoff-issue-1119 -->
+- #1119: contracts/multisig: Off-chain EIP-712 / SEP-format typed signature batch verification
+
+<!-- handsoff-issue-1132 -->
+- #1132: contracts/staking: Time-weighted lockup boosting for staking rewards

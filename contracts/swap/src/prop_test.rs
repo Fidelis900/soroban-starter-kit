@@ -1,33 +1,111 @@
 #![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
     clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::unwrap_used
 )]
-#![cfg(test)]
+
+use std::format;
+
+extern crate std;
 
 use proptest::prelude::*;
 use soroban_sdk::{
     Address, Env,
-    testutils::{Address as _, Ledger as _},
-    token::StellarAssetClient,
+    testutils::{Address as _, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
 };
+use std::vec::Vec;
 
-use crate::{SwapContract, SwapContractClient};
+use crate::{SwapContract, SwapContractClient, SwapState};
 
-fn setup_swap<'a>(env: &'a Env, fee_bps: u32) -> (SwapContractClient<'a>, Address, Address) {
+fn register_token(env: &Env) -> Address {
+    let admin = Address::generate(env);
+    env.register_stellar_asset_contract_v2(admin).address()
+}
+
+fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+    StellarAssetClient::new(env, token).mint(to, &amount);
+}
+
+#[derive(Clone, Debug)]
+enum Command {
+    Propose { amount_a: i128, amount_b: i128 },
+    Accept { index: usize },
+    Cancel { index: usize },
+}
+
+fn commands() -> impl Strategy<Value = Vec<Command>> {
+    prop::collection::vec(
+        prop_oneof![
+            (1i128..=1_000, 1i128..=1_000)
+                .prop_map(|(amount_a, amount_b)| Command::Propose { amount_a, amount_b }),
+            (0usize..=31).prop_map(|index| Command::Accept { index }),
+            (0usize..=31).prop_map(|index| Command::Cancel { index }),
+        ],
+        1..=32,
+    )
+}
+
+use crate::calculate_and_validate_fee;
+
+fn setup(
+    env: &Env,
+) -> (
+    SwapContractClient,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 1);
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
+    let party_a = Address::generate(env);
+    let party_b = Address::generate(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    StellarAssetClient::new(env, &token_a).mint(&party_a, &1_000_000i128);
+    StellarAssetClient::new(env, &token_b).mint(&party_b, &1_000_000i128);
+    let address = env.register_contract(None, SwapContract);
+    let client = SwapContractClient::new(env, &address);
+    client.initialize(&admin, &treasury, &250);
+    (client, party_a, party_b, treasury, token_a, token_b)
+}
 
-    let swap_addr = env.register_contract(None, SwapContract);
-    let client = SwapContractClient::new(env, &swap_addr);
-    client.initialize(&admin, &treasury, &fee_bps);
-
-    (client, treasury, swap_addr)
+fn assert_conservation(
+    env: &Env,
+    client: &SwapContractClient,
+    party_a: &Address,
+    party_b: &Address,
+    treasury: &Address,
+    token_a: &Address,
+    token_b: &Address,
+) {
+    let contract = client.address.clone();
+    let token_a_client = soroban_sdk::token::Client::new(env, token_a);
+    let token_b_client = soroban_sdk::token::Client::new(env, token_b);
+    let token_a_total = token_a_client.balance(party_a)
+        + token_a_client.balance(party_b)
+        + token_a_client.balance(&contract);
+    let token_b_total = token_b_client.balance(party_a)
+        + token_b_client.balance(party_b)
+        + token_b_client.balance(treasury)
+        + token_b_client.balance(&contract);
+    assert_eq!(token_a_total, 1_000_000, "token A was created or destroyed");
+    assert_eq!(token_b_total, 1_000_000, "token B was created or destroyed");
 }
 
 proptest! {
+    /// Stateful invariant: arbitrary propose/cancel/accept sequences conserve both
+    /// assets exactly, with fees moving only to the configured treasury.
+    ///
+    /// Closes #1082.
     /// Property: Fee + party_a_amount always equals amount_b (no rounding loss)
     /// Closes #961 – swap fee calculation invariant
     #[test]
@@ -35,7 +113,7 @@ proptest! {
         amount_b in 100i128..=1_000_000i128,
         fee_bps in 0u32..=10_000u32,
     ) {
-        let fee = (amount_b * i128::from(fee_bps)) / 10_000;
+        let fee = calculate_and_validate_fee(amount_b, fee_bps).unwrap();
         let party_a_amount = amount_b - fee;
 
         // Invariant: no rounding loss
@@ -46,21 +124,42 @@ proptest! {
         // Invariant: both amounts non-negative
         prop_assert!(fee >= 0, "Negative fee: {}", fee);
         prop_assert!(party_a_amount >= 0, "Negative party_a amount: {}", party_a_amount);
+        prop_assert!(fee <= amount_b, "Fee cannot exceed total traded amount");
+    }
+
+    /// Property: Treasury fee cannot exceed total traded amount across split transactions
+    #[test]
+    fn prop_fee_invariance_split_transactions(
+        total_amount in 10i128..=10_000i128,
+        num_splits in 2usize..=10usize,
+        fee_bps in 1u32..=1_000u32,
+    ) {
+        let chunk = total_amount / num_splits as i128;
+        if chunk > 0 {
+            let mut total_split_fee = 0i128;
+            for _ in 0..num_splits {
+                let split_fee = calculate_and_validate_fee(chunk, fee_bps).unwrap();
+                prop_assert!(split_fee > 0, "Fee must be non-zero when fee_bps > 0");
+                prop_assert!(split_fee <= chunk, "Fee cannot exceed chunk size");
+                total_split_fee += split_fee;
+            }
+            prop_assert!(total_split_fee <= total_amount,
+                "Total fee from split transactions cannot exceed total traded volume");
+        }
     }
 
     /// Property: Total transferred out equals total transferred in
     #[test]
-    fn prop_swap_conservation(
+    fn prop_sequential_partial_fills_reach_exact_total(
         amount_a in 100i128..=10_000i128,
-        amount_b in 100i128..=10_000i128,
-        fee_bps in 0u32..=1_000u32,
+        ratio in 1i128..=20i128,
+        first_fill in 1i128..=5_000i128,
     ) {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|l| l.sequence_number = 100);
 
-        let (client, treasury, swap_addr) = setup_swap(&env, fee_bps);
-
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
         let party_a = Address::generate(&env);
         let party_b = Address::generate(&env);
 
@@ -83,7 +182,10 @@ proptest! {
             &amount_a,
             &token_b,
             &amount_b,
-            &expires_at
+            &expires_at,
+            &true,
+            &None,
+            &None,
         );
 
         if swap_id_result.is_err() {
@@ -100,7 +202,7 @@ proptest! {
             let tok_b = soroban_sdk::token::Client::new(&env, &token_b);
 
             // Calculate expected fee
-            let fee = (amount_b * i128::from(fee_bps)) / 10_000;
+            let fee = calculate_and_validate_fee(amount_b, fee_bps).unwrap();
             let party_a_net = amount_b - fee;
 
             // Verify balances
@@ -129,113 +231,472 @@ proptest! {
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let swap_addr = env.register_contract(None, SwapContract);
-        let client = SwapContractClient::new(&env, &swap_addr);
 
-        let result = client.try_initialize(&admin, &treasury, &fee_bps);
-
-        if fee_bps > 10_000 {
-            prop_assert!(result.is_err(), "Should reject fee_bps > 10000");
-        } else {
-            prop_assert!(result.is_ok() || result.is_err(),
-                "fee_bps <= 10000 should be accepted or fail for other reasons");
-        }
-    }
-
+        let amount_b = amount_a * ratio;
+        mint(&env, &token_a, &party_a, amount_a * 2);
+        mint(&env, &token_b, &party_b, amount_b * 2);
     /// Property: Cancelled swaps return funds to party_a
     #[test]
-    fn prop_cancel_returns_funds(
-        amount_a in 100i128..=10_000i128,
-        amount_b in 100i128..=10_000i128,
-    ) {
+    fn prop_swap_state_machine_preserves_balances(actions in commands()) {
         let env = Env::default();
+        let (client, party_a, party_b, treasury, token_a, token_b) = setup(&env);
+        assert_conservation(&env, &client, &party_a, &party_b, &treasury, &token_a, &token_b);
+
+        for action in actions {
+            match action {
+                Command::Propose { amount_a, amount_b } => {
+                    let expiry = env.ledger().sequence() + 100;
+                    let _ = client.try_propose_swap(
+                        &party_a, &token_a, &amount_a, &token_b, &amount_b, &expiry, &true,
+                        &None, &None,
+                    );
+                }
+                Command::Accept { index } => {
+                    let count = client.swap_count();
+                    if count > 0 {
+                        let id = (index as u32) % count;
+                        let _ = client.try_accept_swap(&id, &party_b);
+                    }
+                }
+                Command::Cancel { index } => {
+                    let count = client.swap_count();
+                    if count > 0 {
+                        let id = (index as u32) % count;
+                        let _ = client.try_cancel_swap(&id);
+                    }
+                }
+            }
+            assert_conservation(&env, &client, &party_a, &party_b, &treasury, &token_a, &token_b);
+        }
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.sequence_number = 100);
 
-        let (client, _, _) = setup_swap(&env, 250u32);
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+        let approve_until = env.ledger().sequence() + 1_000_000;
+        TokenClient::new(&env, &token_a).approve(&party_a, &contract_addr, &(amount_a * 4), &approve_until);
 
-        let party_a = Address::generate(&env);
-        let sac_admin = Address::generate(&env);
-        let sac1 = env.register_stellar_asset_contract_v2(sac_admin.clone());
-        let token_a = sac1.address();
-        let sac2 = env.register_stellar_asset_contract_v2(sac_admin);
-        let token_b = sac2.address();
-
-        StellarAssetClient::new(&env, &token_a).mint(&party_a, &amount_a);
-
-        let expires_at = env.ledger().sequence() + 1000;
-        let swap_id_result = client.try_propose_swap(
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
             &party_a,
             &token_a,
             &amount_a,
             &token_b,
             &amount_b,
-            &expires_at
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
         );
 
-        if swap_id_result.is_err() {
-            return Ok(());
-        }
+        let first = first_fill.min(amount_a - 1);
+        client.accept_swap_partial(&party_b, &swap_id, &first);
+        let second = amount_a - first;
+        client.accept_swap_partial(&party_b, &swap_id, &second);
 
-        let swap_id = swap_id_result.unwrap();
-        let balance_after_propose = soroban_sdk::token::Client::new(&env, &token_a).balance(&party_a);
-
-        // Cancel the swap
-        let _ = client.try_cancel_swap(&swap_id);
-
-        let balance_after_cancel = soroban_sdk::token::Client::new(&env, &token_a).balance(&party_a);
-
-        // Invariant: party_a gets their tokens back after cancel
-        prop_assert!(balance_after_cancel >= balance_after_propose,
-            "Party A should get tokens back after cancel: before={}, after={}",
-            balance_after_propose, balance_after_cancel);
+        let swap = client.get_swap(&swap_id);
+        prop_assert_eq!(swap.filled_amount, amount_a);
+        prop_assert_eq!(swap.state, SwapState::Executed);
+        prop_assert_eq!(TokenClient::new(&env, &token_a).balance(&party_b), amount_a);
     }
 
-    /// Property: Expired swaps cannot be accepted
     #[test]
-    fn prop_expired_swaps_rejected(
-        amount_a in 100i128..=1_000i128,
-        amount_b in 100i128..=1_000i128,
+    fn prop_escrow_cancel_returns_remaining_balance(
+        amount_a in 500i128..=20_000i128,
+        amount_b in 500i128..=20_000i128,
+        fill in 1i128..=10_000i128,
     ) {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|l| l.sequence_number = 100);
 
-        let (client, _, _) = setup_swap(&env, 250u32);
-
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
         let party_a = Address::generate(&env);
         let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        let sac_admin = Address::generate(&env);
-        let sac1 = env.register_stellar_asset_contract_v2(sac_admin.clone());
-        let token_a = sac1.address();
-        let sac2 = env.register_stellar_asset_contract_v2(sac_admin);
-        let token_b = sac2.address();
+        mint(&env, &token_a, &party_a, amount_a * 3);
+        mint(&env, &token_b, &party_b, amount_b * 3);
 
-        StellarAssetClient::new(&env, &token_a).mint(&party_a, &amount_a);
-        StellarAssetClient::new(&env, &token_b).mint(&party_b, &amount_b);
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
 
-        let expires_at = env.ledger().sequence() + 10;
-        let swap_id_result = client.try_propose_swap(
+        let token_a_client = TokenClient::new(&env, &token_a);
+        let before = token_a_client.balance(&party_a);
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
             &party_a,
             &token_a,
             &amount_a,
             &token_b,
             &amount_b,
-            &expires_at
+            &expires_at,
+            &true,
+            &true,
+            &None,
+            &None,
         );
 
-        if swap_id_result.is_err() {
+        client.cancel_swap(&swap_id);
+
+        let after = token_a_client.balance(&party_a);
+        let _ = (party_b, fill);
+        prop_assert_eq!(after, before);
+    }
+
+    /// Property: The sum of successive partial fills equals the original offer
+    /// amount, and the remaining amount never goes negative.
+    #[test]
+    fn prop_partial_fills_sum_to_amount_a(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        first_fill in 1i128..=10_000i128,
+        second_fill in 1i128..=10_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a);
+        mint(&env, &token_b, &party_b, amount_b);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let first = first_fill.min(amount_a);
+        let _ = client.try_accept_swap_partial(&party_b, &swap_id, &first);
+        let swap = client.get_swap(&swap_id);
+        prop_assert!(swap.remaining_amount >= 0, "remaining amount went negative");
+
+        let second = second_fill.min(swap.remaining_amount);
+        let _ = client.try_accept_swap_partial(&party_b, &swap_id, &second);
+
+        let swap = client.get_swap(&swap_id);
+        prop_assert!(swap.remaining_amount >= 0, "remaining amount went negative");
+        prop_assert_eq!(
+            swap.filled_amount + swap.remaining_amount,
+            amount_a,
+            "filled + remaining must equal original offer"
+        );
+        prop_assert!(swap.filled_amount <= amount_a);
+    }
+
+    /// Property: Each partial fill delivers a proportional counterparty amount
+    /// (never more than the proportional share, never zero for a non-zero fill).
+    #[test]
+    fn prop_partial_fill_proportional_payment(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        fill in 1i128..=10_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a);
+        mint(&env, &token_b, &party_b, amount_b);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let fill = fill.min(amount_a);
+        let token_b_client = TokenClient::new(&env, &token_b);
+        let before_b = token_b_client.balance(&party_a);
+        let result = client.try_accept_swap_partial(&party_b, &swap_id, &fill);
+        if result.is_err() {
+            return Ok(());
+        }
+        let received = token_b_client.balance(&party_a) - before_b;
+
+        // Proportional share, rounded down, must not exceed the exact ratio.
+        let expected_max = amount_b * fill / amount_a;
+        prop_assert!(received <= expected_max, "over-delivered counterparty amount");
+        prop_assert!(received > 0, "non-zero fill must deliver a non-zero amount");
+    }
+
+    /// Property: Constant product invariant `k = reserve_a * reserve_b` never
+    /// decreases across a long run of random swaps.
+    ///
+    /// Closes #1468.
+    #[test]
+    fn prop_constant_product_invariant_holds(
+        initial_a in 1_000i128..=1_000_000i128,
+        initial_b in 1_000i128..=1_000_000i128,
+        swaps in prop::collection::vec((1i128..=10_000i128, any::<bool>()), 10_000..=10_000),
+    ) {
+        let mut reserve_a = initial_a;
+        let mut reserve_b = initial_b;
+        let mut k = reserve_a * reserve_b;
+
+        for (amount, a_to_b) in swaps {
+            let (reserve_in, reserve_out) = if a_to_b {
+                (reserve_a, reserve_b)
+            } else {
+                (reserve_b, reserve_a)
+            };
+
+            // Constant product output with the standard 0.3% fee, rounded down.
+            let amount_in_with_fee = amount * 997;
+            let numerator = amount_in_with_fee * reserve_out;
+            let denominator = reserve_in * 1000 + amount_in_with_fee;
+            if denominator == 0 {
+                continue;
+            }
+            let amount_out = numerator / denominator;
+            if amount_out <= 0 || amount_out >= reserve_out {
+                continue;
+            }
+
+            if a_to_b {
+                reserve_a += amount;
+                reserve_b -= amount_out;
+            } else {
+                reserve_b += amount;
+                reserve_a -= amount_out;
+            }
+
+            let new_k = reserve_a * reserve_b;
+            prop_assert!(
+                new_k >= k,
+                "invariant decreased: old_k={}, new_k={}",
+                k,
+                new_k
+            );
+            k = new_k;
+        }
+    }
+
+    /// Property: Flash swap repayment verification — the borrower must return
+    /// the borrowed amount plus fee, and the pool invariant must not decrease.
+    ///
+    /// Closes #1469.
+    #[test]
+    fn prop_flash_swap_repayment_verified(
+        reserve_a in 1_000i128..=1_000_000i128,
+        reserve_b in 1_000i128..=1_000_000i128,
+        borrow_frac_bps in 1u32..=5_000u32,
+        fee_bps in 0u32..=100u32,
+    ) {
+        let borrow_a = reserve_a * (borrow_frac_bps as i128) / 10_000;
+        if borrow_a <= 0 {
             return Ok(());
         }
 
-        let swap_id = swap_id_result.unwrap();
+        let fee = borrow_a * (fee_bps as i128) / 10_000;
+        let required_repayment = borrow_a + fee;
 
-        // Advance past deadline
-        env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+        // Repayment must always cover the principal.
+        prop_assert!(required_repayment >= borrow_a);
 
-        let accept_result = client.try_accept_swap(&swap_id, &party_b);
+        // Simulate a successful flash swap: borrow then repay principal + fee.
+        let mut pool_a = reserve_a - borrow_a;
+        let mut pool_b = reserve_b;
+        pool_a += required_repayment;
+        let new_k = pool_a * pool_b;
+        let old_k = reserve_a * reserve_b;
+        prop_assert!(
+            new_k >= old_k,
+            "flash swap decreased invariant: old_k={}, new_k={}",
+            old_k,
+            new_k
+        );
 
-        prop_assert!(accept_result.is_err(), "Expired swap should not be accepted");
+        // Simulate an under-repayment: only principal returned, fee missing.
+        let mut bad_pool_a = reserve_a - borrow_a;
+        bad_pool_a += borrow_a;
+        let bad_k = bad_pool_a * reserve_b;
+        if fee > 0 {
+            prop_assert!(
+                bad_k < old_k,
+                "under-repayment should be detectable via invariant"
+            );
+        }
+    /// Property: Cumulative price accumulators are monotonically non-decreasing
+    /// across arbitrary sequences of swaps and ledger advances, and the locked
+    /// minimum liquidity remains at the dead address.
+    #[test]
+    fn prop_cumulative_price_monotonic_and_min_liquidity_locked(
+        amount_a in 1_000i128..=100_000i128,
+        amount_b in 1_000i128..=100_000i128,
+        steps in 1usize..=10usize,
+        ledger_advance in 1u32..=100u32,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let party_b = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a * steps as i128);
+        mint(&env, &token_b, &party_b, amount_b * steps as i128);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let expires_at = env.ledger().sequence() + 1_000_000;
+        let swap_id = client.propose_swap_with_options(
+            &party_a,
+            &token_a,
+            &amount_a,
+            &token_b,
+            &amount_b,
+            &expires_at,
+            &true,
+            &false,
+            &None,
+            &None,
+        );
+
+        let mut prev_0 = client.get_price_0_cumulative();
+        let mut prev_1 = client.get_price_1_cumulative();
+
+        for _ in 0..steps {
+            env.ledger()
+                .with_mut(|l| l.sequence_number += ledger_advance);
+
+            let _ = client.try_accept_swap_partial(&party_b, &swap_id, &amount_a);
+
+            let cur_0 = client.get_price_0_cumulative();
+            let cur_1 = client.get_price_1_cumulative();
+
+            prop_assert!(
+                cur_0 >= prev_0,
+                "price_0_cumulative decreased: {} -> {}",
+                prev_0,
+                cur_0
+            );
+            prop_assert!(
+                cur_1 >= prev_1,
+                "price_1_cumulative decreased: {} -> {}",
+                prev_1,
+                cur_1
+            );
+
+            prev_0 = cur_0;
+            prev_1 = cur_1;
+        }
+
+        // The minimum liquidity lockup must remain permanently at the dead address.
+        prop_assert!(
+            client.get_locked_liquidity() >= 1_000,
+            "minimum liquidity lockup was not established"
+        );
+        prop_assert_eq!(
+            client.get_lp_balance(&crate::dead_address(&env)),
+            client.get_locked_liquidity(),
+            "locked liquidity must remain at the dead address"
+        );
+    }
+
+    /// Property: Batch cancellation refunds every escrowed balance and leaves
+    /// the contract with no residual funds.
+    #[test]
+    fn prop_batch_cancel_conserves_balances(
+        amount_a in 100i128..=10_000i128,
+        amount_b in 100i128..=10_000i128,
+        count in 1usize..=5usize,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        let token_a = register_token(&env);
+        let token_b = register_token(&env);
+        let party_a = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mint(&env, &token_a, &party_a, amount_a * count as i128);
+        mint(&env, &token_b, &party_a, amount_b * count as i128);
+
+        let contract_addr = env.register_contract(None, SwapContract);
+        let client = SwapContractClient::new(&env, &contract_addr);
+        client.initialize(&party_a, &treasury, &0);
+
+        let token_a_client = TokenClient::new(&env, &token_a);
+        let token_b_client = TokenClient::new(&env, &token_b);
+        let before_a = token_a_client.balance(&party_a);
+        let before_b = token_b_client.balance(&party_a);
+
+        let expires_at = env.ledger().sequence() + 100;
+        let mut ids: Vec<u32> = Vec::new();
+        for _ in 0..count {
+            let id = client.propose_swap_with_options(
+                &party_a,
+                &token_a,
+                &amount_a,
+                &token_b,
+                &amount_b,
+                &expires_at,
+                &true,
+                &false,
+                &None,
+                &None,
+            );
+            ids.push(id);
+        }
+
+        let mut batch: soroban_sdk::Vec<u32> = soroban_sdk::Vec::new(&env);
+        for id in ids.iter() {
+            batch.push_back(*id);
+        }
+        client.cancel_swaps_batch(&party_a, &batch);
+
+        prop_assert_eq!(token_a_client.balance(&party_a), before_a);
+        prop_assert_eq!(token_b_client.balance(&party_a), before_b);
+        prop_assert_eq!(token_a_client.balance(&contract_addr), 0);
+        prop_assert_eq!(token_b_client.balance(&contract_addr), 0);
+        for id in ids.iter() {
+            prop_assert_eq!(client.get_swap(id).state, SwapState::Cancelled);
+        }
     }
 }

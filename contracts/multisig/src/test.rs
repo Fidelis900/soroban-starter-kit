@@ -110,7 +110,7 @@ fn add_signer_with_threshold_approvals_updates_signer_set() {
     let (client, alice, bob, carol, _) = create_multisig(&env);
     let dave = Address::generate(&env);
 
-    client.add_signer(&vec![&env, alice.clone(), bob.clone()], &dave, &3);
+    client.add_signer(&vec![&env, alice.clone(), bob.clone()], &dave, &1, &3);
 
     assert_eq!(client.get_threshold(), Some(3));
     assert_eq!(client.get_signers(), vec![&env, alice, bob, carol, dave]);
@@ -124,7 +124,7 @@ fn add_signer_rejects_insufficient_approvals() {
     let (client, alice, _, _, _) = create_multisig(&env);
     let dave = Address::generate(&env);
 
-    client.add_signer(&vec![&env, alice], &dave, &2);
+    client.add_signer(&vec![&env, alice], &dave, &1, &2);
 }
 
 #[test]
@@ -656,4 +656,978 @@ fn execute_batch_emits_batch_executed_event() {
         .iter()
         .any(|(_, topics, _)| topics == (Symbol::new(&env, "batch_executed"),).into_val(&env));
     assert!(found, "batch_executed event not emitted");
+}
+
+// ── #1117 proposal enumeration and pagination ────────────────────────────────
+
+/// Helper: propose `n` counter increments from `proposer`, returning the target.
+fn propose_n(env: &Env, client: &MultisigContractClient, proposer: &Address, n: u32) -> Address {
+    let target = env.register_contract(None, CounterContract);
+    for _ in 0..n {
+        client.propose_transaction(
+            proposer,
+            &target,
+            &Symbol::new(env, "increment"),
+            &vec![env, 1u32.into_val(env)],
+            &100u32,
+        );
+    }
+    target
+}
+
+fn page_ids(page: &TransactionPage) -> std::vec::Vec<u64> {
+    page.items.iter().map(|tx| tx.id).collect()
+}
+
+#[test]
+fn get_transactions_paginates_forward() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 5);
+
+    let p1 = client.get_transactions(&0, &2, &None, &false);
+    assert_eq!(page_ids(&p1), [0, 1]);
+    assert_eq!(p1.next_cursor, Some(2));
+
+    let p2 = client.get_transactions(&2, &2, &None, &false);
+    assert_eq!(page_ids(&p2), [2, 3]);
+    assert_eq!(p2.next_cursor, Some(4));
+
+    let p3 = client.get_transactions(&4, &2, &None, &false);
+    assert_eq!(page_ids(&p3), [4]);
+    assert_eq!(p3.next_cursor, None);
+
+    let past_end = client.get_transactions(&5, &2, &None, &false);
+    assert!(past_end.items.is_empty());
+    assert_eq!(past_end.next_cursor, None);
+}
+
+#[test]
+fn get_transactions_paginates_backward() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 5);
+
+    let p1 = client.get_transactions(&u64::MAX, &2, &None, &true);
+    assert_eq!(page_ids(&p1), [4, 3]);
+    assert_eq!(p1.next_cursor, Some(2));
+
+    let p2 = client.get_transactions(&2, &2, &None, &true);
+    assert_eq!(page_ids(&p2), [2, 1]);
+    assert_eq!(p2.next_cursor, Some(0));
+
+    let p3 = client.get_transactions(&0, &2, &None, &true);
+    assert_eq!(page_ids(&p3), [0]);
+    assert_eq!(p3.next_cursor, None);
+}
+
+#[test]
+fn get_transactions_empty_wallet_returns_empty_page() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = create_multisig(&env);
+
+    for descending in [false, true] {
+        let page = client.get_transactions(&0, &10, &None, &descending);
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_cursor, None);
+    }
+}
+
+#[test]
+fn get_transactions_filters_by_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 4);
+
+    // 0: pending, 1: executed, 2: cancelled, 3: pending
+    client.sign_transaction(&bob, &1);
+    client.execute_transaction(&1);
+    client.cancel_transaction(&carol, &2);
+
+    let executed = client.get_transactions(&0, &10, &Some(TxStatus::Executed), &false);
+    assert_eq!(page_ids(&executed), [1]);
+
+    let cancelled = client.get_transactions(&0, &10, &Some(TxStatus::Cancelled), &false);
+    assert_eq!(page_ids(&cancelled), [2]);
+
+    let pending = client.get_transactions(&0, &10, &Some(TxStatus::Pending), &false);
+    assert_eq!(page_ids(&pending), [0, 3]);
+
+    env.ledger().with_mut(|l| l.sequence_number += 101);
+    let expired = client.get_transactions(&0, &10, &Some(TxStatus::Expired), &false);
+    assert_eq!(page_ids(&expired), [0, 3]);
+}
+
+// ── #1114 reentrancy guard ───────────────────────────────────────────────────
+
+/// Malicious target that tries to re-enter the multisig and execute another
+/// pending proposal while its own dispatch is still in progress.
+#[contract]
+pub struct ReentrantAttacker;
+
+#[contractimpl]
+impl ReentrantAttacker {
+    pub fn attack(env: Env, multisig: Address, tx_id: u64) {
+        MultisigContractClient::new(&env, &multisig).execute_transaction(&tx_id);
+    }
+}
+
+#[test]
+#[should_panic]
+fn reentrant_execution_from_invoked_contract_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, contract_address) = create_multisig(&env);
+    let attacker = env.register_contract(None, ReentrantAttacker);
+    let counter = env.register_contract(None, CounterContract);
+
+    // Proposal 1: an innocent-looking counter call the attacker wants to run early.
+    let victim_id = 1u64;
+    let attack_id = client.propose_transaction(
+        &alice,
+        &attacker,
+        &Symbol::new(&env, "attack"),
+        &vec![&env, contract_address.into_val(&env), victim_id.into_val(&env)],
+        &100u32,
+    );
+    client.propose_transaction(
+        &alice,
+        &counter,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &100u32,
+    );
+    client.sign_transaction(&bob, &attack_id);
+    client.sign_transaction(&bob, &victim_id);
+
+    client.execute_transaction(&attack_id);
+}
+
+#[test]
+fn entry_points_reject_calls_while_lock_is_held() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, contract_address) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.as_contract(&contract_address, || {
+        env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    });
+
+    let reentrant = Err(Ok(MultisigError::Reentrant));
+    let approvals = vec![&env, alice.clone(), bob.clone()];
+    assert_eq!(client.try_execute_transaction(&0).map(|_| ()), reentrant);
+    assert_eq!(client.try_sign_transaction(&carol, &0).map(|_| ()), reentrant);
+    assert_eq!(client.try_cancel_transaction(&carol, &0).map(|_| ()), reentrant);
+    assert_eq!(
+        client
+            .try_add_signer(&approvals, &Address::generate(&env), &2)
+            .map(|_| ()),
+        reentrant
+    );
+    assert_eq!(
+        client.try_remove_signer(&approvals, &carol, &2).map(|_| ()),
+        reentrant
+    );
+    assert_eq!(
+        client.try_set_timelock_delay(&approvals, &10).map(|_| ()),
+        reentrant
+    );
+    assert_eq!(
+        client.try_spend_allowance(&alice, &bob, &1).map(|_| ()),
+        reentrant
+    );
+    assert!(client.try_execute_batch(&vec![&env, 0u64]).is_err());
+
+    env.as_contract(&contract_address, || {
+        env.storage().instance().remove(&DataKey::ReentrancyLock);
+    });
+    client.execute_transaction(&0);
+}
+
+#[test]
+fn execution_lock_is_released_after_dispatch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, contract_address) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 2);
+    client.sign_transaction(&bob, &0);
+    client.sign_transaction(&bob, &1);
+
+    client.execute_transaction(&0);
+    let locked = env.as_contract(&contract_address, || {
+        env.storage().instance().has(&DataKey::ReentrancyLock)
+    });
+    assert!(!locked);
+
+    // A subsequent, non-reentrant execution still succeeds.
+    client.execute_transaction(&1);
+}
+
+// ── #1116 timelock ───────────────────────────────────────────────────────────
+
+#[test]
+fn timelock_delays_execution_until_elapsed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    client.set_timelock_delay(&vec![&env, alice.clone(), bob.clone()], &50);
+    assert_eq!(client.get_timelock_delay(), 50);
+
+    let target = propose_n(&env, &client, &alice, 1);
+    let counter = CounterContractClient::new(&env, &target);
+    assert_eq!(client.get_transaction_status(&0), Some(TxStatus::Pending));
+
+    client.sign_transaction(&bob, &0);
+    let queued_at = env.ledger().sequence();
+    let tx = client.get_transaction(&0).unwrap();
+    assert_eq!(tx.queued_ledger, Some(queued_at));
+    assert_eq!(client.get_transaction_status(&0), Some(TxStatus::Queued));
+
+    assert_eq!(
+        client.try_execute_transaction(&0).map(|_| ()),
+        Err(Ok(MultisigError::TimelockNotElapsed))
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = queued_at + 49);
+    assert_eq!(
+        client.try_execute_transaction(&0).map(|_| ()),
+        Err(Ok(MultisigError::TimelockNotElapsed))
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = queued_at + 50);
+    client.execute_transaction(&0);
+    assert_eq!(counter.get(), 1);
+}
+
+#[test]
+fn signer_can_cancel_queued_transaction_during_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    client.set_timelock_delay(&vec![&env, alice.clone(), bob.clone()], &50);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    client.cancel_transaction(&carol, &0);
+    assert_eq!(client.get_transaction_status(&0), Some(TxStatus::Cancelled));
+
+    env.ledger().with_mut(|l| l.sequence_number += 50);
+    assert_eq!(
+        client.try_execute_transaction(&0).map(|_| ()),
+        Err(Ok(MultisigError::TransactionCancelled))
+    );
+}
+
+#[test]
+fn non_signer_cannot_cancel_transaction() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 1);
+
+    assert_eq!(
+        client.try_cancel_transaction(&Address::generate(&env), &0),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+#[test]
+fn set_timelock_delay_requires_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_set_timelock_delay(&vec![&env, alice], &50),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+}
+
+#[test]
+fn queue_transaction_queues_after_threshold_lowered() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    client.set_timelock_delay(&vec![&env, alice.clone(), bob.clone()], &10);
+    propose_n(&env, &client, &alice, 1);
+
+    // Not yet at threshold, so the proposal cannot be queued.
+    assert_eq!(
+        client.try_queue_transaction(&0),
+        Err(Ok(MultisigError::ThresholdNotMet))
+    );
+
+    // Lower threshold to 1 via a signer-set change; proposal now qualifies.
+    let dave = Address::generate(&env);
+    client.add_signer(&vec![&env, alice.clone(), bob.clone()], &dave, &1);
+    assert_eq!(
+        client.try_execute_transaction(&0).map(|_| ()),
+        Err(Ok(MultisigError::NotQueued))
+    );
+
+    let executable_at = client.queue_transaction(&0);
+    assert_eq!(executable_at, env.ledger().sequence() + 10);
+    env.ledger().with_mut(|l| l.sequence_number = executable_at);
+    client.execute_transaction(&0);
+}
+
+// ── #1115 daily spending allowance ───────────────────────────────────────────
+
+fn setup_allowance<'a>(
+    env: &'a Env,
+    daily_limit: i128,
+) -> (
+    MultisigContractClient<'a>,
+    Address,
+    soroban_sdk::token::Client<'a>,
+) {
+    let (client, alice, bob, _, contract_address) = create_multisig(env);
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
+    let token_address = sac.address();
+    soroban_sdk::token::StellarAssetClient::new(env, &token_address)
+        .mint(&contract_address, &1_000_000);
+
+    let operator = Address::generate(env);
+    client.set_spending_limit(
+        &vec![env, alice, bob],
+        &operator,
+        &token_address,
+        &daily_limit,
+    );
+    (
+        client,
+        operator,
+        soroban_sdk::token::Client::new(env, &token_address),
+    )
+}
+
+#[test]
+fn operator_spends_within_allowance_without_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, operator, token) = setup_allowance(&env, 100);
+    let payee = Address::generate(&env);
+
+    assert_eq!(client.spend_allowance(&operator, &payee, &60), 60);
+    assert_eq!(token.balance(&payee), 60);
+    assert_eq!(client.remaining_allowance(), 40);
+
+    assert_eq!(
+        client.try_spend_allowance(&operator, &payee, &41),
+        Err(Ok(MultisigError::DailyLimitExceeded))
+    );
+    assert_eq!(client.spend_allowance(&operator, &payee, &40), 100);
+    assert_eq!(token.balance(&payee), 100);
+}
+
+#[test]
+fn allowance_resets_after_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, operator, token) = setup_allowance(&env, 100);
+    let payee = Address::generate(&env);
+
+    client.spend_allowance(&operator, &payee, &100);
+    assert_eq!(
+        client.try_spend_allowance(&operator, &payee, &1),
+        Err(Ok(MultisigError::DailyLimitExceeded))
+    );
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += SPENDING_WINDOW_LEDGERS);
+    assert_eq!(client.remaining_allowance(), 100);
+    assert_eq!(client.spend_allowance(&operator, &payee, &70), 70);
+    assert_eq!(token.balance(&payee), 170);
+}
+
+#[test]
+fn allowance_spend_count_is_rate_limited() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, operator, _) = setup_allowance(&env, 1_000);
+    let payee = Address::generate(&env);
+
+    for _ in 0..MAX_SPENDS_PER_WINDOW {
+        client.spend_allowance(&operator, &payee, &1);
+    }
+    assert_eq!(
+        client.try_spend_allowance(&operator, &payee, &1),
+        Err(Ok(MultisigError::RateLimited))
+    );
+}
+
+#[test]
+fn non_operator_cannot_spend_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_allowance(&env, 100);
+
+    assert_eq!(
+        client.try_spend_allowance(&Address::generate(&env), &Address::generate(&env), &1),
+        Err(Ok(MultisigError::NotSpendingOperator))
+    );
+}
+
+#[test]
+fn spend_without_configuration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_spend_allowance(&alice, &bob, &1),
+        Err(Ok(MultisigError::SpendingNotConfigured))
+    );
+}
+
+#[test]
+fn set_spending_limit_requires_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_set_spending_limit(&vec![&env, alice.clone()], &alice, &bob, &100),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+}
+
+// ── #1445 threshold change proposals ─────────────────────────────────────────
+
+#[test]
+fn threshold_change_proposal_executes_after_current_threshold_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    // Proposer counts as the first approval; threshold stays unchanged.
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    assert_eq!(client.get_threshold(), Some(2));
+
+    let proposal = client.get_threshold_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.new_threshold, 3);
+    assert!(!proposal.executed);
+    assert_eq!(proposal.approvals, vec![&env, alice.clone()]);
+
+    // Second approval reaches the current threshold (2) and applies the change.
+    client.approve_threshold_change(&bob, &proposal_id);
+    assert_eq!(client.get_threshold(), Some(3));
+
+    let proposal = client.get_threshold_proposal(&proposal_id).unwrap();
+    assert!(proposal.executed);
+    assert_eq!(proposal.approvals, vec![&env, alice, bob]);
+}
+
+#[test]
+fn threshold_change_proposal_emits_event_on_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+
+    let proposal_id = client.propose_threshold_change(&alice, &1);
+    client.approve_threshold_change(&bob, &proposal_id);
+
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics == (Symbol::new(&env, "threshold_changed"),).into_val(&env)
+    });
+    assert!(found, "threshold_changed event not emitted");
+}
+
+#[test]
+fn threshold_change_proposal_requires_insufficient_approvals_to_execute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    // Only the proposer has approved; current threshold is 2.
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    assert_eq!(
+        client.try_execute_threshold_change(&alice, &proposal_id),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+    assert_eq!(client.get_threshold(), Some(2));
+}
+
+#[test]
+fn threshold_change_proposal_rejects_zero_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &0),
+        Err(Ok(MultisigError::InvalidNewThreshold))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_threshold_above_signer_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&alice, &4),
+        Err(Ok(MultisigError::InvalidNewThreshold))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_non_signer_proposer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = create_multisig(&env);
+    let outsider = Address::generate(&env);
+
+    assert_eq!(
+        client.try_propose_threshold_change(&outsider, &1),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_non_signer_approver() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&Address::generate(&env), &proposal_id),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_duplicate_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&alice, &proposal_id),
+        Err(Ok(MultisigError::AlreadySigned))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_unknown_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&alice, &999u64),
+        Err(Ok(MultisigError::TransactionNotFound))
+    );
+}
+
+#[test]
+fn threshold_change_proposal_rejects_approval_after_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let proposal_id = client.propose_threshold_change(&alice, &3);
+    client.approve_threshold_change(&bob, &proposal_id);
+
+    assert_eq!(
+        client.try_approve_threshold_change(&carol, &proposal_id),
+        Err(Ok(MultisigError::ThresholdProposalClosed))
+    );
+}
+
+// ── #1323 dead-man's switch / dormant signer replacement ─────────────────────
+
+#[test]
+fn signer_activity_is_tracked_on_sign() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    propose_n(&env, &client, &alice, 1);
+
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+    client.sign_transaction(&bob, &0);
+
+    assert_eq!(client.get_last_activity(&bob), Some(env.ledger().sequence()));
+}
+
+#[test]
+fn dormant_signer_can_be_replaced_after_inactivity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    // Keep alice and bob active; carol never signs.
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    client.replace_dormant_signer(
+        &vec![&env, alice.clone(), bob.clone()],
+        &carol,
+        &dave,
+        &1,
+    );
+
+    assert!(!client.is_signer(&carol));
+    assert!(client.is_signer(&dave));
+    assert_eq!(client.get_threshold(), Some(1));
+}
+
+#[test]
+fn replace_dormant_signer_rejects_active_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    // bob is still active, so cannot be replaced.
+    assert_eq!(
+        client.try_replace_dormant_signer(
+            &vec![&env, alice.clone(), carol.clone()],
+            &bob,
+            &dave,
+            &1,
+        ),
+        Err(Ok(MultisigError::SignerNotDormant))
+    );
+}
+
+#[test]
+fn replace_dormant_signer_requires_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    assert_eq!(
+        client.try_replace_dormant_signer(&vec![&env, alice.clone()], &carol, &dave, &1),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+}
+
+#[test]
+fn replace_dormant_signer_rejects_unknown_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    propose_n(&env, &client, &alice, 1);
+    client.sign_transaction(&bob, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += INACTIVITY_TIMEOUT_LEDGERS + 1);
+
+    assert_eq!(
+        client.try_replace_dormant_signer(
+            &vec![&env, alice.clone(), bob.clone()],
+            &outsider,
+            &dave,
+            &1,
+        ),
+        Err(Ok(MultisigError::NotSigner))
+    );
+}
+
+// ── #1446 stale proposal expiry / garbage collection ─────────────────────────
+
+#[test]
+fn proposal_records_expiration_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+
+    let tx_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &25u32,
+    );
+
+    let tx = client.get_transaction(&tx_id).expect("transaction exists");
+    assert_eq!(tx.expiration_ledger, env.ledger().sequence() + 25);
+}
+
+#[test]
+fn execute_after_expiration_returns_proposal_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+
+    let tx_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &10u32,
+    );
+    client.sign_transaction(&bob, &tx_id);
+
+    env.ledger().with_mut(|l| l.sequence_number += 11);
+    assert_eq!(
+        client.try_execute_transaction(&tx_id).map(|_| ()),
+        Err(Ok(MultisigError::ProposalExpired))
+    );
+}
+
+#[test]
+fn garbage_collect_expired_removes_only_expired_unexecuted_proposals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+
+    // tx0: expires soon, never executed.
+    let expired_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &10u32,
+    );
+    // tx1: long-lived, executed before expiry.
+    let executed_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 2u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &executed_id);
+    client.execute_transaction(&executed_id);
+    // tx2: long-lived, still pending.
+    let pending_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 3u32.into_val(&env)],
+        &1_000u32,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number += 11);
+    let removed = client.garbage_collect_expired(&vec![
+        &env,
+        expired_id,
+        executed_id,
+        pending_id,
+    ]);
+
+    assert_eq!(removed, 1);
+    assert_eq!(client.get_transaction(&expired_id), None);
+    assert!(client.get_transaction(&executed_id).is_some());
+    assert!(client.get_transaction(&pending_id).is_some());
+}
+
+// ── #1447 signer replacement with nonce invalidation ─────────────────────────
+
+#[test]
+fn replace_signer_with_threshold_approvals_updates_signer_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    client.replace_signer(&vec![&env, alice.clone(), bob.clone()], &carol, &dave, &2);
+
+    assert!(!client.is_signer(&carol));
+    assert!(client.is_signer(&dave));
+    assert_eq!(client.get_threshold(), Some(2));
+    assert_eq!(client.get_signers(), vec![&env, alice, bob, dave]);
+}
+
+#[test]
+fn replace_signer_rejects_existing_new_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+
+    assert_eq!(
+        client.try_replace_signer(&vec![&env, alice, bob], &carol, &alice, &2),
+        Err(Ok(MultisigError::AlreadySigner))
+    );
+}
+
+#[test]
+fn replace_signer_rejects_insufficient_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    assert_eq!(
+        client.try_replace_signer(&vec![&env, alice], &carol, &dave, &2),
+        Err(Ok(MultisigError::InsufficientApprovals))
+    );
+}
+
+#[test]
+fn replace_signer_bumps_config_nonce() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+
+    let before = client.get_config_nonce();
+    client.replace_signer(&vec![&env, alice, bob], &carol, &dave, &2);
+    assert_eq!(client.get_config_nonce(), before + 1);
+}
+
+#[test]
+fn replace_signer_invalidates_pending_proposals_signed_by_old_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, carol, _) = create_multisig(&env);
+    let dave = Address::generate(&env);
+    let target = env.register_contract(None, CounterContract);
+
+    // carol signs a pending proposal; alice+bob sign another that carol did not touch.
+    let carol_tx = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&carol, &carol_tx);
+    let other_tx = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 2u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &other_tx);
+
+    client.replace_signer(&vec![&env, alice.clone(), bob.clone()], &carol, &dave, &2);
+
+    // Proposal signed by the old key can no longer execute.
+    assert_eq!(
+        client.try_execute_transaction(&carol_tx).map(|_| ()),
+        Err(Ok(MultisigError::TransactionCancelled))
+    );
+    // Unrelated pending proposal is unaffected.
+    client.execute_transaction(&other_tx);
+}
+
+// ── #1448 atomic batch execution ─────────────────────────────────────────────
+
+#[test]
+fn execute_batch_executes_multiple_approved_proposals_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+    let counter = CounterContractClient::new(&env, &target);
+
+    let tx0 = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 4u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &tx0);
+    let tx1 = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 6u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &tx1);
+
+    let executed = client.execute_batch(&vec![&env, tx0, tx1]);
+    assert_eq!(executed.len(), 2);
+    assert_eq!(counter.get(), 10);
+}
+
+#[test]
+fn execute_batch_rolls_back_all_on_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, bob, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+    let counter = CounterContractClient::new(&env, &target);
+
+    // tx0: valid increment.
+    let tx0 = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 5u32.into_val(&env)],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &tx0);
+    // tx1: calls a missing function, so dispatch traps.
+    let tx1 = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "does_not_exist"),
+        &vec![&env],
+        &1_000u32,
+    );
+    client.sign_transaction(&bob, &tx1);
+
+    assert!(client.try_execute_batch(&vec![&env, tx0, tx1]).is_err());
+
+    // Atomic rollback: counter untouched and tx0 still pending.
+    assert_eq!(counter.get(), 0);
+    assert!(
+        !client
+            .get_transaction(&tx0)
+            .expect("transaction exists")
+            .executed
+    );
+}
+
+// ── #1449 duplicate signature rejection ──────────────────────────────────────
+
+#[test]
+fn execute_rejects_duplicate_signatures() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, alice, _, _, _) = create_multisig(&env);
+    let target = env.register_contract(None, CounterContract);
+
+    let tx_id = client.propose_transaction(
+        &alice,
+        &target,
+        &Symbol::new(&env, "increment"),
+        &vec![&env, 1u32.into_val(&env)],
+        &1_000u32,
+    );
+
+    // Threshold bypass attempt: same signer listed twice.
+    assert_eq!(
+        client.try_execute_with_signatures(&tx_id, &vec![&env, alice.clone(), alice]),
+        Err(Ok(MultisigError::DuplicateSignature))
+    );
 }

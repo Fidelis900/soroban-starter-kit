@@ -18,12 +18,58 @@ pub enum DaoError {
     QuorumNotMet = 8,
     ProposalRejected = 9,
     InsufficientVotingPower = 10,
+    /// Proposer's token balance is below the required proposal bond (issue #1106).
+    InsufficientBondBalance = 11,
+    /// Action dispatch via `env.invoke_contract` failed (issue #1108).
+    ActionFailed = 12,
     /// Proposer self-cancel rejected because votes have already been cast.
     VotesAlreadyCast = 11,
     /// `quorum_bps` must be in the range [0, 10_000].
     InvalidQuorumBps = 12,
     /// Returned by `vote` when the voting period has ended.
     VotingClosed = 13,
+    /// Execution attempted before the execution timelock has elapsed.
+    TimelockNotExpired = 14,
+    /// Delegation would create a cycle in the delegation graph.
+    CircularDelegation = 15,
+    /// No locked tokens found for this voter/proposal combination.
+    NoLockedTokens = 16,
+    /// Attempted to unlock tokens before the proposal voting window has closed.
+    VotingStillOpen = 17,
+    /// An active unexecuted proposal with the identical payload hash already exists (issue #1319).
+    DuplicateProposal = 18,
+    /// Voter selected a choice symbol that is not part of the proposal's choices.
+    InvalidChoice = 19,
+    /// Multi-choice proposal created without any choices.
+    NoChoices = 20,
+    /// Voting type is not supported for this operation.
+    InvalidVotingType = 21,
+    /// Emergency fast-track requested but no security council is configured.
+    MissingSecurityCouncil = 18,
+    /// Caller is not the configured security council.
+    UnauthorizedCouncil = 19,
+    /// Caller is not the proposal's proposer.
+    NotProposer = 20,
+    /// Proposal cancellation rejected because voting has already started.
+    VotingAlreadyStarted = 21,
+    /// A vote was cast before the proposal's voting window opened (issue #1441).
+    VotingNotStarted = 22,
+    /// Too many non-circulating holder addresses supplied for the dynamic
+    /// quorum configuration (issue #1440).
+    TooManyNonCirculatingHolders = 23,
+    /// Requested vote weight exceeds the voter's snapshotted balance at
+    /// proposal creation ledger (issue #1442).
+    VoteWeightExceedsSnapshot = 24,
+    /// No balance snapshot recorded for this voter/proposal combination
+    /// (issue #1442).
+    SnapshotMissing = 25,
+    /// Guardian veto requested but no guardian is configured (issue #1444).
+    GuardianNotConfigured = 26,
+    /// Caller is not the configured guardian (issue #1444).
+    UnauthorizedGuardian = 27,
+    /// Veto attempted after the timelock expired or the proposal was already
+    /// executed (issue #1444).
+    VetoWindowClosed = 28,
 }
 
 impl_display_error!(
@@ -38,9 +84,30 @@ impl_display_error!(
     QuorumNotMet            => "quorum not met",
     ProposalRejected        => "proposal rejected by majority",
     InsufficientVotingPower => "insufficient voting power",
+    InsufficientBondBalance => "insufficient balance for proposal bond",
+    ActionFailed            => "proposal action dispatch failed",
     VotesAlreadyCast        => "votes have already been cast; proposer cannot cancel",
     InvalidQuorumBps        => "quorum_bps must be between 0 and 10_000",
     VotingClosed            => "voting period has ended",
+    TimelockNotExpired      => "execution timelock has not yet expired",
+    CircularDelegation      => "delegation would create a circular loop",
+    NoLockedTokens          => "no locked tokens found for this voter and proposal",
+    VotingStillOpen         => "voting period is still open; tokens cannot be unlocked yet",
+    DuplicateProposal       => "an active proposal with the identical payload already exists",
+    InvalidChoice           => "selected choice is not part of this proposal",
+    NoChoices               => "multi-choice proposal must define at least one choice",
+    InvalidVotingType       => "unsupported voting type",
+    MissingSecurityCouncil  => "no security council configured",
+    UnauthorizedCouncil     => "caller is not the security council",
+    NotProposer             => "caller is not the proposal proposer",
+    VotingAlreadyStarted    => "voting has already started; proposal cannot be cancelled",
+    VotingNotStarted        => "voting has not started yet",
+    TooManyNonCirculatingHolders => "too many non-circulating holder addresses",
+    VoteWeightExceedsSnapshot => "vote weight exceeds snapshotted balance",
+    SnapshotMissing         => "no balance snapshot recorded for this voter and proposal",
+    GuardianNotConfigured   => "no guardian configured",
+    UnauthorizedGuardian    => "caller is not the guardian",
+    VetoWindowClosed        => "veto window is closed",
 );
 
 #[cfg(test)]
@@ -65,9 +132,29 @@ DaoError::AlreadyVoted = {}\n\
 DaoError::QuorumNotMet = {}\n\
 DaoError::ProposalRejected = {}\n\
 DaoError::InsufficientVotingPower = {}\n\
+DaoError::InsufficientBondBalance = {}\n\
+DaoError::ActionFailed = {}\n",
 DaoError::VotesAlreadyCast = {}\n\
 DaoError::InvalidQuorumBps = {}\n\
-DaoError::VotingClosed = {}\n",
+DaoError::VotingClosed = {}\n\
+DaoError::TimelockNotExpired = {}\n\
+DaoError::CircularDelegation = {}\n\
+DaoError::NoLockedTokens = {}\n\
+DaoError::VotingStillOpen = {}\n\
+DaoError::DuplicateProposal = {}\n\
+DaoError::InvalidChoice = {}\n\
+DaoError::NoChoices = {}\n\
+DaoError::InvalidVotingType = {}\n",
+DaoError::MissingSecurityCouncil = {}\n\
+DaoError::UnauthorizedCouncil = {}\n\
+DaoError::NotProposer = {}\n\
+DaoError::VotingAlreadyStarted = {}\n\
+DaoError::TooManyNonCirculatingHolders = {}\n\
+DaoError::VoteWeightExceedsSnapshot = {}\n\
+DaoError::SnapshotMissing = {}\n\
+DaoError::GuardianNotConfigured = {}\n\
+DaoError::UnauthorizedGuardian = {}\n\
+DaoError::VetoWindowClosed = {}\n",
             DaoError::NotAuthorized as u32,
             DaoError::AlreadyInitialized as u32,
             DaoError::NotInitialized as u32,
@@ -78,9 +165,29 @@ DaoError::VotingClosed = {}\n",
             DaoError::QuorumNotMet as u32,
             DaoError::ProposalRejected as u32,
             DaoError::InsufficientVotingPower as u32,
+            DaoError::InsufficientBondBalance as u32,
+            DaoError::ActionFailed as u32,
             DaoError::VotesAlreadyCast as u32,
             DaoError::InvalidQuorumBps as u32,
             DaoError::VotingClosed as u32,
+            DaoError::TimelockNotExpired as u32,
+            DaoError::CircularDelegation as u32,
+            DaoError::NoLockedTokens as u32,
+            DaoError::VotingStillOpen as u32,
+            DaoError::DuplicateProposal as u32,
+            DaoError::InvalidChoice as u32,
+            DaoError::NoChoices as u32,
+            DaoError::InvalidVotingType as u32,
+            DaoError::MissingSecurityCouncil as u32,
+            DaoError::UnauthorizedCouncil as u32,
+            DaoError::NotProposer as u32,
+            DaoError::VotingAlreadyStarted as u32,
+            DaoError::TooManyNonCirculatingHolders as u32,
+            DaoError::VoteWeightExceedsSnapshot as u32,
+            DaoError::SnapshotMissing as u32,
+            DaoError::GuardianNotConfigured as u32,
+            DaoError::UnauthorizedGuardian as u32,
+            DaoError::VetoWindowClosed as u32,
         )
     }
 

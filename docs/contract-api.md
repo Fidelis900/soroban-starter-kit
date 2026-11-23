@@ -240,12 +240,20 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
 | `initialize` | `env: Env, signers: Vec<Address>, threshold: u32, weights: Option<Vec<SignerWeight>>` | `Result<(), MultisigError>` | `AlreadyInitialized`, `InvalidThreshold`, `InvalidSigners`, `InvalidWeight` |
-| `add_signer` | `env: Env, approvals: Vec<Address>, signer: Address, new_threshold: u32` | `Result<(), MultisigError>` | `NotInitialized`, `NotSigner`, `InsufficientApprovals`, `InvalidThreshold`, `InvalidSigners` |
+| `add_signer` | `env: Env, approvals: Vec<Address>, signer: Address, weight: u32, new_threshold: u32` | `Result<(), MultisigError>` | `NotInitialized`, `NotSigner`, `InsufficientApprovals`, `InvalidThreshold`, `InvalidSigners`, `InvalidWeight` |
 | `remove_signer` | `env: Env, approvals: Vec<Address>, signer: Address, new_threshold: u32` | `Result<(), MultisigError>` | `NotInitialized`, `NotSigner`, `InsufficientApprovals`, `InvalidThreshold`, `InvalidSigners` |
+| `update_signer_weight` | `env: Env, approvals: Vec<Address>, signer: Address, new_weight: u32` | `Result<(), MultisigError>` | `NotInitialized`, `NotSigner`, `InsufficientApprovals`, `InvalidThreshold`, `InvalidSigners`, `InvalidWeight` |
+| `propose_signer_change` | `env: Env, proposer: Address, change: SignerChange, expiry_ledgers: u32` | `Result<u64, MultisigError>` | `NotSigner`, `NotInitialized` |
+| `sign_signer_change` | `env: Env, signer: Address, proposal_id: u64` | `Result<(), MultisigError>` | `NotSigner`, `TransactionNotFound`, `AlreadyExecuted`, `ProposalExpired`, `AlreadySigned` |
+| `execute_signer_change` | `env: Env, proposal_id: u64` | `Result<(), MultisigError>` | `TransactionNotFound`, `AlreadyExecuted`, `ProposalExpired`, `NotInitialized`, `ThresholdNotMet`, plus any error from the applied change |
+| `get_signer_proposal` | `env: Env, proposal_id: u64` | `Option<SignerProposal>` | None |
 | `propose_transaction` | `env: Env, proposer: Address, target: Address, function: Symbol, args: Vec<Val>, expiry_ledgers: u32` | `Result<u64, MultisigError>` | `NotSigner`, `NotInitialized` |
 | `sign_transaction` | `env: Env, signer: Address, tx_id: u64` | `Result<(), MultisigError>` | `NotSigner`, `TransactionNotFound`, `AlreadyExecuted`, `ProposalExpired`, `AlreadySigned` |
 | `execute_transaction` | `env: Env, tx_id: u64` | `Result<Val, MultisigError>` | `TransactionNotFound`, `AlreadyExecuted`, `ProposalExpired`, `NotInitialized`, `ThresholdNotMet` |
-| `execute_batch` | `env: Env, proposal_ids: Vec<u64>` | `Vec<u64>` | None |
+| `cancel_proposal` | `env: Env, proposer: Address, tx_id: u64` | `Result<(), MultisigError>` | `TransactionNotFound`, `NotProposer`, `AlreadyExecuted` |
+| `revoke_signature` | `env: Env, signer: Address, tx_id: u64` | `Result<(), MultisigError>` | `TransactionNotFound`, `AlreadyExecuted`, `NotSigned` |
+| `replace_signer` | `env: Env, approvals: Vec<Address>, old_signer: Address, new_signer: Address` | `Result<(), MultisigError>` | `NotInitialized`, `NotSigner`, `InsufficientApprovals`, `InvalidSigners`, `InvalidThreshold` |
+| `execute_batch` | `env: Env, proposal_ids: Vec<u64>` | `Result<Vec<Val>, MultisigError>` | `NotInitialized`, `TransactionNotFound`, `AlreadyExecuted`, `ProposalExpired`, `ThresholdNotMet` |
 | `get_signers` | `env: Env` | `Vec<Address>` | None |
 | `get_threshold` | `env: Env` | `Option<u32>` | None |
 | `get_signer_weight` | `env: Env, signer: Address` | `u32` | None |
@@ -253,9 +261,18 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 | `get_transaction` | `env: Env, tx_id: u64` | `Option<Transaction>` | None |
 | `signature_count` | `env: Env, tx_id: u64` | `Option<u32>` | None |
 | `cleanup_expired` | `env: Env, tx_id: u64` | `Result<(), MultisigError>` | `TransactionNotFound`, `AlreadyExecuted`, `NotYetExpired` |
+| `garbage_collect_expired` | `env: Env, tx_ids: Vec<u64>` | `Result<u32, MultisigError>` | `NotInitialized` |
 | `contract_version` | `env: Env` | `u32` | None |
 
-`initialize`'s optional `weights` parameter assigns each signer a custom vote weight (any signer omitted from `weights` defaults to weight 1); `threshold` is then measured in accumulated weight rather than raw signer count, so unweighted wallets behave exactly like the original flat-count design. `execute_batch` attempts each proposal ID independently — a failure for one (not found, already executed, expired, or under threshold) is silently skipped rather than aborting the batch; diff the returned `Vec<u64>` against the input to see what ran, or inspect individual proposals via `get_transaction`. Every proposal expires `expiry_ledgers` after `propose_transaction`; `cleanup_expired` lets anyone reclaim storage for an expired, unexecuted proposal.
+`initialize`'s optional `weights` parameter assigns each signer a custom vote weight (any signer omitted from `weights` defaults to weight 1); `threshold` is then measured in accumulated weight rather than raw signer count, so unweighted wallets behave exactly like the original flat-count design.
+
+**Proposal expiration (#1446):** every proposal records an `expiration_ledger` field on its stored `Transaction`, computed as `current_ledger + expiry_ledgers` at `propose_transaction` time. `sign_transaction` and `execute_transaction` reject a proposal once the current ledger exceeds `expiration_ledger` with `ProposalExpired`. `cleanup_expired` removes a single expired, unexecuted proposal (failing with `NotYetExpired` before its deadline), and `garbage_collect_expired` sweeps a batch of `tx_ids`, removing each expired, unexecuted proposal and returning the number reclaimed; IDs that are unknown, already executed, or not yet expired are skipped rather than aborting the sweep.
+
+**Batch execution (#1448):** `execute_batch` executes every listed proposal sequentially in one invocation and is all-or-nothing — if any proposal is missing, already executed, expired, or under threshold, the whole call reverts with that error and no proposal in the batch is executed. On success it returns the `Vec<Val>` of each proposal's execution result, in input order.
+
+**Signer replacement (#1447):** `replace_signer` swaps `old_signer` for `new_signer` in a single approved operation. `approvals` must carry at least threshold weight (excluding the outgoing signer), `old_signer` must be an existing signer, and `new_signer` must not already be a signer (else `InvalidSigners`). The replacement increments the contract configuration nonce, which invalidates every pending transaction signed by `old_signer`: those proposals can no longer reach threshold and must be re-proposed and re-signed by the new key.
+
+Before execution the original proposer may `cancel_proposal` (removing it from storage), and any signer may `revoke_signature`, which recomputes `accumulated_weight` from the remaining signatures using current weights. `add_signer` takes a custom `weight` (≥ 1), and `update_signer_weight` changes an existing signer's weight while revalidating the current threshold against the new total weight. Signer additions, removals, weight updates, and threshold changes can also be approved asynchronously: `propose_signer_change` stores a `SignerChange` (`AddSigner`, `RemoveSigner`, `UpdateSignerWeight`, `ChangeThreshold`) that signers approve over time with `sign_signer_change`; `execute_signer_change` applies it once accumulated weight meets the threshold.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `initialize` called twice
@@ -271,6 +288,8 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 - `ProposalExpired` (11) — Proposal is past its `expiry_ledger`
 - `InvalidWeight` (12) — A `SignerWeight.weight` of zero was supplied
 - `NotYetExpired` (13) — `cleanup_expired` called before the proposal's expiry ledger was reached
+- `NotProposer` (14) — `cancel_proposal` called by someone other than the original proposer
+- `NotSigned` (15) — `revoke_signature` called by a signer who has not signed the transaction
 
 ---
 
@@ -280,24 +299,66 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
-| `initialize` | `env: Env, admin: Address, token: Address, claim_deadline: u32` | `Result<(), AirdropError>` | `AlreadyInitialized` |
+| `initialize` | `env: Env, admin: Address, claim_deadline: u32, vesting: Option<VestingConfig>` | `Result<(), AirdropError>` | `AlreadyInitialized`, `InvalidVestingConfig` |
 | `set_root` | `env: Env, root: BytesN<32>` | `Result<(), AirdropError>` | `NotInitialized`, `Unauthorized` |
-| `claim` | `env: Env, recipient: Address, amount: i128, proof: Vec<BytesN<32>>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `InvalidAmount`, `ClaimWindowClosed`, `AlreadyClaimed`, `InvalidProof` |
-| `claim_batch` | `env: Env, entries: Vec<(Address, i128, Vec<BytesN<32>>)>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `InvalidAmount`, `AlreadyClaimed`, `InvalidProof` |
-| `is_claimed` | `env: Env, address: Address` | `bool` | None |
+| `claim` | `env: Env, recipient: Address, token: Address, amount: i128, proof: Vec<BytesN<32>>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `InvalidAmount`, `AlreadyClaimed`, `InvalidProof`, `InsufficientBalance` |
+| `claim_batch` | `env: Env, entries: Vec<(Address, Address, i128)>, proof: Vec<BytesN<32>>, proof_flags: Vec<bool>` | `Result<(), AirdropError>` | `NotInitialized`, `RootNotSet`, `ClaimWindowClosed`, `EmptyBatch`, `InvalidAmount`, `DuplicateEntry`, `AlreadyClaimed`, `InvalidProof`, `InsufficientBalance` |
+| `release` | `env: Env, recipient: Address, token: Address` | `Result<i128, AirdropError>` | `NoVestingSchedule`, `NothingToRelease` |
+| `is_claimed` | `env: Env, address: Address, token: Address` | `bool` | None |
 | `get_root` | `env: Env` | `Option<Bytes>` | None |
+| `get_vesting_config` | `env: Env` | `Option<VestingConfig>` | None |
+| `get_vesting` | `env: Env, recipient: Address, token: Address` | `Option<VestingSchedule>` | None |
+| `releasable` | `env: Env, recipient: Address, token: Address` | `i128` | None |
+| `total_locked` | `env: Env, token: Address` | `i128` | None |
+
+### Leaf format
+
+Each leaf commits to the network, the airdrop contract instance, the recipient, the token, and the amount. Proofs therefore cannot be replayed across networks (Testnet vs. Mainnet), across airdrop contracts, or across tokens:
+
+```text
+leaf = sha256(
+    "SOROBAN_AIRDROP_LEAF_V1"      // 23-byte ASCII domain separator
+ || network_id                     // 32 bytes: sha256(network passphrase)
+ || xdr(ScVal::Address(contract))  // the airdrop contract address
+ || xdr(ScVal::Address(recipient))
+ || xdr(ScVal::Address(token))
+ || amount                         // i128, 16-byte big-endian
+)
+node = sha256(min(left, right) || max(left, right))
+```
+
+Because the contract address is part of every leaf, the tree can only be built **after** the contract is deployed (or from its pre-computed address).
+
+### Multi-token distributions
+
+A single tree may contain leaves for any number of tokens. Each `(recipient, token)` pair can be claimed once. Fund the contract with every distributed token; claims fail with `InsufficientBalance` when the contract's balance of a token, minus tokens already locked for vesting, cannot cover the claim.
+
+### Batch claims (multi-proof)
+
+`claim_batch` verifies all entries against one Merkle **multi-proof** (the `OpenZeppelin` `multiProofVerify` format, with SHA-256), implemented in `soroban_common::verify_merkle_multi_proof`. Intermediate nodes shared by several entries are hashed only once, so a batch costs `leaves + proof - 1` hashes instead of `leaves × depth`. For 50 leaves in a 1024-leaf tree this is 56 hashes instead of 500, about 87% fewer CPU instructions (`cargo bench -p contract-benchmarks --bench merkle_ops`). `entries` must be supplied in the leaf order emitted by the multi-proof generator.
 
 `claim_batch` uses all-or-nothing semantics: every entry is validated before any transfer executes, so a single bad entry aborts the whole batch.
+
+### Vesting
+
+When `initialize` receives `Some(VestingConfig { initial_unlock_bps, vesting_duration_ledgers })`, each claim transfers `amount * initial_unlock_bps / 10_000` immediately and locks the remainder in a per-`(recipient, token)` schedule that vests linearly over `vesting_duration_ledgers` ledgers from the claim ledger. Recipients withdraw vested tokens with `release`, which keeps working after the claim deadline.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `initialize` called twice
 - `NotInitialized` (2) — Operation before initialize
 - `Unauthorized` (3) — Caller not admin
 - `RootNotSet` (4) — No merkle root configured yet
-- `InvalidProof` (5) — Merkle proof does not verify
-- `AlreadyClaimed` (6) — Address already claimed
+- `InvalidProof` (5) — Merkle proof or multi-proof does not verify
+- `AlreadyClaimed` (6) — `(recipient, token)` already claimed
 - `InvalidAmount` (7) — Claim amount <= 0
 - `ClaimWindowClosed` (8) — Current ledger past `claim_deadline`
+- `InsufficientBalance` (9) — Contract's unlocked token balance cannot cover the claim
+- `InvalidVestingConfig` (10) — `initial_unlock_bps > 10_000`, or locked portion with zero duration
+- `NoVestingSchedule` (11) — No schedule for `(recipient, token)`
+- `NothingToRelease` (12) — Nothing new has vested
+- `DuplicateEntry` (13) — Same `(recipient, token)` twice in one batch
+- `ArithmeticOverflow` (14) — Checked arithmetic overflowed
+- `EmptyBatch` (15) — `claim_batch` called with no entries
 
 ---
 
@@ -307,15 +368,39 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
-| `start` | `env: Env, seller: Address, token: Address, start_price: i128, min_increment: i128, deadline: u32, reserve_price: Option<i128>, extension_window: u32` | `Result<(), AuctionError>` | `AlreadyInitialized`, `InvalidAmount`, `InvalidDeadline` |
+| `start` | `env: Env, seller: Address, token: Address, start_price: i128, min_increment: i128, deadline: u32, reserve_price: Option<i128>, extension_window: u32, cancellation_grace_ledgers: u32, cancellation_fee: i128` | `Result<(), AuctionError>` | `AlreadyInitialized`, `InvalidAmount`, `InvalidDeadline` |
 | `bid` | `env: Env, bidder: Address, amount: i128` | `Result<(), AuctionError>` | `InvalidAmount`, `AuctionEnded`, `NotInitialized`, `BidTooLow` |
-| `cancel` | `env: Env, seller: Address` | `Result<(), AuctionError>` | `NotInitialized`, `NotAuthorized`, `AlreadyEnded`, `BidAlreadyPlaced` |
+| `cancel` | `env: Env, seller: Address` | `Result<(), AuctionError>` | `NotInitialized`, `NotAuthorized`, `AlreadyEnded`, `BidAlreadyPlaced`, `InvalidAmount` |
 | `end` | `env: Env` | `Result<(), AuctionError>` | `NotInitialized`, `AuctionNotEnded`, `AlreadyEnded` |
+| `start` | `env: Env, seller: Address, token: Address, start_price: i128, min_increment: i128, deadline: u32, reserve_price: Option<i128>, extension_window: u32, nft_contract: Option<Address>, token_id: Option<u32>` | `Result<(), AuctionError>` | `AlreadyInitialized`, `InvalidAmount`, `InvalidDeadline`, `InvalidNftParams` |
+| `start_dutch` | `env: Env, seller: Address, token: Address, start_price: i128, floor_price: i128, start_ledger: u32, duration_ledgers: u32, nft_contract: Option<Address>, token_id: Option<u32>` | `Result<(), AuctionError>` | `AlreadyInitialized`, `InvalidAmount`, `InvalidDeadline`, `Overflow`, `InvalidNftParams` |
+| `bid` | `env: Env, bidder: Address, amount: i128` | `Result<(), AuctionError>` | `InvalidAmount`, `WrongMode`, `AuctionEnded`, `NotInitialized`, `BidTooLow`, `Overflow` |
+| `bid_with_credit` | `env: Env, bidder: Address, total_bid: i128` | `Result<(), AuctionError>` | Same as `bid` |
+| `get_current_price` | `env: Env` | `Result<i128, AuctionError>` | `NotInitialized`, `WrongMode` |
+| `buy` | `env: Env, buyer: Address, max_price: i128` | `Result<i128, AuctionError>` (price paid) | `NotInitialized`, `WrongMode`, `AuctionEnded`, `AuctionNotStarted`, `BidTooLow` |
+| `cancel` | `env: Env, seller: Address` | `Result<(), AuctionError>` | `NotInitialized`, `NotAuthorized`, `AlreadyEnded`, `BidAlreadyPlaced` |
+| `end` | `env: Env` | `Result<(), AuctionError>` | `NotInitialized`, `WrongMode`, `AuctionNotEnded`, `AlreadyEnded` |
 | `withdraw` | `env: Env, bidder: Address` | `Result<(), AuctionError>` | `NothingToWithdraw` |
 | `get_pending` | `env: Env, bidder: Address` | `i128` | None |
+| `get_dutch_config` | `env: Env` | `Option<DutchConfig>` | None |
 | `get_info` | `env: Env` | `Result<AuctionInfo, AuctionError>` | `NotInitialized` |
+| `is_cancelled` | `env: Env` | `bool` | None |
 
-`bid` extends `deadline` by `extension_window` ledgers when a bid lands within that window of the current deadline (anti-sniping). `end` settles to the seller when `highest_bid >= reserve_price` (or no reserve is set); otherwise it refunds the highest bidder and the item goes unsold. `cancel` only succeeds before the first bid is placed.
+`bid` extends `deadline` by `extension_window` ledgers when a bid lands within that window of the current deadline (anti-sniping). `end` settles to the seller when `highest_bid >= reserve_price` (or no reserve is set); otherwise it refunds the highest bidder and the item goes unsold. `cancel` always succeeds before the first bid is placed. After a bid, it only succeeds inside the cancellation grace window (`current_ledger <= start_ledger + cancellation_grace_ledgers`, disabled when `cancellation_grace_ledgers` is `0`): the seller pays `cancellation_fee` into the contract, the top bidder's pending refund is credited with their full bid plus the fee, and a `cancelled_with_compensation` event carrying `AuctionCancelledWithCompensation { seller, top_bidder, compensation_amount }` is emitted. A cancelled auction cannot be settled with `end`.
+
+**Checked arithmetic (#1070):** the minimum-bid computation (`highest_bid + min_increment`), refund queueing (`pending + highest_bid`), credit offsets, and Dutch price decay all use checked operations and return `Overflow` rather than trapping.
+
+**Custodial NFT escrow (#1069):** when `nft_contract` and `token_id` are both supplied, `start`/`start_dutch` transfer the NFT from the seller into the auction contract (the seller's authorization of `start` covers the nested NFT `transfer`). The NFT is delivered to the winner in the same `end`/`buy` invocation that pays the seller, and returned to the seller on `cancel`, on `end` with no bids, or when the reserve is not met. The NFT contract must expose `transfer(from: Address, to: Address, token_id: u32)`, as `contracts/nft` does.
+
+**Refund-credit counter-bids (#1068):** `bid_with_credit` applies the bidder's `Pending(bidder)` balance toward `total_bid` and transfers only `total_bid - credit` from their wallet (nothing when the credit covers the bid). Unused credit stays pending and withdrawable. The current highest bidder may also use it to raise their own bid, paying only the increase.
+
+**Dutch auctions (#1071):** `start_dutch` requires `0 <= floor_price < start_price`, `duration_ledgers > 0`, and a `start_ledger` at or after the current ledger. The price is
+
+```text
+price = start_price - (start_price - floor_price) * (now - start_ledger) / duration_ledgers
+```
+
+equal to `start_price` before `start_ledger` and clamped to `floor_price` from `start_ledger + duration_ledgers` onwards. `buy` succeeds for the first caller with `max_price >= get_current_price()`: the auction is marked settled before any external call, the price goes directly from buyer to seller, and the NFT (if any) goes to the buyer. English-only calls (`bid`, `bid_with_credit`, `end`) return `WrongMode` on a Dutch auction, and vice versa.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `start` called twice
@@ -323,14 +408,19 @@ The contract supports **multiple beneficiaries per deployed instance**: `initial
 - `AuctionEnded` (3) — Deadline passed or auction cancelled
 - `AuctionNotEnded` (4) — `end` called before the deadline
 - `BidTooLow` (5) — Bid below the required minimum
-- `AlreadyEnded` (6) — Already settled
+- `AlreadyEnded` (6) — Already settled or cancelled
 - `NoBids` (7) — Reserved; `end()` handles the no-bids case via an event, not this error
 - `NotAuthorized` (8) — Caller is not the seller
-- `InvalidAmount` (9) — `start_price`/`min_increment`/bid <= 0
+- `InvalidAmount` (9) — `start_price`/`min_increment`/bid <= 0, or `cancellation_fee` < 0
 - `InvalidDeadline` (10) — `deadline` not in the future
 - `NothingToWithdraw` (11) — No pending refund
 - `ReserveNotMet` (12) — Reserved; `end()` handles this case via an event, not this error
+- `BidAlreadyPlaced` (13) — `cancel` called after a bid was placed, outside the cancellation grace window
 - `BidAlreadyPlaced` (13) — `cancel` called after a bid was placed
+- `Overflow` (14) — Checked arithmetic on a bid, refund, credit, or Dutch price overflowed
+- `WrongMode` (15) — English-only call on a Dutch auction, or vice versa
+- `AuctionNotStarted` (16) — `buy` before the Dutch `start_ledger`
+- `InvalidNftParams` (17) — Only one of `nft_contract` / `token_id` supplied
 
 ---
 
@@ -444,8 +534,9 @@ Linear curve: `price = reserve / (supply + 1)` (scaled by `PRICE_SCALE`). `buy` 
 | `proposer_cancel_proposal` | `env: Env, proposer: Address, proposal_id: u32` | `Result<(), DaoError>` | `NotInitialized`, `ProposalNotFound`, `NotAuthorized`, `InvalidState`, `VotesAlreadyCast` |
 | `get_proposal` | `env: Env, proposal_id: u32` | `Result<Proposal, DaoError>` | `ProposalNotFound` |
 | `proposal_count` | `env: Env` | `u32` | None |
+| `get_proposals` | `env: Env, cursor: u32, limit: u32, state: Option<ProposalState>` | `ProposalPage` | None |
 
-Voting weight is the voter's token balance at vote time, capped at the total supply snapshot taken at proposal creation (flash-loan resistant). `execute_proposal` requires both the absolute `quorum` and, if `quorum_bps > 0`, that participation reach `quorum_bps` of the snapshotted total supply, plus `yes_votes > no_votes`.
+Voting weight is the voter's token balance at vote time, capped at the total supply snapshot taken at proposal creation (flash-loan resistant). `execute_proposal` requires both the absolute `quorum` and, if `quorum_bps > 0`, that participation reach `quorum_bps` of the snapshotted total supply, plus `yes_votes > no_votes`. `get_proposals` lists proposals in ascending ID order via `soroban_common::paginate`, optionally filtered by `ProposalState`; `limit` is clamped to `[1, MAX_PAGE_SIZE]` (50), and the returned `next_cursor` is `None` once the end is reached.
 
 **Errors:**
 - `NotAuthorized` (1) — Caller not admin/original proposer
@@ -507,27 +598,67 @@ Commit-reveal randomness: `commit` locks in `hash(secret ++ salt)` and a reveal 
 
 **Location:** `contracts/marketplace/src/lib.rs`
 
-> **Known issue:** `lib.rs` currently contains corrupted/duplicated code — two
-> conflicting `get_active_listings` definitions (one of which is actually the
-> body of an offer-accept flow), references to error variants and a `NftClient`
-> type that don't exist anywhere in the crate, and no function that actually
-> creates an `Offer` (despite `cancel_offer` and offer-acceptance logic, and an
-> `Offer` storage key, existing). The table below documents only the coherent,
-> internally-consistent subset of the file, using the canonical error names
-> from `errors.rs`. Treat this section as a known-incomplete placeholder until
-> the contract code itself is fixed in a separate PR — see the note in
-> `error-reference.md`'s Marketplace section.
+Each listing carries its own `payment_token`; purchases, offers and royalties on
+that listing all settle in that token. The admin may optionally enforce a
+payment-token whitelist on new listings (off by default; the default token
+passed to `initialize` is always whitelisted). Batch entry points accept at most
+`MAX_BATCH_SIZE` (20) items and are all-or-nothing.
 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
 | `initialize` | `env: Env, admin: Address, payment_token: Address, royalty_bps: u32, royalty_recipient: Address` | `Result<(), MarketplaceError>` | `AlreadyInitialized`, `InvalidRoyalty` |
+| `set_payment_token_allowed` | `env: Env, token: Address, allowed: bool` (admin) | `Result<(), MarketplaceError>` | `NotInitialized` |
+| `set_whitelist_enabled` | `env: Env, enabled: bool` (admin) | `Result<(), MarketplaceError>` | `NotInitialized` |
+| `is_whitelist_enabled` | `env: Env` | `bool` | None |
+| `is_payment_token_allowed` | `env: Env, token: Address` | `bool` | None |
+| `get_default_payment_token` | `env: Env` | `Option<Address>` | None |
+| `list` | `env: Env, seller: Address, nft_contract: Address, token_id: u32, price: i128, payment_token: Address` | `Result<u64, MarketplaceError>` | `NotInitialized`, `InvalidPrice`, `PaymentTokenNotAllowed` |
+| `list_with_expiry` | `env: Env, seller: Address, nft_contract: Address, token_id: u32, price: i128, payment_token: Address, expires_at: u32` | `Result<u64, MarketplaceError>` | `NotInitialized`, `InvalidPrice`, `InvalidExpiry`, `PaymentTokenNotAllowed` |
+| `list_batch` | `env: Env, seller: Address, items: Vec<ListingParams>` | `Result<Vec<u64>, MarketplaceError>` | `EmptyBatch`, `BatchTooLarge`, + `list_with_expiry` errors |
+| `buy` | `env: Env, buyer: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `ListingExpired`, `SellerNotOwner` |
+| `buy_batch` | `env: Env, buyer: Address, listing_ids: Vec<u64>` | `Result<(), MarketplaceError>` | `EmptyBatch`, `BatchTooLarge`, + `buy` errors |
+| `cancel` | `env: Env, seller: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `ListingNotFound`, `ListingInactive` |
+| `cancel_batch` | `env: Env, seller: Address, listing_ids: Vec<u64>` | `Result<(), MarketplaceError>` | `EmptyBatch`, `BatchTooLarge`, + `cancel` errors |
+| `sweep_expired` | `env: Env, seller: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `ListingNotFound`, `ListingInactive`, `ListingNotExpired` |
+| `invalidate_listing` | `env: Env, listing_id: u64` (permissionless) | `Result<bool, MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive` |
+| `make_offer` | `env: Env, buyer: Address, listing_id: u64, amount: i128, expiration_ledger: u32` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `InvalidOfferAmount`, `InvalidExpiry`, `OfferIncrementTooLow` |
+| `make_offers_batch` | `env: Env, buyer: Address, token_ids: Vec<u32>, prices: Vec<i128>, expiration: u32` | `Result<(), MarketplaceError>` | `NotInitialized`, `EmptyBatch`, `BatchTooLarge`, `InvalidOfferAmount`, `InvalidExpiry`, `OfferIncrementTooLow` |
+| `accept_offer` | `env: Env, seller: Address, listing_id: u64, buyer: Address` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `NotAuthorized`, `OfferNotFound`, `OfferExpired`, `SellerNotOwner` |
+| `cancel_offer` | `env: Env, buyer: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `OfferNotFound` |
+| `expire_offer` | `env: Env, listing_id: u64, buyer: Address` (permissionless) | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `OfferNotFound`, `OfferNotExpired` |
+| `set_staking_contract` | `env: Env, staking_contract: Option<Address>` (admin) | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized` |
+| `get_staking_contract` | `env: Env` | `Option<Address>` | None |
+| `set_min_counter_offer_bps` | `env: Env, min_counter_offer_bps: u32` (admin) | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `InvalidRoyalty` |
+| `get_min_counter_offer_bps` | `env: Env` | `u32` | None |
+| `sweep_offers` | `env: Env, listing_id: u64, buyers: Vec<Address>` (permissionless) | `Result<u32, MarketplaceError>` | `NotInitialized`, `EmptyBatch`, `BatchTooLarge`, `ListingNotFound`, `ListingStillActive` |
+| `get_listing` | `env: Env, listing_id: u64` | `Option<Listing>` | None |
+| `get_offer` | `env: Env, listing_id: u64, buyer: Address` | `Option<i128>` | None |
+| `get_active_listings` | `env: Env, cursor: u64, limit: u32` | `ListingPage` (ghost listings filtered out) | None |
 | `list` | `env: Env, seller: Address, token_id: u32, price: i128` | `Result<u64, MarketplaceError>` | `NotInitialized`, `NotAuthorized` |
-| `buy` | `env: Env, buyer: Address, listing_id: u64, payment_amount: i128` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `InvalidPrice` |
+| `buy` | `env: Env, buyer: Address, listing_id: u64, max_price: i128` | `Result<(), MarketplaceError>` | `NotInitialized`, `ListingNotFound`, `ListingInactive`, `ListingExpired`, `PriceExceedsMax` |
 | `cancel` | `env: Env, caller: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `ListingNotFound`, `ListingInactive` |
 | `cancel_offer` | `env: Env, buyer: Address, listing_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `OfferNotFound` |
 | `get_listing` | `env: Env, listing_id: u64` | `Option<Listing>` | None |
 | `get_offer` | `env: Env, listing_id: u64, buyer: Address` | `Option<i128>` | None |
 | `get_active_listings` | `env: Env, cursor: u64, limit: u32` | `ListingPage` | None |
+| `make_collection_offer` | `env: Env, buyer: Address, nft_contract: Address, amount: i128, expires_at: u32` | `Result<u64, MarketplaceError>` | `NotInitialized`, `InvalidOfferAmount`, `InvalidExpiry` |
+| `accept_collection_offer` | `env: Env, seller: Address, offer_id: u64, token_id: u32` | `Result<(), MarketplaceError>` | `NotInitialized`, `CollectionOfferNotFound`, `CollectionOfferExpired`, `NotAuthorized` |
+| `cancel_collection_offer` | `env: Env, buyer: Address, offer_id: u64` | `Result<(), MarketplaceError>` | `NotInitialized`, `CollectionOfferNotFound`, `NotAuthorized` |
+| `get_collection_offer` | `env: Env, offer_id: u64` | `Option<CollectionOffer>` | None |
+| `set_royalty_splits` | `env: Env, admin: Address, splits: Vec<(Address, u32)>` | `Result<(), MarketplaceError>` | `NotInitialized`, `NotAuthorized`, `InvalidRoyalty` |
+| `get_royalty_splits` | `env: Env` | `Vec<(Address, u32)>` | None |
+
+`buy` takes a `max_price` slippage bound: pass the price you observed; the call fails with `PriceExceedsMax` if the listing price is higher when it executes.
+
+**Offer expiry (#1312):** `make_offer` escrows `amount` from the buyer and records an `expiration_ledger` on the offer. `accept_offer` rejects an offer whose `expiration_ledger` has been reached with `OfferExpired`. Once expired, anyone may call `expire_offer(listing_id, buyer)` to refund the escrowed funds to the buyer and remove the offer; calling it before expiry fails with `OfferNotExpired`.
+
+**Batch offers (#1313):** `make_offers_batch` creates one offer per `(token_id, price)` pair against the corresponding active listing, all with the same `expiration` ledger. The total escrow (`sum(prices)`) is transferred from the buyer in a single token `transfer` call, and the batch is all-or-nothing: any invalid entry (missing/inactive listing, bad amount, expired `expiration`, or an increment below the minimum) aborts the whole call.
+
+**Minimum counter-offer increment (#1315):** when `min_counter_offer_bps` is non-zero, a new offer on a listing that already has a higher offer must exceed that highest offer by at least `min_counter_offer_bps` basis points (e.g. `500` = +5%). Offers that fail the threshold are rejected with `OfferIncrementTooLow`. The admin configures the threshold with `set_min_counter_offer_bps` (`0` disables the check).
+
+**Staker fee discounts (#1314):** when a staking contract is configured via `set_staking_contract(Some(address))`, the marketplace queries the buyer's (and, where applicable, the seller's) staked balance from that contract before computing the trading fee and applies a tiered discount — roughly 20% off at the lower stake tiers up to 50% off at the highest. With no staking contract configured (`None`, the default) the full fee applies. The staking contract must expose `get_stake(staker: Address) -> i128`.
+
+`set_royalty_splits` splits the marketplace royalty across up to 10 `(recipient, bps)` entries whose basis points sum to the total royalty (≤ 10 000). A royalty returned by the NFT contract's `royalty_info` still takes priority.
 
 **Not currently reachable through a working entry point:** making an offer (an `Offer` is only ever read/cancelled, never created) and accepting an offer (the intended logic exists but is bound to a duplicate, misnamed `get_active_listings` definition rather than its own function).
 
@@ -544,6 +675,15 @@ Commit-reveal randomness: `commit` locks in `hash(secret ++ salt)` and a reveal 
 - `ListingNotExpired` (10) — Sweep called on a non-expired listing
 - `InvalidOfferAmount` (11) — Offer amount invalid or not below price
 - `OfferNotFound` (12) — No offer for `(listing_id, buyer)`
+- `PaymentTokenNotAllowed` (13) — Whitelist enabled and listing token not on it
+- `SellerNotOwner` (14) — Seller no longer owns the listed NFT (ghost listing)
+- `BatchTooLarge` (15) — Batch exceeds `MAX_BATCH_SIZE`
+- `EmptyBatch` (16) — Batch contains no items
+- `ListingStillActive` (17) — `sweep_offers` called on an open listing
+- `Reentrant` (18) — Reentrancy guard already held
+- `OfferExpired` (19) — `accept_offer` called on an offer past its `expiration_ledger`
+- `OfferNotExpired` (20) — `expire_offer` called before the offer's `expiration_ledger`
+- `OfferIncrementTooLow` (21) — Offer does not exceed the current highest offer by `min_counter_offer_bps`
 
 ---
 
@@ -617,17 +757,37 @@ Commit-reveal randomness: `commit` locks in `hash(secret ++ salt)` and a reveal 
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
 | `initialize` | `env: Env, provider: Address, token: Address` | `Result<(), SubscriptionError>` | `AlreadyInitialized` |
-| `register_plan` | `env: Env, plan_id: Symbol, amount: i128, interval_ledgers: u32` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `InvalidInterval`, `PlanAlreadyExists` |
+| `register_plan` | `env: Env, plan_id: Symbol, amount: i128, interval_ledgers: u32, unit_price: i128, prepay_discount_bps: u32` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `InvalidInterval`, `InvalidDiscount`, `PlanAlreadyExists` |
 | `set_plan_active` | `env: Env, plan_id: Symbol, active: bool` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `PlanNotFound` |
-| `subscribe` | `env: Env, subscriber: Address, plan_id: Symbol, trial_ledgers: Option<u32>` | `Result<(), SubscriptionError>` | `NotInitialized`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed` |
-| `charge` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `NotSubscribed`, `SubscriptionInactive`, `IntervalNotElapsed`, `InsufficientAllowance` |
+| `subscribe` | `env: Env, subscriber: Address, plan_id: Symbol, trial_ledgers: Option<u32>, prepay_intervals: Option<u32>` | `Result<(), SubscriptionError>` | `NotInitialized`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed`, `ArithmeticOverflow` |
+| `charge` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `NotSubscribed`, `SubscriptionInactive`, `IntervalNotElapsed`, `InsufficientAllowance`, `ArithmeticOverflow` |
+| `report_usage` | `env: Env, subscriber: Address, units: u64` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `InvalidAmount`, `NotSubscribed`, `SubscriptionInactive`, `ArithmeticOverflow` |
 | `cancel` | `env: Env, subscriber: Address` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotSubscribed`, `SubscriptionInactive` |
 | `get_subscription` | `env: Env, subscriber: Address` | `Option<SubscriptionInfo>` | None |
+| `subscribe` | `env: Env, subscriber: Address, plan_id: Symbol, trial_ledgers: Option<u32>` | `Result<(), SubscriptionError>` | `NotInitialized`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed` |
+| `set_grace_period` | `env: Env, grace_period_ledgers: u32` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotAuthorized` |
+| `charge` | `env: Env, subscriber: Address, plan_id: Symbol` | `Result<ChargeOutcome, SubscriptionError>` | `NotInitialized`, `NotAuthorized`, `NotSubscribed`, `SubscriptionSuspended`, `SubscriptionInactive`, `IntervalNotElapsed` |
+| `charge_batch` | `env: Env, subscriptions: Vec<(Address, Symbol)>` | `Result<BatchChargeResult, SubscriptionError>` | `NotInitialized`, `NotAuthorized` |
+| `change_plan` | `env: Env, subscriber: Address, old_plan_id: Symbol, new_plan_id: Symbol` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotSubscribed`, `SubscriptionSuspended`, `SubscriptionInactive`, `PlanNotFound`, `PlanInactive`, `AlreadySubscribed`, `PaymentOverdue`, `ArithmeticOverflow` |
+| `cancel` | `env: Env, subscriber: Address, plan_id: Symbol` | `Result<(), SubscriptionError>` | `NotInitialized`, `NotSubscribed`, `SubscriptionInactive` |
+| `get_subscription` | `env: Env, subscriber: Address, plan_id: Symbol` | `Option<SubscriptionInfo>` | None |
 | `get_provider` | `env: Env` | `Option<Address>` | None |
 | `get_token` | `env: Env` | `Option<Address>` | None |
 | `get_plan` | `env: Env, plan_id: Symbol` | `Option<Plan>` | None |
+| `get_grace_period` | `env: Env` | `u32` | None |
 
 The subscriber must pre-approve this contract as a token spender (`token.approve(subscriber, subscription_contract, amount * periods, expiry_ledger)`) before the provider can `charge`. An optional `trial_ledgers` on `subscribe` delays the first real charge; `charge` during the trial window only marks the trial complete without transferring funds.
+
+**Metered billing:** plans with a non-zero `unit_price` bill `amount + usage_units * unit_price` per interval. The provider accumulates usage with `report_usage`; the meter resets to zero on each successful `charge` (and is discarded on `cancel`).
+
+**Prepaid billing:** passing `prepay_intervals: Some(n)` to `subscribe` transfers `amount * n` less the plan's `prepay_discount_bps` into contract escrow. Each `charge` releases one interval's share to the provider (usage fees are still pulled from the allowance). `cancel` refunds the unconsumed escrow balance.
+Subscriptions are keyed by `(subscriber, plan_id)`, so one address can hold several plans concurrently, each billed on its own interval.
+
+**Grace period:** a failed `charge` (insufficient allowance or balance) does not revert; it returns `ChargeOutcome::PaymentFailed`, increments `failed_charges_count`, records `delinquent_since_ledger`, and emits `charge_failed`. A failed attempt at or after `delinquent_since_ledger + grace_period_ledgers` sets the subscription to suspended (`ChargeOutcome::Suspended`, `subscription_suspended` event). A successful charge clears the delinquency. The grace period defaults to 120 960 ledgers (~7 days).
+
+**Batch billing:** `charge_batch` charges many `(subscriber, plan_id)` pairs under one provider authorization. Entries that are not due or not chargeable are skipped without reverting the others, and a single `batch_charged` event carries the totals.
+
+**Plan changes:** `change_plan` credits the unused part of the current paid interval (`old_amount * remaining / old_interval`). On an upgrade the shortfall is charged immediately and a new interval starts; on a downgrade the credit is turned into extra ledgers on the new plan before the next charge is due.
 
 **Errors:**
 - `AlreadyInitialized` (1) — `initialize` called twice
@@ -643,6 +803,11 @@ The subscriber must pre-approve this contract as a token spender (`token.approve
 - `PlanAlreadyExists` (11) — Plan ID already registered
 - `PlanNotFound` (12) — Unknown plan ID
 - `PlanInactive` (13) — Plan deactivated
+- `InvalidDiscount` (14) — `prepay_discount_bps` > 10,000
+- `ArithmeticOverflow` (15) — A billing calculation overflowed
+- `SubscriptionSuspended` (14) — Suspended after the grace period expired
+- `PaymentOverdue` (15) — Current period is due or delinquent; charge before changing plans
+- `ArithmeticOverflow` (16) — Pro-ration arithmetic overflowed
 
 ---
 
@@ -650,32 +815,24 @@ The subscriber must pre-approve this contract as a token spender (`token.approve
 
 **Location:** `contracts/swap/src/lib.rs`
 
-> **Known issue:** `lib.rs` currently contains corrupted/duplicated code — both
-> `set_fee_bps` and `get_fee_bps` are defined twice in the same `impl` block,
-> and some branches reference states/errors (`SwapState::Pending`/`Accepted`,
-> `SwapError::SwapNotPending`/`SwapExpired`) that don't exist in `storage.rs`
-> / `errors.rs` (which define `SwapState::Open`/`Completed`/`Cancelled` and
-> `SwapError::InvalidState`/`DeadlineExpired`). The table below documents the
-> coherent, internally-consistent subset of the file using the canonical
-> names from `errors.rs`/`storage.rs`. Treat this section as a
-> known-incomplete placeholder until the contract code itself is fixed in a
-> separate PR — see the note in `error-reference.md`'s Swap section.
-
 | Function | Parameters | Returns | Errors |
 |----------|-----------|---------|--------|
-| `initialize` | `env: Env, admin: Address, fee_bps: u32` | `Result<(), SwapError>` | `AlreadyInitialized`, `InvalidFee` |
+| `initialize` | `env: Env, admin: Address, treasury: Address, fee_bps: u32` | `Result<(), SwapError>` | `AlreadyInitialized`, `InvalidFee` |
 | `set_treasury` | `env: Env, new_treasury: Address` | `Result<(), SwapError>` | `NotInitialized`, `NotAuthorized` |
 | `set_fee_bps` | `env: Env, new_fee_bps: u32` | `Result<(), SwapError>` | `NotInitialized`, `NotAuthorized`, `InvalidFee` |
 | `set_admin` | `env: Env, new_admin: Address` | `Result<(), SwapError>` | `NotInitialized`, `NotAuthorized` |
 | `get_admin` | `env: Env` | `Result<Address, SwapError>` | `NotInitialized` |
 | `get_treasury` | `env: Env` | `Result<Address, SwapError>` | `NotInitialized` |
 | `get_fee_bps` | `env: Env` | `Result<u32, SwapError>` | `NotInitialized` |
+| `swap_count` | `env: Env` | `Result<u32, SwapError>` | `NotInitialized` |
 | `propose_swap` | `env: Env, party_a: Address, token_a: Address, amount_a: i128, token_b: Address, amount_b: i128, expires_at: u32` | `Result<u32, SwapError>` | `NotInitialized`, `InvalidDeadline` |
 | `accept_swap` | `env: Env, swap_id: u32, party_b: Address` | `Result<u32, SwapError>` | `NotInitialized`, `SwapNotFound`, `InvalidState`, `DeadlineExpired` |
 | `cancel_swap` | `env: Env, swap_id: u32` | `Result<(), SwapError>` | `SwapNotFound`, `InvalidState`, `NotAuthorized` |
 | `get_swap` | `env: Env, swap_id: u32` | `Result<SwapInfo, SwapError>` | `SwapNotFound` |
 
-`accept_swap` deducts a `fee_bps` fee (paid to the admin) from `token_b`'s transfer to party A, then executes both legs of the swap atomically.
+`propose_swap` escrows `token_a` and writes the complete `SwapInfo` under the persistent composite key `DataKey::Swap(swap_id)`. The instance entry contains only configuration and the monotonic counter; every mutation and read of a swap bumps that swap's persistent TTL.
+
+`accept_swap` deducts a `fee_bps` fee (paid to the configured treasury) from `token_b`'s transfer to party A, then executes both legs of the swap atomically. `cancel_swap` returns the escrowed `token_a` to party A.
 
 **Errors:**
 - `NotAuthorized` (1) — Caller not permitted

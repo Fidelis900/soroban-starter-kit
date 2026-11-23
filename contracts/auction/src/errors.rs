@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuctionError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
@@ -20,13 +20,24 @@ pub enum AuctionError {
     NothingToWithdraw = 11,
     /// The auction ended but the highest bid did not meet the reserve price.
     ReserveNotMet = 12,
-    /// `cancel` was called after at least one bid has been placed.
+    /// `cancel` was called after at least one bid has been placed and the
+    /// cancellation grace window is disabled or has elapsed.
     BidAlreadyPlaced = 13,
     /// The bid does not exceed the current highest bid by at least
     /// [`crate::MIN_BID_INCREMENT_BPS`].
     BidIncrementTooLow = 14,
     /// A checked arithmetic operation overflowed.
     ArithmeticOverflow = 15,
+    /// A checked arithmetic operation on bid, refund, or price values overflowed.
+    Overflow = 14,
+    /// The call does not apply to this auction's mode (English vs. Dutch).
+    WrongMode = 15,
+    /// `buy` was called before the Dutch auction's `start_ledger`.
+    AuctionNotStarted = 16,
+    /// Exactly one of `nft_contract` / `token_id` was supplied.
+    InvalidNftParams = 17,
+    /// `cancel_auctions_batch` was called with an auction that already has a bid.
+    BatchCancelFailed = 18,
 }
 
 impl_display_error!(
@@ -46,6 +57,12 @@ impl_display_error!(
     BidAlreadyPlaced   => "cannot cancel after a bid has been placed",
     BidIncrementTooLow => "bid below minimum percentage increment",
     ArithmeticOverflow => "arithmetic overflow",
+    BidAlreadyPlaced   => "cannot cancel after a bid outside the grace window",
+    Overflow           => "arithmetic overflow",
+    WrongMode          => "operation not supported in this auction mode",
+    AuctionNotStarted  => "auction has not started",
+    InvalidNftParams   => "nft_contract and token_id must be supplied together",
+    BatchCancelFailed  => "batch cancellation failed: auction has active bids",
 );
 
 #[cfg(test)]
@@ -75,6 +92,11 @@ AuctionError::ReserveNotMet = {}\n\
 AuctionError::BidAlreadyPlaced = {}\n\
 AuctionError::BidIncrementTooLow = {}\n\
 AuctionError::ArithmeticOverflow = {}\n",
+AuctionError::Overflow = {}\n\
+AuctionError::WrongMode = {}\n\
+AuctionError::AuctionNotStarted = {}\n\
+AuctionError::InvalidNftParams = {}\n\
+AuctionError::BatchCancelFailed = {}\n",
             AuctionError::AlreadyInitialized as u32,
             AuctionError::NotInitialized as u32,
             AuctionError::AuctionEnded as u32,
@@ -90,6 +112,11 @@ AuctionError::ArithmeticOverflow = {}\n",
             AuctionError::BidAlreadyPlaced as u32,
             AuctionError::BidIncrementTooLow as u32,
             AuctionError::ArithmeticOverflow as u32,
+            AuctionError::Overflow as u32,
+            AuctionError::WrongMode as u32,
+            AuctionError::AuctionNotStarted as u32,
+            AuctionError::InvalidNftParams as u32,
+            AuctionError::BatchCancelFailed as u32,
         )
     }
 

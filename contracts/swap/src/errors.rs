@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapError {
     NotAuthorized = 1,
     SwapNotFound = 2,
@@ -18,6 +18,22 @@ pub enum SwapError {
     AlreadyInitialized = 9,
     NotInitialized = 10,
     InvalidFee = 11,
+    BasketSwapNotFound = 12,
+    MathOverflow = 13,
+    StorageError = 14,
+    FeeZeroNotAllowed = 15,
+    ExecutionDelayExceeded = 16,
+    PartialFillsDisabled = 17,
+    InvalidFillAmount = 18,
+    HashLockMismatch = 19,
+    NotCreator = 20,
+    EmptyBatch = 21,
+    SecretNotRevealed = 22,
+    InvariantViolated = 23,
+    FeeZeroNotAllowed = 12,
+    ExecutionDelayExceeded = 13,
+    SwapExpired = 15,
+    InsufficientInitialLiquidity = 23,
 }
 
 impl_display_error!(
@@ -33,6 +49,20 @@ impl_display_error!(
     AlreadyInitialized => "contract already initialized",
     NotInitialized     => "contract not initialized",
     InvalidFee         => "invalid fee basis points",
+    BasketSwapNotFound => "basket swap not found",
+    MathOverflow       => "arithmetic overflow",
+    StorageError       => "storage error",
+    FeeZeroNotAllowed      => "fee truncated to zero or below minimum required",
+    ExecutionDelayExceeded => "maximum execution delay exceeded",
+    PartialFillsDisabled   => "partial fills are disabled for this swap",
+    InvalidFillAmount      => "invalid fill amount",
+    HashLockMismatch       => "hash lock preimage does not match",
+    NotCreator             => "caller is not the swap creator",
+    EmptyBatch             => "batch must contain at least one swap",
+    SecretNotRevealed      => "secret has not been revealed",
+    InvariantViolated      => "swap would decrease the pool invariant",
+    SwapExpired            => "swap has expired",
+    InsufficientInitialLiquidity => "insufficient initial liquidity",
 );
 
 #[cfg(test)]
@@ -54,7 +84,17 @@ SwapError::DeadlineExpired = {}\n\
 SwapError::InvalidAmount = {}\n\
 SwapError::InvalidDeadline = {}\n\
 SwapError::AlreadyCompleted = {}\n\
-SwapError::AlreadyCancelled = {}\n",
+SwapError::AlreadyCancelled = {}\n\
+SwapError::PartialFillsDisabled = {}\n\
+SwapError::InvalidFillAmount = {}\n\
+SwapError::HashLockMismatch = {}\n\
+SwapError::NotCreator = {}\n\
+SwapError::EmptyBatch = {}\n\
+SwapError::SecretNotRevealed = {}\n\
+SwapError::InvariantViolated = {}\n\
+SwapError::SwapExpired = {}\n",
+SwapError::SwapExpired = {}\n\
+SwapError::InsufficientInitialLiquidity = {}\n",
             SwapError::NotAuthorized as u32,
             SwapError::SwapNotFound as u32,
             SwapError::InvalidState as u32,
@@ -63,6 +103,15 @@ SwapError::AlreadyCancelled = {}\n",
             SwapError::InvalidDeadline as u32,
             SwapError::AlreadyCompleted as u32,
             SwapError::AlreadyCancelled as u32,
+            SwapError::PartialFillsDisabled as u32,
+            SwapError::InvalidFillAmount as u32,
+            SwapError::HashLockMismatch as u32,
+            SwapError::NotCreator as u32,
+            SwapError::EmptyBatch as u32,
+            SwapError::SecretNotRevealed as u32,
+            SwapError::InvariantViolated as u32,
+            SwapError::SwapExpired as u32,
+            SwapError::InsufficientInitialLiquidity as u32,
         )
     }
 

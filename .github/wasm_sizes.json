@@ -3,5 +3,12 @@
     "escrow": 23456,
     "multisig": 34567,
     "nft": 45678,
-    "staking": 56789
+    "staking": 56789,
+    "budgets": {
+        "dao": 65536,
+        "escrow": 65536,
+        "multisig": 65536,
+        "nft": 65536,
+        "staking": 65536
+    }
 }

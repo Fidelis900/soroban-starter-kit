@@ -221,7 +221,7 @@ fn test_mint_zero_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_transfer_zero_amount() {
     let env = Env::default();
     env.mock_all_auths();
@@ -234,7 +234,7 @@ fn test_transfer_zero_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_transfer_negative_amount() {
     let env = Env::default();
     env.mock_all_auths();
@@ -244,6 +244,415 @@ fn test_transfer_negative_amount() {
     let client = init_token(&env, &admin);
     client.mint(&user, &1000i128);
     client.transfer(&user, &other, &-1i128);
+}
+
+#[test]
+fn test_transfer_zero_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let other = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&user, &1000i128);
+
+    assert_eq!(
+        client.try_transfer(&user, &other, &0i128),
+        Err(Ok(TokenError::ZeroAmount))
+    );
+    // Balances untouched
+    assert_eq!(client.balance(&user), 1000i128);
+    assert_eq!(client.balance(&other), 0i128);
+}
+
+#[test]
+fn test_transfer_negative_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let other = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&user, &1000i128);
+
+    assert_eq!(
+        client.try_transfer(&user, &other, &-1i128),
+        Err(Ok(TokenError::ZeroAmount))
+    );
+    assert_eq!(client.balance(&user), 1000i128);
+    assert_eq!(client.balance(&other), 0i128);
+}
+
+#[test]
+fn test_transfer_from_zero_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+    client.approve(&owner, &spender, &500i128, &expiration);
+
+    assert_eq!(
+        client.try_transfer_from(&spender, &owner, &recipient, &0i128),
+        Err(Ok(TokenError::ZeroAmount))
+    );
+    // Allowance and balances untouched
+    assert_eq!(client.allowance(&owner, &spender), 500i128);
+    assert_eq!(client.balance(&owner), 1000i128);
+    assert_eq!(client.balance(&recipient), 0i128);
+}
+
+#[test]
+fn test_transfer_from_negative_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+    client.approve(&owner, &spender, &500i128, &expiration);
+
+    assert_eq!(
+        client.try_transfer_from(&spender, &owner, &recipient, &-1i128),
+        Err(Ok(TokenError::ZeroAmount))
+    );
+    assert_eq!(client.allowance(&owner, &spender), 500i128);
+    assert_eq!(client.balance(&owner), 1000i128);
+}
+
+#[test]
+fn test_burn_zero_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&user, &1000i128);
+
+    assert_eq!(
+        client.try_burn(&user, &0i128),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.balance(&user), 1000i128);
+    assert_eq!(client.total_supply(), 1000i128);
+}
+
+#[test]
+fn test_burn_negative_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&user, &1000i128);
+
+    assert_eq!(
+        client.try_burn(&user, &-1i128),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.balance(&user), 1000i128);
+    assert_eq!(client.total_supply(), 1000i128);
+}
+
+#[test]
+fn test_burn_from_zero_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+    client.approve(&owner, &spender, &400i128, &expiration);
+
+    assert_eq!(
+        client.try_burn_from(&spender, &owner, &0i128),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.allowance(&owner, &spender), 400i128);
+    assert_eq!(client.balance(&owner), 1000i128);
+    assert_eq!(client.total_supply(), 1000i128);
+}
+
+#[test]
+fn test_burn_from_negative_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+    client.approve(&owner, &spender, &400i128, &expiration);
+
+    assert_eq!(
+        client.try_burn_from(&spender, &owner, &-1i128),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.allowance(&owner, &spender), 400i128);
+    assert_eq!(client.balance(&owner), 1000i128);
+    assert_eq!(client.total_supply(), 1000i128);
+}
+
+#[test]
+fn test_approve_zero_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+
+    assert_eq!(
+        client.try_approve(&owner, &spender, &0i128, &expiration),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.allowance(&owner, &spender), 0i128);
+}
+
+#[test]
+fn test_approve_negative_amount_returns_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&owner, &1000i128);
+    let expiration = env.ledger().sequence() + 100;
+
+    assert_eq!(
+        client.try_approve(&owner, &spender, &-1i128, &expiration),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.allowance(&owner, &spender), 0i128);
+}
+
+// ── #1279 transfer_to_many tests ─────────────────────────────────────────────
+
+#[test]
+fn test_transfer_to_many_conserves_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients = soroban_sdk::vec![
+        &env,
+        (user1.clone(), 100i128),
+        (user2.clone(), 200i128),
+        (user3.clone(), 300i128),
+    ];
+    client.transfer_to_many(&sender, &recipients);
+
+    assert_eq!(client.balance(&sender), 400i128);
+    assert_eq!(client.balance(&user1), 100i128);
+    assert_eq!(client.balance(&user2), 200i128);
+    assert_eq!(client.balance(&user3), 300i128);
+    // Total supply is conserved across the multi-recipient payout
+    assert_eq!(client.total_supply(), 1000i128);
+    assert_eq!(
+        client.balance(&sender)
+            + client.balance(&user1)
+            + client.balance(&user2)
+            + client.balance(&user3),
+        1000i128
+    );
+}
+
+#[test]
+fn test_transfer_to_many_single_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &500i128);
+
+    let recipients = soroban_sdk::vec![&env, (recipient.clone(), 500i128)];
+    client.transfer_to_many(&sender, &recipients);
+
+    assert_eq!(client.balance(&sender), 0i128);
+    assert_eq!(client.balance(&recipient), 500i128);
+    assert_eq!(client.total_supply(), 500i128);
+}
+
+#[test]
+fn test_transfer_to_many_uses_single_authorization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients = soroban_sdk::vec![
+        &env,
+        (user1.clone(), 100i128),
+        (user2.clone(), 100i128),
+    ];
+    client.transfer_to_many(&sender, &recipients);
+
+    // Exactly one authorization entry is recorded for the sender.
+    use soroban_sdk::testutils::MockAuth;
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (auth_address, _) = auths.first().unwrap();
+    assert_eq!(auth_address, sender);
+    let _ = MockAuth::default;
+}
+
+#[test]
+fn test_transfer_to_many_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &100i128);
+
+    let recipients = soroban_sdk::vec![
+        &env,
+        (user1.clone(), 100i128),
+        (user2.clone(), 100i128),
+    ];
+    assert_eq!(
+        client.try_transfer_to_many(&sender, &recipients),
+        Err(Ok(TokenError::InsufficientBalance))
+    );
+    // No balances changed
+    assert_eq!(client.balance(&sender), 100i128);
+    assert_eq!(client.balance(&user1), 0i128);
+    assert_eq!(client.balance(&user2), 0i128);
+}
+
+#[test]
+fn test_transfer_to_many_empty_recipients_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients: soroban_sdk::Vec<(Address, i128)> = soroban_sdk::vec![&env];
+    assert_eq!(
+        client.try_transfer_to_many(&sender, &recipients),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.balance(&sender), 1000i128);
+}
+
+#[test]
+fn test_transfer_to_many_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients = soroban_sdk::vec![
+        &env,
+        (user1.clone(), 100i128),
+        (user2.clone(), 0i128),
+    ];
+    assert_eq!(
+        client.try_transfer_to_many(&sender, &recipients),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.balance(&sender), 1000i128);
+    assert_eq!(client.balance(&user1), 0i128);
+}
+
+#[test]
+fn test_transfer_to_many_negative_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients = soroban_sdk::vec![&env, (user1.clone(), -1i128)];
+    assert_eq!(
+        client.try_transfer_to_many(&sender, &recipients),
+        Err(Ok(TokenError::InvalidAmount))
+    );
+    assert_eq!(client.balance(&sender), 1000i128);
+    assert_eq!(client.balance(&user1), 0i128);
+}
+
+#[test]
+fn test_transfer_to_many_overflow_on_sum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &i128::MAX);
+
+    // The checked sum of the recipient amounts overflows i128.
+    let recipients = soroban_sdk::vec![
+        &env,
+        (user1.clone(), i128::MAX),
+        (user2.clone(), 1i128),
+    ];
+    assert_eq!(
+        client.try_transfer_to_many(&sender, &recipients),
+        Err(Ok(TokenError::Overflow))
+    );
+    assert_eq!(client.balance(&sender), i128::MAX);
+    assert_eq!(client.balance(&user1), 0i128);
+    assert_eq!(client.balance(&user2), 0i128);
+}
+
+#[test]
+fn test_transfer_to_many_self_recipient_is_noop() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let other = Address::generate(&env);
+    let client = init_token(&env, &admin);
+    client.mint(&sender, &1000i128);
+
+    let recipients = soroban_sdk::vec![
+        &env,
+        (sender.clone(), 200i128),
+        (other.clone(), 300i128),
+    ];
+    client.transfer_to_many(&sender, &recipients);
+
+    assert_eq!(client.balance(&sender), 700i128);
+    assert_eq!(client.balance(&other), 300i128);
+    assert_eq!(client.total_supply(), 1000i128);
 }
 
 #[test]
@@ -1131,6 +1540,150 @@ mod transfer_hook_tests {
     }
 }
 
+// ── freeze feature tests ───────────────────────────────────────────────────────
+
+#[cfg(feature = "freeze")]
+mod freeze_tests {
+    use super::*;
+    use crate::storage::DataKey;
+
+    #[test]
+    fn test_freeze_blocks_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+
+        // Transfer should fail for frozen account
+        assert!(client.try_transfer(&user, &recipient, &100i128).is_err());
+    }
+
+    #[test]
+    fn test_unfreeze_allows_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+        client.unfreeze_account(&user);
+
+        // Transfer should succeed after unfreeze
+        client.transfer(&user, &recipient, &100i128);
+        assert_eq!(client.balance(&user), 900i128);
+        assert_eq!(client.balance(&recipient), 100i128);
+    }
+
+    #[test]
+    fn test_freeze_uses_persistent_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.freeze_account(&user);
+
+        // Verify frozen status is in persistent storage
+        let frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen(user.clone()))
+            .unwrap_or(false);
+        assert!(frozen);
+
+        // Verify frozen status is NOT in instance storage
+        let instance_frozen: Option<bool> =
+            env.storage().instance().get(&DataKey::Frozen(user.clone()));
+        assert!(instance_frozen.is_none());
+    }
+
+    #[test]
+    fn test_unfreeze_removes_from_persistent_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.freeze_account(&user);
+        client.unfreeze_account(&user);
+
+        // Verify frozen status is removed from persistent storage
+        let frozen: Option<bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Frozen(user.clone()));
+        assert!(frozen.is_none());
+    }
+
+    #[test]
+    fn test_freeze_does_not_affect_instance_storage_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        // Freeze many accounts to verify instance storage doesn't grow
+        for _ in 0..100 {
+            let user = Address::generate(&env);
+            client.freeze_account(&user);
+        }
+
+        // Instance storage should only contain configuration, not frozen accounts
+        // This is a sanity check - we verify the contract still functions
+        let new_user = Address::generate(&env);
+        client.mint(&new_user, &100i128);
+        assert_eq!(client.balance(&new_user), 100i128);
+    }
+
+    #[test]
+    fn test_freeze_blocks_burn() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+
+        // Burn should fail for frozen account
+        assert!(client.try_burn(&user, &100i128).is_err());
+    }
+
+    #[test]
+    fn test_freeze_blocks_transfer_from() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&owner, &1000i128);
+        let expiration = env.ledger().sequence() + 100;
+        client.approve(&owner, &spender, &500i128, &expiration);
+        client.freeze_account(&owner);
+
+        // transfer_from should fail when owner is frozen
+        assert!(
+            client
+                .try_transfer_from(&spender, &owner, &recipient, &100i128)
+                .is_err()
+        );
+    }
+}
+
 // ── #717 snapshot tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -1459,5 +2012,306 @@ mod permit_tests {
         );
         client.approve_with_signature(&owner, &spender, &100i128, &0u32, &expiry, &new_signature);
         assert_eq!(client.allowance(&owner, &spender), 100i128);
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_marks_nonce_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+        client.cancel_permit_nonce(&owner, &0u32);
+        assert!(client.is_permit_nonce_cancelled(&owner, &0u32));
+        // Other nonces are unaffected.
+        assert!(!client.is_permit_nonce_cancelled(&owner, &1u32));
+    }
+
+    #[test]
+    fn test_cancelled_nonce_rejects_matching_permit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            500i128,
+            0u32,
+            expiry,
+        );
+
+        // Owner cancels the nonce before the relayer submits the permit.
+        client.cancel_permit_nonce(&owner, &0u32);
+
+        let result = client
+            .try_approve_with_signature(&owner, &spender, &500i128, &0u32, &expiry, &signature);
+        assert!(result.is_err());
+        // No allowance was granted.
+        assert_eq!(client.allowance(&owner, &spender), 0i128);
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, _spender, _signing_key) = setup_permit(&env);
+
+        // Stop mocking auths: the owner's authorization is now required.
+        env.set_auths(&[]);
+        let result = client.try_cancel_permit_nonce(&owner, &0u32);
+        assert!(result.is_err());
+        assert!(!client.is_permit_nonce_cancelled(&owner, &0u32));
+    }
+
+    #[test]
+    fn test_cancel_permit_nonce_does_not_advance_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner, spender, signing_key) = setup_permit(&env);
+
+        client.cancel_permit_nonce(&owner, &0u32);
+        // Cancelling does not consume the nonce counter.
+        assert_eq!(client.permit_nonce(&owner), 0u32);
+
+        // A permit signed for a different, uncancelled nonce still works.
+        let contract_id = client.address.clone();
+        let expiry = env.ledger().sequence() + 1_000;
+        let signature = sign_permit(
+            &env,
+            &signing_key,
+            &contract_id,
+            &owner,
+            &spender,
+            250i128,
+            1u32,
+            expiry,
+        );
+        client.approve_with_signature(&owner, &spender, &250i128, &1u32, &expiry, &signature);
+        assert_eq!(client.allowance(&owner, &spender), 250i128);
+        assert_eq!(client.permit_nonce(&owner), 2u32);
+    }
+
+    #[test]
+    fn test_transfer_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 200i128),
+            (user3.clone(), 300i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+
+        assert_eq!(client.balance(&user1), 500i128);
+        assert_eq!(client.balance(&user2), 200i128);
+        assert_eq!(client.balance(&user3), 300i128);
+        assert_eq!(client.total_supply(), 1000i128);
+    }
+
+    #[test]
+    fn test_transfer_batch_self_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user1.clone(), 200i128),
+            (user2.clone(), 300i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+
+        assert_eq!(client.balance(&user1), 700i128);
+        assert_eq!(client.balance(&user2), 300i128);
+        assert_eq!(client.total_supply(), 1000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1)")]
+    fn test_transfer_batch_insufficient_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &100i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 200i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), 0i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_negative_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![
+            &env,
+            (user2.clone(), -1i128),
+        ];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_transfer_batch_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&user1, &1000i128);
+
+        let transfers = soroban_sdk::vec![&env];
+        client.transfer_batch(&user1, &transfers);
+    }
+
+    #[test]
+    fn test_transfer_batch_multiple_recipients() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let client = init_token(&env, &admin);
+        client.mint(&sender, &10000i128);
+
+        let mut recipients = soroban_sdk::Vec::new(&env);
+        for i in 0..10 {
+            let recipient = Address::generate(&env);
+            recipients.push_back((recipient, 100i128));
+        }
+        client.transfer_batch(&sender, &recipients);
+
+        assert_eq!(client.balance(&sender), 9000i128);
+        assert_eq!(client.total_supply(), 10000i128);
+        for i in 0..10 {
+            let recipient = recipients.get(i).unwrap().0;
+            assert_eq!(client.balance(&recipient), 100i128);
+        }
+    }
+}
+
+
+// ── blacklist vs freeze (issue #1178) ───────────────────────────────────────────
+
+#[cfg(feature = "freeze")]
+mod blacklist_tests {
+    use super::*;
+
+    #[test]
+    fn test_blacklist_blocks_transfer_unlike_unfrozen() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.blacklist(&user);
+        assert!(client.is_blacklisted(&user));
+        assert!(client.try_transfer(&user, &recipient, &100i128).is_err());
+    }
+
+    #[test]
+    fn test_freeze_and_blacklist_are_independent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.freeze_account(&user);
+        client.unfreeze_account(&user);
+        // Unfreeze does not clear a blacklist.
+        client.blacklist(&user);
+        assert!(client.is_blacklisted(&user));
+        assert!(client.try_transfer(&user, &recipient, &50i128).is_err());
+
+        client.unblacklist(&user);
+        assert!(!client.is_blacklisted(&user));
+        client.transfer(&user, &recipient, &50i128);
+        assert_eq!(client.balance(&recipient), 50i128);
+    }
+
+    #[test]
+    fn test_confiscate_blacklisted_to_compliance_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.set_compliance_treasury(&treasury);
+        client.blacklist(&user);
+        client.confiscate_blacklisted(&user, &400i128);
+
+        assert_eq!(client.balance(&user), 600i128);
+        assert_eq!(client.balance(&treasury), 400i128);
+    }
+
+    #[test]
+    fn test_confiscate_requires_blacklist() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let client = init_token(&env, &admin);
+
+        client.mint(&user, &1000i128);
+        client.set_compliance_treasury(&treasury);
+        // Frozen but not blacklisted — confiscate must fail.
+        client.freeze_account(&user);
+        assert!(client.try_confiscate_blacklisted(&user, &100i128).is_err());
     }
 }

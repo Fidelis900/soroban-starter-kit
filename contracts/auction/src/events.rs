@@ -1,4 +1,20 @@
-use soroban_sdk::{Address, Env, Symbol};
+// `#[contracttype]` generates undocumented public associated items.
+#![allow(missing_docs)]
+
+use soroban_sdk::{Address, Env, Symbol, Vec, contracttype};
+
+/// Payload of the `cancelled_with_compensation` event, emitted when the seller
+/// cancels inside the grace window after at least one bid has been placed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionCancelledWithCompensation {
+    /// The seller who cancelled the auction.
+    pub seller: Address,
+    /// The highest bidder at the time of cancellation.
+    pub top_bidder: Address,
+    /// Compensation fee credited to `top_bidder` on top of their bid refund.
+    pub compensation_amount: i128,
+}
 
 pub fn started(env: &Env, seller: &Address, start_price: i128, deadline: u32) {
     env.events().publish(
@@ -10,6 +26,36 @@ pub fn started(env: &Env, seller: &Address, start_price: i128, deadline: u32) {
 pub fn bid_placed(env: &Env, bidder: &Address, amount: i128) {
     env.events()
         .publish((Symbol::new(env, "bid_placed"), bidder.clone()), amount);
+}
+
+pub fn outbid(
+    env: &Env,
+    outbid_bidder: &Address,
+    outbid_amount: i128,
+    new_highest_bid: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "outbid"), outbid_bidder.clone()),
+        (outbid_amount, new_highest_bid),
+    );
+}
+
+pub fn refund_queued(env: &Env, bidder: &Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "refund_queued"), bidder.clone()), amount);
+}
+
+/// Emitted when an outbid (or below-reserve) bidder is refunded immediately.
+pub fn refund_sent(env: &Env, bidder: &Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "refund_sent"), bidder.clone()), amount);
+}
+
+/// Emitted when an immediate refund transfer fails and the amount is credited
+/// to the bidder's pending balance instead.
+pub fn refund_failed(env: &Env, bidder: &Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "refund_failed"), bidder.clone()), amount);
 }
 
 pub fn ended(env: &Env, winner: &Address, amount: i128) {
@@ -52,7 +98,106 @@ pub fn auction_extended(env: &Env, auction_id: &Address, new_deadline: u32) {
     );
 }
 
+/// Emitted when a late bid triggers an anti-sniping extension of the auction
+/// deadline, identifying the affected auction and its new `end_ledger`.
+pub fn auction_extended(env: &Env, auction_id: u32, new_deadline: u32) {
+    env.events().publish(
+        (Symbol::new(env, "auction_extended"), auction_id),
+        new_deadline,
+    );
+}
+
+pub fn max_deadline_reached(env: &Env, max_deadline: u32) {
+    env.events()
+        .publish((Symbol::new(env, "max_deadline_reached"),), max_deadline);
+}
+
 pub fn cancelled(env: &Env, seller: &Address) {
     env.events()
         .publish((Symbol::new(env, "cancelled"), seller.clone()), ());
+}
+
+/// Emitted when a seller cancels several unbid auctions in a single call.
+pub fn cancelled_batch(env: &Env, seller: &Address, auction_ids: &Vec<u32>) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled_batch"), seller.clone()),
+        auction_ids.clone(),
+    );
+}
+
+pub fn cancelled_with_compensation(
+    env: &Env,
+    seller: &Address,
+    top_bidder: &Address,
+    compensation_amount: i128,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "cancelled_with_compensation"),
+            seller.clone(),
+        ),
+        AuctionCancelledWithCompensation {
+            seller: seller.clone(),
+            top_bidder: top_bidder.clone(),
+            compensation_amount,
+        },
+    );
+}
+pub fn credit_applied(env: &Env, bidder: &Address, credit_used: i128, transferred: i128) {
+    env.events().publish(
+        (Symbol::new(env, "credit_applied"), bidder.clone()),
+        (credit_used, transferred),
+    );
+}
+
+pub fn dutch_started(
+    env: &Env,
+    seller: &Address,
+    start_price: i128,
+    floor_price: i128,
+    start_ledger: u32,
+    duration_ledgers: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "dutch_started"), seller.clone()),
+        (start_price, floor_price, start_ledger, duration_ledgers),
+    );
+}
+
+pub fn dutch_bought(env: &Env, buyer: &Address, price: i128) {
+    env.events()
+        .publish((Symbol::new(env, "dutch_bought"), buyer.clone()), price);
+}
+
+pub fn nft_escrowed(env: &Env, nft_contract: &Address, token_id: u32) {
+    env.events().publish(
+        (Symbol::new(env, "nft_escrowed"), nft_contract.clone()),
+        token_id,
+    );
+}
+
+pub fn nft_released(env: &Env, to: &Address, token_id: u32) {
+    env.events()
+        .publish((Symbol::new(env, "nft_released"), to.clone()), token_id);
+}
+
+pub fn seller_proceeds_queued(env: &Env, seller: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "seller_proceeds_queued"), seller.clone()),
+        amount,
+    );
+}
+
+pub fn seller_proceeds_withdrawn(env: &Env, seller: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "seller_proceeds_withdrawn"), seller.clone()),
+        amount,
+    );
+}
+
+pub fn royalty_paid(env: &Env, recipient: &Address, token_id: u32, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "royalty_paid"), recipient.clone(), token_id),
+        amount,
+    );
 }

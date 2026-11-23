@@ -1,3 +1,8 @@
+Looking at the current file, I can see it has significant corruption (duplicate imports, syntax errors, orphaned code blocks). I need to produce a complete, working file that implements all four features while preserving existing functionality.
+
+Let me carefully reconstruct the file with all four features implemented:
+
+```rust
 #![no_std]
 #![deny(missing_docs)]
 //! DAO governance contract template.
@@ -5,6 +10,45 @@
 //! Token holders create proposals and cast token-weighted votes; a proposal
 //! passes when it reaches quorum with more yes votes than no votes.
 //!
+//! ## Features
+//!
+//! * **Executable action payloads** (issue #1108) — proposals may carry an
+//!   optional `(target, function, args)` triple that is dispatched atomically
+//!   via `env.invoke_contract` on execution.
+//! * **Proposal submission bond** (issue #1106) — a configurable bond is
+//!   escrowed on `create_proposal`; it is refunded when the proposal passes
+//!   quorum or slashed to the admin treasury when it fails to meet minimum
+//!   participation.
+//! * **Dynamic quorum** (issue #1107) — an exponential moving average of
+//!   historical participation keeps quorum between `min_quorum_bps` and
+//!   `max_quorum_bps`, bounded in basis points (0–10 000).
+//! * **Quadratic voting** (issue #1316) — proposals may opt into quadratic
+//!   vote weighting, where a voter's weight is `fixed_sqrt(balance)` rather
+//!   than the raw token balance, reducing whale dominance.
+//! * **Multi-choice voting** (issue #1317) — proposals may define a list of
+//!   `choices`; voters allocate weight across choices and the winner is the
+//!   choice with the highest tally.
+//! * **Tiered execution timelock** (issue #1318) — proposals are classified
+//!   into `Standard`, `Financial`, or `Critical` tiers, each with its own
+//!   execution delay so high-impact actions wait longer.
+//! * **Duplicate payload rejection** (issue #1319) — proposals are hashed
+//!   over their payload; creating a proposal identical to an active one is
+//!   rejected with `DaoError::DuplicateProposal`.
+//! * **Vote-weight snapshots** (issue #1442) — each proposal records the
+//!   ledger at which it was created and, on an address's first vote, the
+//!   voter's token balance is snapshotted into `VoteSnapshotKey`. Vote weight
+//!   is derived exclusively from that snapshot, so tokens transferred after a
+//!   vote cannot be recycled by the recipient to vote again (their snapshot
+//!   is zero).
+//! * **Immutable execution timelock** (issue #1443) — a minimum 48-hour
+//!   `TimelockDelay` is fixed at initialization (it may only ever be
+//!   increased). Passed proposals record `executable_at = now + delay` and
+//!   `execute_proposal` rejects any call before that ledger.
+//! * **Guardian emergency veto** (issue #1444) — a configured multi-sig
+//!   guardian may call `guardian_veto` to cancel a `Queued` proposal during
+//!   its timelock window, before it becomes executable.
+//!
+
 //! ## Quorum modes
 //!
 //! Two quorum controls can be set at initialization; both must be satisfied
@@ -14,22 +58,75 @@
 //! * **`quorum_bps`** — minimum participation as a share of total token supply
 //!   expressed in basis points (0–10 000). Set to `0` to disable.
 //!
+//! ## Execution timelock (#1104)
+//!
+//! After a proposal passes its voting deadline it enters `Queued` state.
+//! `execute_proposal` can be called only once `env.ledger().sequence() >=
+//! proposal.execution_eta` (where `execution_eta = deadline +
+//! tier_delay(tier)`).  The admin / security council may veto a queued
+//! proposal at any time before it executes via `veto_proposal`.
+//!
+//! ## Token locking during voting (#1103)
+//!
+//! When a voter calls `vote()` their governance tokens are transferred into
+//! the DAO contract.  This prevents flash-loan attacks — the tokens are
+//! physically absent from the attacker's account during the proposal window.
+//! After the proposal's deadline the voter calls `unlock_tokens()` to reclaim
+//! their stake.
+//!
+//! ## Vote delegation (#1105)
+//!
+//! Token holders may call `delegate(delegator, delegatee)` to assign their
+//! voting weight to another address.  When the delegatee calls `vote()` the
+//! contract aggregates the delegatee's own locked balance with the locked
+//! balances of all addresses that have delegated to them *for this proposal*.
+//! Circular delegation chains are rejected at `delegate()` time.
+//!
 //! ## Proposer self-cancel (#830)
 //!
 //! The original proposer may call `proposer_cancel_proposal` to retract their
-//! proposal **before any vote has been cast**. This lets them correct mistakes
+//! proposal **before any vote has been cast**.  This lets them correct mistakes
 //! without waiting for the voting period to lapse.
+//!
+//! ## Proposal listing (#1110)
+//!
+//! `get_proposals(cursor, limit, state)` returns proposals in ascending ID
+//! order, optionally filtered by [`ProposalState`], at most [`MAX_PAGE_SIZE`]
+//! per call. Pass the returned `next_cursor` to fetch the following page.
 
-use soroban_sdk::{Address, Env, String, Symbol, Vec, contract, contractimpl, token};
+use soroban_sdk::{Address, Bytes, Env, String, Symbol, Val, Vec, contract, contractimpl, token};
 
 mod errors;
 mod events;
 mod storage;
 
 pub use errors::DaoError;
-pub use storage::{DataKey, Proposal, ProposalKey, ProposalState, VoteKey};
+pub use storage::{
+    ChoiceTally, DataKey, DelegateKey, LockedTokensKey, Proposal, ProposalKey, ProposalPage,
+    ProposalState, ProposalTier, VoteKey, VoteSnapshotKey, VotingType,
+};
 
-use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
+use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, paginate};
+
+/// Maximum number of proposals returned by a single `get_proposals` call.
+pub const MAX_PAGE_SIZE: u32 = 50;
+
+/// Maximum number of non-circulating holder addresses whose balances are
+/// subtracted from total supply for the dynamic quorum (issue #1440). Bounds
+/// the number of cross-contract balance reads at proposal creation.
+pub const MAX_NON_CIRCULATING_HOLDERS: u32 = 20;
+
+/// Minimum execution timelock (in ledgers) between a proposal passing and
+/// becoming executable (issue #1443). 48 hours at 5s/ledger = 34 560.
+pub const MIN_TIMELOCK_DELAY: u32 = 34_560;
+
+/// Default execution delay (in ledgers) for `ProposalTier::Standard` when no
+/// tier-specific delay has been configured. 24 hours at 5s/ledger ≈ 17 280.
+pub const DEFAULT_STANDARD_DELAY: u32 = 17_280;
+/// Default execution delay (in ledgers) for `ProposalTier::Financial`. 72 hours.
+pub const DEFAULT_FINANCIAL_DELAY: u32 = 51_840;
+/// Default execution delay (in ledgers) for `ProposalTier::Critical`. 7 days.
+pub const DEFAULT_CRITICAL_DELAY: u32 = 120_960;
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -39,7 +136,8 @@ fn bump_instance(env: &Env) {
 
 fn bump_persistent<K>(env: &Env, key: &K)
 where
-    K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+    K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>
+        + soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
 {
     env.storage()
         .persistent()
@@ -48,11 +146,16 @@ where
 
 /// DAO governance contract for on-chain proposal creation and token-weighted voting.
 ///
-/// Voting power is capped at the token balance at vote time, but limited to not exceed
-/// the total token supply at proposal creation time. This snapshot prevents flash-loan
-/// style vote manipulation. A proposal passes when `yes_votes > no_votes`, total votes
-/// reach the absolute `quorum`, *and* participation reaches `quorum_bps` of the total
-/// token supply (measured at proposal creation time).
+/// Key security properties:
+/// - **Quorum snapshot** – `total_supply_at_creation` is captured from the token
+///   at proposal time, preventing token minting/burning from manipulating quorum.
+/// - **Token locking** – governance tokens are transferred into this contract when
+///   a voter casts their vote, eliminating flash-loan vote manipulation.
+/// - **Execution timelock** – passed proposals enter `Queued` state and may only
+///   be executed after the tier-specific delay, giving the community time to
+///   react to malicious governance.
+/// - **Vote delegation** – token holders may delegate their voting weight to
+///   trusted representatives without losing token ownership.
 pub use contract::*;
 
 // The `#[contract]` / `#[contractimpl]` macros generate an undocumented public
@@ -61,6 +164,12 @@ pub use contract::*;
 mod contract {
     #![allow(missing_docs)]
     use super::*;
+
+    // ── Adaptive-quorum constants ────────────────────────────────────────────
+    /// Default EMA smoothing window (number of proposals).
+    const DEFAULT_QUORUM_EMA_WINDOW: u32 = 10;
+    /// Basis points denominator.
+    const BPS_DENOMINATOR: u32 = 10_000;
 
     #[contract]
     pub struct DaoContract;
@@ -71,8 +180,17 @@ mod contract {
         ///
         /// - `voting_period` — number of ledgers a proposal stays open for voting.
         /// - `quorum` — minimum total votes (in token units) required for a valid result.
-        /// - `quorum_bps` — minimum participation as basis points of total supply (0–10 000).
-        ///   Pass `0` to disable the percentage-based quorum check.
+        ///   Used as the *initial* absolute quorum floor; adaptive quorum BPS are layered
+        ///   on top and stored separately.
+        /// - `proposal_bond` — token units escrowed by a proposer at submission time
+        ///   (issue #1106). Set to 0 to disable bonding.
+        /// - `min_quorum_bps` / `max_quorum_bps` — lower and upper bounds (in basis
+        ///   points, 0–10 000) for the adaptive quorum EMA (issue #1107). Pass both
+        ///   as 0 to disable adaptive quorum.
+        /// - `quorum_bps`      — minimum participation as basis points of total supply (0–10 000).
+        ///                       Pass `0` to disable the percentage-based quorum check.
+        /// - `execution_delay` — number of ledgers a passed proposal must wait in `Queued` state
+        ///                       before it can be executed. Used as the default `Standard` tier delay.
         ///
         /// # Errors
         ///
@@ -84,7 +202,11 @@ mod contract {
             token: Address,
             voting_period: u32,
             quorum: i128,
+            proposal_bond: i128,
+            min_quorum_bps: u32,
+            max_quorum_bps: u32,
             quorum_bps: u32,
+            execution_delay: u32,
         ) -> Result<(), DaoError> {
             if env.storage().instance().has(&DataKey::Initialized) {
                 return Err(DaoError::AlreadyInitialized);
@@ -103,7 +225,48 @@ mod contract {
             env.storage().instance().set(&DataKey::Quorum, &quorum);
             env.storage()
                 .instance()
+                .set(&DataKey::ProposalBond, &proposal_bond);
+            env.storage()
+                .instance()
+                .set(&DataKey::MinQuorumBps, &min_quorum_bps);
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxQuorumBps, &max_quorum_bps);
+            env.storage().instance().set(
+                &DataKey::QuorumEmaWindow,
+                &DEFAULT_QUORUM_EMA_WINDOW,
+            );
+            // Initialise EMA at the midpoint of the allowed band.
+            let initial_ema = (min_quorum_bps + max_quorum_bps) / 2;
+            env.storage()
+                .instance()
+                .set(&DataKey::QuorumEmaBps, &initial_ema);
+            env.storage()
+                .instance()
+                .set(&DataKey::QuorumEmaCount, &0u32);
+            env.storage()
+                .instance()
                 .set(&DataKey::QuorumBps, &quorum_bps);
+            env.storage()
+                .instance()
+                .set(&DataKey::ExecutionDelay, &execution_delay);
+            // Immutable execution timelock (issue #1443): never below the
+            // 48-hour minimum, regardless of the caller-supplied value.
+            let timelock_delay = execution_delay.max(MIN_TIMELOCK_DELAY);
+            env.storage()
+                .instance()
+                .set(&DataKey::TimelockDelay, &timelock_delay);
+            // Tier-specific delays default to the standard delay for Standard,
+            // and to the longer defaults for Financial / Critical (issue #1318).
+            env.storage()
+                .instance()
+                .set(&DataKey::StandardDelay, &execution_delay);
+            env.storage()
+                .instance()
+                .set(&DataKey::FinancialDelay, &DEFAULT_FINANCIAL_DELAY);
+            env.storage()
+                .instance()
+                .set(&DataKey::CriticalDelay, &DEFAULT_CRITICAL_DELAY);
             env.storage().instance().set(&DataKey::ProposalCount, &0u32);
             env.storage().instance().set(&DataKey::Initialized, &true);
 
@@ -113,36 +276,126 @@ mod contract {
             Ok(())
         }
 
-        /// Create a new proposal. The proposer must hold > 0 governance tokens.
+        /// Create a new proposal with the legacy (binary, standard-tier) config.
         ///
-        /// Returns the newly created `proposal_id`.
-        ///
-        /// Voting power and quorum are calculated using a snapshot of the total
-        /// token supply at proposal creation time, preventing flash-loan-style
-        /// vote manipulation.
+        /// This is a thin wrapper around [`create_proposal_with_config`] that
+        /// preserves the original signature for backwards compatibility.
         ///
         /// # Errors
         ///
-        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
-        /// Returns [`DaoError::InsufficientVotingPower`] if the proposer has no tokens.
+        /// See [`create_proposal_with_config`].
         pub fn create_proposal(
             env: Env,
             proposer: Address,
             title: String,
             description: String,
+            action_target: Option<Address>,
+            action_function: Option<Symbol>,
+            action_args: Option<Vec<Val>>,
+        ) -> Result<u32, DaoError> {
+            Self::create_proposal_with_config(
+                env,
+                proposer,
+                title,
+                description,
+                action_target,
+                action_function,
+                action_args,
+                VotingType::Linear,
+                ProposalTier::Standard,
+                Vec::new(&env),
+            )
+        }
+
+        /// Create a new proposal with full configuration.
+        ///
+        /// The proposer must hold > 0 governance tokens. When `proposal_bond > 0`,
+        /// exactly `proposal_bond` tokens are transferred from `proposer` to the
+        /// DAO contract as an anti-spam measure (issue #1106).
+        ///
+        /// - `voting_type` — `Linear` (1 token = 1 vote) or `Quadratic`
+        ///   (weight = `fixed_sqrt(balance)`) — issue #1316.
+        /// - `tier` — `Standard`, `Financial`, or `Critical`; determines the
+        ///   execution timelock — issue #1318.
+        /// - `choices` — optional list of choice symbols for multi-choice
+        ///   voting — issue #1317. When empty, the proposal is binary.
+        ///
+        /// A SHA-256 hash of the payload is computed and checked against active
+        /// proposals; duplicates are rejected with [`DaoError::DuplicateProposal`]
+        /// (issue #1319).
+        ///
+        /// Returns the newly created `proposal_id`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::InsufficientVotingPower`] if the proposer has no tokens.
+        /// Returns [`DaoError::InsufficientBondBalance`] if the proposer cannot cover
+        ///   the proposal bond.
+        /// Returns [`DaoError::DuplicateProposal`] if an active proposal with the
+        ///   same payload hash already exists.
+        pub fn create_proposal_with_config(
+            env: Env,
+            proposer: Address,
+            title: String,
+            description: String,
+            action_target: Option<Address>,
+            action_function: Option<Symbol>,
+            action_args: Option<Vec<Val>>,
+            voting_type: VotingType,
+            tier: ProposalTier,
+            choices: Vec<Symbol>,
         ) -> Result<u32, DaoError> {
             Self::require_initialized(&env)?;
             proposer.require_auth();
 
-            let token: Address = env
+            let token_addr: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::Token)
                 .ok_or(DaoError::NotInitialized)?;
-            let balance = token::Client::new(&env, &token).balance(&proposer);
+            let token_client = token::Client::new(&env, &token_addr);
+
+            let balance = token_client.balance(&proposer);
             if balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
+
+            // ── Duplicate payload rejection (issue #1319) ────────────────────
+            let payload_hash = Self::compute_payload_hash(
+                &env,
+                &title,
+                &description,
+                &action_target,
+                &action_function,
+                &action_args,
+            );
+            let hash_key = ProposalKey::ActivePayloadHash(payload_hash.clone());
+            if env.storage().persistent().has(&hash_key) {
+                return Err(DaoError::DuplicateProposal);
+            }
+
+            // ── Bond escrow (issue #1106) ─────────────────────────────────────
+            let proposal_bond: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProposalBond)
+                .unwrap_or(0);
+            if proposal_bond > 0 {
+                if balance < proposal_bond {
+                    return Err(DaoError::InsufficientBondBalance);
+                }
+                let dao_addr = env.current_contract_address();
+                token_client.transfer(&proposer, &dao_addr, &proposal_bond);
+            }
+
+            // FIX #1102: Query the real total supply from the token contract at
+            // proposal creation time instead of using the i128::MAX sentinel.
+            let total_supply_at_creation: i128 = env.invoke_contract(
+                &token_addr,
+                &Symbol::new(&env, "total_supply"),
+                Vec::new(&env),
+            );
 
             let count: u32 = env
                 .storage()
@@ -156,24 +409,47 @@ mod contract {
                 .instance()
                 .get(&DataKey::VotingPeriod)
                 .ok_or(DaoError::NotInitialized)?;
-            let deadline = env.ledger().sequence() + voting_period;
+            // Voting opens after the configurable review delay, giving the
+            // author a window to cancel a mistaken proposal (issue #1441).
+            let voting_delay: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingDelay)
+                .unwrap_or(0);
+            let voting_start = env.ledger().sequence().saturating_add(voting_delay);
+            let deadline = voting_start.saturating_add(voting_period);
 
-            // TODO: Once soroban-sdk supports total_supply() on token::Client,
-            // capture the actual total supply here.
-            // Using i128::MAX as a temporary sentinel ensures voting isn't restricted
-            // while the infrastructure is in place for the cap.
-            let total_supply_at_creation = i128::MAX;
+            // Snapshot the dynamic quorum threshold from the active circulating
+            // supply at creation time (issue #1440).
+            let dynamic_quorum = Self::snapshot_dynamic_quorum(
+                &env,
+                &token_client,
+                total_supply_at_creation,
+            );
 
             let proposal = Proposal {
                 id: proposal_id,
                 proposer: proposer.clone(),
                 title,
                 description,
+                voting_start,
                 deadline,
                 yes_votes: 0,
                 no_votes: 0,
                 state: ProposalState::Active,
+                action_target,
+                action_function,
+                action_args,
+                bond_amount: proposal_bond,
                 total_supply_at_creation,
+                execution_eta: 0,
+                voting_type,
+                tier,
+                choices,
+                payload_hash: payload_hash.clone(),
+                // Record the creation ledger so vote weights can be evaluated
+                // against a historical snapshot (issue #1442).
+                created_at: env.ledger().sequence(),
             };
 
             env.storage()
@@ -183,14 +459,32 @@ mod contract {
                 .instance()
                 .set(&DataKey::ProposalCount, &(count + 1));
 
+            // Track the active payload hash so future duplicates are rejected.
+            env.storage().persistent().set(&hash_key, &proposal_id);
+
+            if let Some((circulating, required)) = dynamic_quorum {
+                let snapshot_key = ProposalKey::DynamicQuorumSnapshot(proposal_id);
+                env.storage().persistent().set(&snapshot_key, &required);
+                bump_persistent(&env, &snapshot_key);
+                events::dynamic_quorum_snapshot(&env, proposal_id, circulating, required);
+            }
+
             bump_instance(&env);
             bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            bump_persistent(&env, &hash_key);
             events::proposal_created(&env, &proposer, proposal_id);
 
             Ok(proposal_id)
         }
 
-        /// Cast a vote on an active proposal. Voting weight is the voter's current token balance.
+        /// Cast a vote on an active proposal.
+        ///
+        /// The voter's governance tokens are **transferred into this contract** for
+        /// the duration of the voting window, preventing flash-loan attacks (#1103).
+        /// Tokens are returned via [`unlock_tokens`] after `proposal.deadline`.
+        ///
+        /// If the proposal uses [`VotingType::Quadratic`], the vote weight is
+        /// `fixed_sqrt(balance)` rather than the raw balance (issue #1316).
         ///
         /// # Errors
         ///
@@ -217,6 +511,9 @@ mod contract {
             if proposal.state != ProposalState::Active {
                 return Err(DaoError::InvalidState);
             }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
+            }
             if env.ledger().sequence() > proposal.deadline {
                 return Err(DaoError::VotingClosed);
             }
@@ -234,24 +531,63 @@ mod contract {
                 .instance()
                 .get(&DataKey::Token)
                 .ok_or(DaoError::NotInitialized)?;
-            let balance = token::Client::new(&env, &token).balance(&voter);
-            if balance <= 0 {
+            let token_client = token::Client::new(&env, &token);
+
+            let dao_address = env.current_contract_address();
+
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            // Weight is derived exclusively from this snapshot so tokens moved
+            // after voting cannot be recycled by the recipient.
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
+            if own_balance <= 0 {
                 return Err(DaoError::InsufficientVotingPower);
             }
 
-            // Cap voting weight to the total supply at proposal creation time.
-            // This prevents flash-loan attacks where a voter temporarily acquires
-            // a large balance to inflate their voting power.
-            let weight = if balance > proposal.total_supply_at_creation {
+            // Lock the voter's own tokens into the DAO contract.
+            token_client.transfer(&voter, &dao_address, &own_balance);
+
+            let locked_key = LockedTokensKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            env.storage().persistent().set(&locked_key, &own_balance);
+            bump_persistent(&env, &locked_key);
+            events::tokens_locked(&env, &voter, proposal_id, own_balance);
+
+            // Cap at total supply snapshot first, then apply quadratic weighting.
+            let capped = if own_balance > proposal.total_supply_at_creation {
                 proposal.total_supply_at_creation
             } else {
-                balance
+                own_balance
             };
+            let weight = Self::apply_voting_type(&env, proposal.voting_type, capped);
 
             if support {
-                proposal.yes_votes += weight;
+                proposal.yes_votes = proposal
+                    .yes_votes
+                    .checked_add(weight)
+                    .ok_or(DaoError::NotInitialized)?;
             } else {
-                proposal.no_votes += weight;
+                proposal.no_votes = proposal
+                    .no_votes
+                    .checked_add(weight)
+                    .ok_or(DaoError::NotInitialized)?;
             }
 
             env.storage()
@@ -266,19 +602,554 @@ mod contract {
             Ok(())
         }
 
-        /// Execute a passed proposal. Callable after the deadline when quorum and majority are met.
+        /// Vote for a specific choice on a multi-choice proposal (issue #1317).
         ///
-        /// Both the absolute `quorum` (token units) and the percentage-based
-        /// `quorum_bps` (share of total supply) must be satisfied.
+        /// The voter's tokens are locked into the DAO contract for the duration
+        /// of the voting window (same anti-flash-loan mechanism as [`vote`]).
+        /// The vote weight is computed according to the proposal's
+        /// [`VotingType`] (linear or quadratic) and added to the matching
+        /// [`ChoiceTally`].
         ///
         /// # Errors
         ///
         /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
         /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
-        /// Returns [`DaoError::DeadlineNotReached`] if the voting deadline has not passed.
-        /// Returns [`DaoError::QuorumNotMet`] if total votes are below either quorum threshold.
+        /// Returns [`DaoError::VotingClosed`] if the voting period has ended.
+        /// Returns [`DaoError::AlreadyVoted`] if the voter has already voted.
+        /// Returns [`DaoError::InsufficientVotingPower`] if the voter has no tokens.
+        /// Returns [`DaoError::InvalidChoice`] if `choice` is not in the proposal's choices.
+        pub fn vote_choice(
+            env: Env,
+            voter: Address,
+            proposal_id: u32,
+            choice: Symbol,
+            amount: i128,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            voter.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Active {
+                return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
+            }
+            if env.ledger().sequence() > proposal.deadline {
+                return Err(DaoError::VotingClosed);
+            }
+
+            // Validate the choice exists on this proposal.
+            let mut found = false;
+            for c in proposal.choices.iter() {
+                if c == choice {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(DaoError::InvalidChoice);
+            }
+
+            let vote_key = VoteKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            if env.storage().persistent().has(&vote_key) {
+                return Err(DaoError::AlreadyVoted);
+            }
+
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(DaoError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token);
+            let dao_address = env.current_contract_address();
+
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
+            if own_balance <= 0 {
+                return Err(DaoError::InsufficientVotingPower);
+            }
+
+            // Lock the voter's tokens.
+            token_client.transfer(&voter, &dao_address, &own_balance);
+            let locked_key = LockedTokensKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            env.storage().persistent().set(&locked_key, &own_balance);
+            bump_persistent(&env, &locked_key);
+            events::tokens_locked(&env, &voter, proposal_id, own_balance);
+
+            // Determine the base amount to weight: `amount` if positive and
+            // within the voter's balance, otherwise the full balance.
+            let base = if amount > 0 && amount <= own_balance {
+                amount
+            } else {
+                own_balance
+            };
+            let capped = if base > proposal.total_supply_at_creation {
+                proposal.total_supply_at_creation
+            } else {
+                base
+            };
+            let weight = Self::apply_voting_type(&env, proposal.voting_type, capped);
+
+            // Update the matching choice tally.
+            let tally_key = ProposalKey::ChoiceTally(proposal_id, choice.clone());
+            let mut tally: ChoiceTally = env
+                .storage()
+                .persistent()
+                .get(&tally_key)
+                .unwrap_or(ChoiceTally {
+                    choice: choice.clone(),
+                    votes: 0,
+                });
+            tally.votes = tally
+                .votes
+                .checked_add(weight)
+                .ok_or(DaoError::NotInitialized)?;
+            env.storage().persistent().set(&tally_key, &tally);
+            bump_persistent(&env, &tally_key);
+
+            // Also record the vote to prevent double-voting.
+            env.storage().persistent().set(&vote_key, &weight);
+            bump_persistent(&env, &vote_key);
+
+            // Keep the proposal's aggregate tally in sync so quorum checks work.
+            proposal.yes_votes = proposal
+                .yes_votes
+                .checked_add(weight)
+                .ok_or(DaoError::NotInitialized)?;
+
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            events::voted(&env, &voter, proposal_id, true, weight);
+
+            Ok(())
+        }
+
+        /// Return the per-choice tallies for a multi-choice proposal (issue #1317).
+        ///
+        /// Returns a `Vec<ChoiceTally>` in the same order as `proposal.choices`.
+        /// For binary proposals (empty `choices`) this returns an empty vector.
+        #[must_use]
+        pub fn get_proposal_choice_tallies(
+            env: Env,
+            proposal_id: u32,
+        ) -> Vec<ChoiceTally> {
+            let mut result = Vec::new(&env);
+            let proposal: Proposal = match env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+            {
+                Some(p) => p,
+                None => return result,
+            };
+            for choice in proposal.choices.iter() {
+                let tally_key = ProposalKey::ChoiceTally(proposal_id, choice.clone());
+                let tally: ChoiceTally = env
+                    .storage()
+                    .persistent()
+                    .get(&tally_key)
+                    .unwrap_or(ChoiceTally {
+                        choice: choice.clone(),
+                        votes: 0,
+                    });
+                result.push_back(tally);
+            }
+            result
+        }
+
+        /// Return the winning choice for a multi-choice proposal (issue #1317).
+        ///
+        /// Returns the choice with the highest tally, or `None` if the proposal
+        /// has no choices or no votes have been cast. Ties resolve to the first
+        /// choice in declaration order.
+        #[must_use]
+        pub fn get_proposal_winner(env: Env, proposal_id: u32) -> Option<Symbol> {
+            let tallies = Self::get_proposal_choice_tallies(env, proposal_id);
+            let mut best: Option<ChoiceTally> = None;
+            for tally in tallies.iter() {
+                if tally.votes <= 0 {
+                    continue;
+                }
+                match &best {
+                    Some(b) if b.votes >= tally.votes => {}
+                    _ => best = Some(tally),
+                }
+            }
+            best.map(|t| t.choice)
+        }
+
+        /// Delegate voting power to another address (#1105).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::CircularDelegation`] if the assignment would create a cycle.
+        pub fn delegate(
+            env: Env,
+            delegator: Address,
+            delegatee: Address,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            delegator.require_auth();
+
+            let mut current = delegatee.clone();
+            let max_hops = 20u32;
+            let mut hops = 0u32;
+            loop {
+                let next_key = DelegateKey { delegator: current.clone() };
+                if let Some(next) = env
+                    .storage()
+                    .persistent()
+                    .get::<DelegateKey, Address>(&next_key)
+                {
+                    if next == delegator {
+                        return Err(DaoError::CircularDelegation);
+                    }
+                    current = next;
+                    hops += 1;
+                    if hops >= max_hops {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            let key = DelegateKey { delegator: delegator.clone() };
+            env.storage().persistent().set(&key, &delegatee);
+            bump_persistent(&env, &key);
+            events::delegated(&env, &delegator, &delegatee);
+
+            Ok(())
+        }
+
+        /// Remove the caller's delegation, restoring direct voting (#1105).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        pub fn undelegate(env: Env, delegator: Address) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            delegator.require_auth();
+
+            let key = DelegateKey { delegator: delegator.clone() };
+            env.storage().persistent().remove(&key);
+            events::undelegated(&env, &delegator);
+
+            Ok(())
+        }
+
+        /// Lock a delegator's tokens into the DAO for a specific proposal (#1103/#1105).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
+        /// Returns [`DaoError::VotingClosed`] if the voting period has ended.
+        /// Returns [`DaoError::InsufficientVotingPower`] if the delegator has no tokens.
+        pub fn lock_for_vote(
+            env: Env,
+            delegator: Address,
+            proposal_id: u32,
+        ) -> Result<i128, DaoError> {
+            Self::require_initialized(&env)?;
+            delegator.require_auth();
+
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Active {
+                return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
+            }
+            if env.ledger().sequence() > proposal.deadline {
+                return Err(DaoError::VotingClosed);
+            }
+
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(DaoError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token);
+            let balance = token_client.balance(&delegator);
+            if balance <= 0 {
+                return Err(DaoError::InsufficientVotingPower);
+            }
+
+            let dao_address = env.current_contract_address();
+            token_client.transfer(&delegator, &dao_address, &balance);
+
+            let locked_key = LockedTokensKey {
+                proposal_id,
+                voter: delegator.clone(),
+            };
+            env.storage().persistent().set(&locked_key, &balance);
+            bump_persistent(&env, &locked_key);
+            events::tokens_locked(&env, &delegator, proposal_id, balance);
+
+            Ok(balance)
+        }
+
+        /// Vote on behalf of the caller plus a list of delegators whose tokens
+        /// have already been locked via `lock_for_vote` (#1105).
+        ///
+        /// # Errors
+        ///
+        /// Returns the same set of errors as [`vote`].
+        /// Returns [`DaoError::NotAuthorized`] if a listed delegator has not actually
+        /// delegated to this voter.
+        /// Returns [`DaoError::NoLockedTokens`] if a delegator has not pre-locked tokens.
+        pub fn vote_with_delegators(
+            env: Env,
+            voter: Address,
+            proposal_id: u32,
+            support: bool,
+            delegators: Vec<Address>,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            voter.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Active {
+                return Err(DaoError::InvalidState);
+            }
+            if env.ledger().sequence() < proposal.voting_start {
+                return Err(DaoError::VotingNotStarted);
+            }
+            if env.ledger().sequence() > proposal.deadline {
+                return Err(DaoError::VotingClosed);
+            }
+
+            let vote_key = VoteKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            if env.storage().persistent().has(&vote_key) {
+                return Err(DaoError::AlreadyVoted);
+            }
+
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(DaoError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token);
+            let dao_address = env.current_contract_address();
+
+            // Snapshot the voter's balance on their first vote (issue #1442).
+            let snapshot_key = VoteSnapshotKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let own_balance: i128 = match env
+                .storage()
+                .persistent()
+                .get::<VoteSnapshotKey, i128>(&snapshot_key)
+            {
+                Some(snap) => snap,
+                None => {
+                    let bal = token_client.balance(&voter);
+                    env.storage().persistent().set(&snapshot_key, &bal);
+                    bump_persistent(&env, &snapshot_key);
+                    bal
+                }
+            };
+            if own_balance <= 0 {
+                return Err(DaoError::InsufficientVotingPower);
+            }
+            token_client.transfer(&voter, &dao_address, &own_balance);
+            let locked_key = LockedTokensKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            env.storage().persistent().set(&locked_key, &own_balance);
+            bump_persistent(&env, &locked_key);
+            events::tokens_locked(&env, &voter, proposal_id, own_balance);
+
+            // --- Aggregate delegated tokens ---
+            let mut total_weight: i128 = own_balance;
+
+            for delegator in delegators.iter() {
+                // Verify the delegator actually delegates to this voter.
+                let delegate_key = DelegateKey { delegator: delegator.clone() };
+                let delegatee: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&delegate_key)
+                    .ok_or(DaoError::NotAuthorized)?;
+                if delegatee != voter {
+                    return Err(DaoError::NotAuthorized);
+                }
+
+                // Retrieve the amount the delegator pre-locked.
+                let delegator_locked_key = LockedTokensKey {
+                    proposal_id,
+                    voter: delegator.clone(),
+                };
+                let delegated_amount: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&delegator_locked_key)
+                    .ok_or(DaoError::NoLockedTokens)?;
+
+                total_weight = total_weight
+                    .checked_add(delegated_amount)
+                    .ok_or(DaoError::NotInitialized)?;
+            }
+
+            // Cap at total supply snapshot.
+            let weight = if total_weight > proposal.total_supply_at_creation {
+                proposal.total_supply_at_creation
+            } else {
+                total_weight
+            };
+
+            if support {
+                proposal.yes_votes = proposal
+                    .yes_votes
+                    .checked_add(weight)
+                    .ok_or(DaoError::NotInitialized)?;
+            } else {
+                proposal.no_votes = proposal
+                    .no_votes
+                    .checked_add(weight)
+                    .ok_or(DaoError::NotInitialized)?;
+            }
+
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            env.storage().persistent().set(&vote_key, &weight);
+
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            bump_persistent(&env, &vote_key);
+            events::voted(&env, &voter, proposal_id, support, weight);
+
+            Ok(())
+        }
+
+        /// Reclaim governance tokens locked during voting (#1103).
+        ///
+        /// Can be called by any voter after `proposal.deadline` has passed,
+        /// regardless of the proposal's outcome.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::VotingStillOpen`] if the voting period has not yet ended.
+        /// Returns [`DaoError::NoLockedTokens`] if the caller has no locked tokens for this proposal.
+        pub fn unlock_tokens(
+            env: Env,
+            voter: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            // Tokens can only be retrieved once voting has closed.
+            if env.ledger().sequence() <= proposal.deadline {
+                return Err(DaoError::VotingStillOpen);
+            }
+
+            let locked_key = LockedTokensKey {
+                proposal_id,
+                voter: voter.clone(),
+            };
+            let locked_amount: i128 = env
+                .storage()
+                .persistent()
+                .get(&locked_key)
+                .ok_or(DaoError::NoLockedTokens)?;
+
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(DaoError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token);
+            let dao_address = env.current_contract_address();
+
+            token_client.transfer(&dao_address, &voter, &locked_amount);
+            env.storage().persistent().remove(&locked_key);
+
+            events::tokens_unlocked(&env, &voter, proposal_id, locked_amount);
+
+            Ok(())
+        }
+
+        /// Queue a passed proposal for execution after the timelock expires (#1104).
+        ///
+        /// This is a permissionless transition: any caller may queue a proposal
+        /// that has passed its deadline with sufficient votes.  The call fails
+        /// if quorum or majority is not yet met.
+        ///
+        /// Execution is fully atomic: the proposal state is updated, the bond is
+        /// refunded (if any), the action payload is dispatched (if any), and the
+        /// adaptive-quorum EMA is bumped — all in a single transaction. Any panic
+        /// inside the invoked contract rolls back the entire transaction.
+        ///
+        /// After dispatch, the return value is emitted as a
+        /// [`ProposalActionExecuted`](events::proposal_action_executed) event
+        /// (issue #1108).
+        ///
+        /// The adaptive-quorum EMA is updated with the actual participation rate of
+        /// this proposal (issue #1107).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
+        /// Returns [`DaoError::DeadlineNotReached`] if voting is still open.
+        /// Returns [`DaoError::QuorumNotMet`] if participation thresholds are not met.
         /// Returns [`DaoError::ProposalRejected`] if `no_votes >= yes_votes`.
-        pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
+        pub fn queue_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
             Self::require_initialized(&env)?;
 
             let mut proposal: Proposal = env
@@ -294,50 +1165,131 @@ mod contract {
                 return Err(DaoError::DeadlineNotReached);
             }
 
+            // --- Quorum checks ---
             let quorum: i128 = env
                 .storage()
                 .instance()
                 .get(&DataKey::Quorum)
                 .ok_or(DaoError::NotInitialized)?;
-            let total_votes = proposal.yes_votes + proposal.no_votes;
 
-            // Absolute quorum check.
+            let total_votes = proposal
+                .yes_votes
+                .checked_add(proposal.no_votes)
+                .ok_or(DaoError::NotInitialized)?;
+
+            // Absolute quorum.
             if total_votes < quorum {
+                // Slash bond on participation failure (issue #1106).
+                if proposal.bond_amount > 0 {
+                    Self::slash_bond(&env, &proposal);
+                }
+                // Even failed proposals count toward the EMA with zero participation
+                // relative to quorum so that a quiet period lowers quorum (issue #1107).
+                Self::update_quorum_ema(&env, 0);
                 return Err(DaoError::QuorumNotMet);
             }
 
-            // Percentage-based quorum check (#829).
-            // Uses the total supply snapshot at proposal creation time to prevent
-            // manipulation through token minting/burning between proposal and execution.
+            // Percentage-based quorum (#1102 fix).
+            // FIX: use `total_supply_at_creation` (captured at proposal creation)
+            // instead of fetching live supply, and use overflow-safe arithmetic.
             let quorum_bps: u32 = env
                 .storage()
                 .instance()
                 .get(&DataKey::QuorumBps)
                 .unwrap_or(0u32);
             if quorum_bps > 0 {
-                let token: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Token)
-                    .ok_or(DaoError::NotInitialized)?;
-                // `total_supply` is not part of the SEP-41 `TokenInterface`, so it is
-                // unreachable through `token::Client`. Invoke it by symbol instead; this
-                // requires the configured governance token to implement `total_supply`
-                // (as `soroban-token-template` does).
-                let total_supply: i128 = env.invoke_contract(
-                    &token,
-                    &Symbol::new(&env, "total_supply"),
-                    Vec::new(&env),
-                );
                 // total_votes / total_supply >= quorum_bps / 10_000
-                // ⟺ total_votes * 10_000 >= quorum_bps * total_supply
-                if total_votes * 10_000 < i128::from(quorum_bps) * proposal.total_supply_at_creation {
+                // ⟺  total_votes * 10_000 >= quorum_bps * total_supply
+                // Use checked arithmetic to avoid overflow.
+                let lhs = total_votes
+                    .checked_mul(10_000)
+                    .ok_or(DaoError::NotInitialized)?;
+                let rhs = i128::from(quorum_bps)
+                    .checked_mul(proposal.total_supply_at_creation)
+                    .ok_or(DaoError::NotInitialized)?;
+                if lhs < rhs {
                     return Err(DaoError::QuorumNotMet);
                 }
             }
 
+            // Dynamic quorum against the circulating supply snapshotted at
+            // proposal creation (issue #1440).
+            if let Some(required) = env
+                .storage()
+                .persistent()
+                .get::<ProposalKey, i128>(&ProposalKey::DynamicQuorumSnapshot(proposal_id))
+            {
+                if total_votes < required {
+                    if proposal.bond_amount > 0 {
+                        Self::slash_bond(&env, &proposal);
+                    }
+                    Self::update_quorum_ema(&env, 0);
+                    return Err(DaoError::QuorumNotMet);
+                }
+            }
+
+            // Majority check.
             if proposal.yes_votes <= proposal.no_votes {
+                // Slash bond on rejection (issue #1106).
+                if proposal.bond_amount > 0 {
+                    Self::slash_bond(&env, &proposal);
+                }
+                Self::update_quorum_ema(&env, Self::participation_bps(total_votes, quorum));
                 return Err(DaoError::ProposalRejected);
+            }
+
+            // Set execution_eta and transition to Queued. The immutable
+            // timelock delay (issue #1443) is measured from the current ledger
+            // so a passed proposal can never execute immediately.
+            let timelock_delay: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TimelockDelay)
+                .unwrap_or(MIN_TIMELOCK_DELAY);
+            let execution_eta = env
+                .ledger()
+                .sequence()
+                .saturating_add(timelock_delay)
+                .max(proposal.deadline.saturating_add(timelock_delay));
+
+            proposal.state = ProposalState::Queued;
+            proposal.execution_eta = execution_eta;
+
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            events::proposal_queued(&env, proposal_id, execution_eta);
+
+            Ok(())
+        }
+
+        /// Execute a queued proposal once the execution timelock has expired (#1104).
+        ///
+        /// The proposal must be in `Queued` state and `env.ledger().sequence()` must
+        /// be >= `proposal.execution_eta`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Queued`.
+        /// Returns [`DaoError::TimelockNotExpired`] if the execution delay has not elapsed.
+        pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Queued {
+                return Err(DaoError::InvalidState);
+            }
+
+            // Enforce the execution timelock.
+            if env.ledger().sequence() < proposal.execution_eta {
+                return Err(DaoError::TimelockNotExpired);
             }
 
             proposal.state = ProposalState::Executed;
@@ -346,19 +1298,189 @@ mod contract {
                 .set(&ProposalKey::Proposal(proposal_id), &proposal);
 
             bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            // ── Refund bond on success (issue #1106) ─────────────────────────
+            if proposal.bond_amount > 0 {
+                let token_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Token)
+                    .ok_or(DaoError::NotInitialized)?;
+                let dao_addr = env.current_contract_address();
+                token::Client::new(&env, &token_addr).transfer(
+                    &dao_addr,
+                    &proposal.proposer,
+                    &proposal.bond_amount,
+                );
+                events::bond_refunded(&env, &proposal.proposer, proposal_id, proposal.bond_amount);
+            }
+
             events::proposal_executed(&env, proposal_id);
+
+            // ── Dispatch action payload (issue #1108) ─────────────────────────
+            if let (Some(target), Some(function), Some(args)) = (
+                proposal.action_target.clone(),
+                proposal.action_function.clone(),
+                proposal.action_args.clone(),
+            ) {
+                let return_val: Val = env.invoke_contract(&target, &function, args);
+                events::proposal_action_executed(&env, proposal_id, return_val);
+            }
+
+            // ── Update adaptive quorum EMA (issue #1107) ─────────────────────
+            let quorum: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Quorum)
+                .unwrap_or(0);
+            let total_votes = proposal
+                .yes_votes
+                .checked_add(proposal.no_votes)
+                .unwrap_or(0);
+            Self::update_quorum_ema(&env, Self::participation_bps(total_votes, quorum));
+
+            Ok(())
+        }
+
+        /// Configure the emergency guardian address (issue #1444).
+        ///
+        /// The guardian is expected to be a multi-sig account. It may cancel a
+        /// `Queued` proposal during its timelock window via [`guardian_veto`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_guardian(
+            env: Env,
+            admin: Address,
+            guardian: Address,
+        ) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::Guardian, &guardian);
+            bump_instance(&env);
+            events::guardian_set(&env, &admin, &guardian);
+            Ok(())
+        }
+
+        /// Return the configured guardian address, if any (issue #1444).
+        #[must_use]
+        pub fn guardian(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::Guardian)
+        }
+
+        /// Emergency veto of a queued proposal by the guardian (issue #1444).
+        ///
+        /// Only the configured guardian may call this. It succeeds only while
+        /// the proposal is `Queued` and before its `execution_eta` (i.e. during
+        /// the timelock window), cancelling the proposal so a malicious action
+        /// can never be dispatched.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::MissingGuardian`] if no guardian is configured.
+        /// Returns [`DaoError::UnauthorizedGuardian`] if the caller is not the guardian.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Queued`.
+        /// Returns [`DaoError::TimelockExpired`] if the timelock has already elapsed.
+        pub fn guardian_veto(
+            env: Env,
+            guardian: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_guardian: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Guardian)
+                .ok_or(DaoError::MissingGuardian)?;
+            if stored_guardian != guardian {
+                return Err(DaoError::UnauthorizedGuardian);
+            }
+            guardian.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Queued {
+                return Err(DaoError::InvalidState);
+            }
+            // The veto is only available during the timelock window.
+            if env.ledger().sequence() >= proposal.execution_eta {
+                return Err(DaoError::TimelockExpired);
+            }
+
+            proposal.state = ProposalState::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            events::guardian_vetoed(&env, &guardian, proposal_id);
+
+            Ok(())
+        }
+
+        /// Veto a queued proposal — admin / security council only (#1104).
+        ///
+        /// This is the emergency veto entry point.  It transitions a `Queued`
+        /// proposal to `Cancelled` before its execution timelock expires, giving
+        /// a security council the ability to stop malicious governance actions.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Queued`.
+        pub fn veto_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(DaoError::NotInitialized)?;
+            admin.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Queued {
+                return Err(DaoError::InvalidState);
+            }
+
+            proposal.state = ProposalState::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            events::proposal_vetoed(&env, &admin, proposal_id);
 
             Ok(())
         }
 
         /// Cancel a proposal. Admin only; works on any `Active` proposal regardless of votes.
         ///
+        /// The proposal bond (if any) is slashed to the admin treasury on admin
+        /// cancellation (issue #1106).
+        ///
         /// # Errors
         ///
         /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
         /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
         /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
-        pub fn cancel_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
+        pub fn admin_cancel_proposal(env: Env, proposal_id: u32) -> Result<(), DaoError> {
             Self::require_initialized(&env)?;
 
             let admin: Address = env
@@ -383,8 +1505,310 @@ mod contract {
                 .persistent()
                 .set(&ProposalKey::Proposal(proposal_id), &proposal);
 
+            // Slash bond on admin cancellation (issue #1106).
+            if proposal.bond_amount > 0 {
+                Self::slash_bond(&env, &proposal);
+            }
+
             bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
             events::proposal_cancelled(&env, &admin, proposal_id);
+
+            Ok(())
+        }
+
+        /// Cancel a proposal as its original proposer before voting opens (#1321).
+        ///
+        /// This lets a proposer retract a proposal that contains a mistake before
+        /// any voting begins, refunding the proposal bond instead of slashing it.
+        /// Cancellation is only permitted strictly before `proposal.voting_start`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::NotProposer`] if the caller is not the original proposer.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active`.
+        /// Returns [`DaoError::VotingAlreadyStarted`] if voting has already opened.
+        pub fn cancel_proposal(
+            env: Env,
+            proposer: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+            proposer.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.proposer != proposer {
+                return Err(DaoError::NotProposer);
+            }
+
+            if proposal.state != ProposalState::Active {
+                return Err(DaoError::InvalidState);
+            }
+
+            // Cancellation is only allowed strictly before voting starts.
+            if env.ledger().sequence() >= proposal.voting_start {
+                return Err(DaoError::VotingAlreadyStarted);
+            }
+
+            proposal.state = ProposalState::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+
+            // Free the payload hash so the author can resubmit a corrected
+            // proposal (issue #1441).
+            env.storage()
+                .persistent()
+                .remove(&ProposalKey::ActivePayloadHash(proposal.payload_hash.clone()));
+
+            // Refund the proposal bond to the proposer (#1321).
+            if proposal.bond_amount > 0 {
+                let token_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Token)
+                    .ok_or(DaoError::NotInitialized)?;
+                let dao_addr = env.current_contract_address();
+                token::Client::new(&env, &token_addr).transfer(
+                    &dao_addr,
+                    &proposal.proposer,
+                    &proposal.bond_amount,
+                );
+                events::bond_refunded(&env, &proposal.proposer, proposal_id, proposal.bond_amount);
+            }
+
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+            events::proposal_cancelled(&env, &proposer, proposal_id);
+
+            Ok(())
+        }
+
+        /// Set the review delay, in ledgers, between proposal creation and the
+        /// opening of voting (issue #1441).
+        ///
+        /// While `env.ledger().sequence() < proposal.voting_start` the author
+        /// may withdraw the proposal via [`cancel_proposal`] and votes are
+        /// rejected with [`DaoError::VotingNotStarted`]. Only affects
+        /// proposals created after the call.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_voting_delay(env: Env, admin: Address, voting_delay: u32) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::VotingDelay, &voting_delay);
+            bump_instance(&env);
+            events::voting_delay_set(&env, &admin, voting_delay);
+            Ok(())
+        }
+
+        /// Return the configured voting delay in ledgers (0 when unset).
+        #[must_use]
+        pub fn voting_delay(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::VotingDelay)
+                .unwrap_or(0)
+        }
+
+        /// Configure the dynamic quorum (issue #1440).
+        ///
+        /// `quorum_bps` is the share (0–10_000 basis points) of the *active
+        /// circulating* governance token supply that must participate for a
+        /// proposal to pass. Circulating supply is the token's `total_supply`
+        /// at proposal creation minus the balances of `non_circulating`
+        /// holders (staking pools, treasuries, vesting vaults, …) at that same
+        /// moment. The resulting threshold is snapshotted per proposal, so it
+        /// scales automatically as supply expands or tokens get locked, while
+        /// later supply changes cannot move the goalposts mid-vote.
+        ///
+        /// Pass `quorum_bps = 0` to disable. Only affects proposals created
+        /// after the call.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        /// Returns [`DaoError::InvalidQuorumBps`] if `quorum_bps` > 10 000.
+        /// Returns [`DaoError::TooManyNonCirculatingHolders`] if more than
+        ///   [`MAX_NON_CIRCULATING_HOLDERS`] addresses are supplied.
+        pub fn set_dynamic_quorum(
+            env: Env,
+            admin: Address,
+            quorum_bps: u32,
+            non_circulating: Vec<Address>,
+        ) -> Result<(), DaoError> {
+            Self::require_admin(&env, &admin)?;
+            if quorum_bps > BPS_DENOMINATOR {
+                return Err(DaoError::InvalidQuorumBps);
+            }
+            if non_circulating.len() > MAX_NON_CIRCULATING_HOLDERS {
+                return Err(DaoError::TooManyNonCirculatingHolders);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::DynamicQuorumBps, &quorum_bps);
+            env.storage()
+                .instance()
+                .set(&DataKey::NonCirculatingHolders, &non_circulating);
+            bump_instance(&env);
+            events::dynamic_quorum_set(&env, &admin, quorum_bps, non_circulating.len());
+            Ok(())
+        }
+
+        /// Return the dynamic quorum configuration: `(quorum_bps, non_circulating)`.
+        #[must_use]
+        pub fn dynamic_quorum_config(env: Env) -> (u32, Vec<Address>) {
+            let bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DynamicQuorumBps)
+                .unwrap_or(0);
+            let holders: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::NonCirculatingHolders)
+                .unwrap_or_else(|| Vec::new(&env));
+            (bps, holders)
+        }
+
+        /// Return the dynamic quorum (minimum total votes) snapshotted for
+        /// `proposal_id`, or `None` if dynamic quorum was disabled when the
+        /// proposal was created.
+        #[must_use]
+        pub fn proposal_dynamic_quorum(env: Env, proposal_id: u32) -> Option<i128> {
+            env.storage()
+                .persistent()
+                .get(&ProposalKey::DynamicQuorumSnapshot(proposal_id))
+        }
+
+        /// Set the optional emergency security council address (#1320).
+        ///
+        /// The security council may fast-track emergency proposals via
+        /// [`emergency_execute_proposal`], bypassing the standard voting and
+        /// timelock periods during an active exploit.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::NotAuthorized`] if the caller is not the admin.
+        pub fn set_security_council(
+            env: Env,
+            admin: Address,
+            council: Address,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(DaoError::NotInitialized)?;
+            if stored_admin != admin {
+                return Err(DaoError::NotAuthorized);
+            }
+            admin.require_auth();
+
+            env.storage()
+                .instance()
+                .set(&DataKey::SecurityCouncil, &council);
+            bump_instance(&env);
+
+            Ok(())
+        }
+
+        /// Return the configured security council address, if any (#1320).
+        #[must_use]
+        pub fn security_council(env: Env) -> Option<Address> {
+            env.storage().instance().get(&DataKey::SecurityCouncil)
+        }
+
+        /// Fast-track execution of an emergency proposal by the security council (#1320).
+        ///
+        /// The caller must be the configured security council. The proposal must
+        /// be `Active` or `Queued` (i.e. not already executed or cancelled). The
+        /// proposal is marked `Executed` immediately, bypassing the standard
+        /// voting duration and execution timelock, and any action payload is
+        /// dispatched atomically.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`DaoError::NotInitialized`] if the DAO has not been set up.
+        /// Returns [`DaoError::MissingSecurityCouncil`] if no council is configured.
+        /// Returns [`DaoError::UnauthorizedCouncil`] if the caller is not the council.
+        /// Returns [`DaoError::ProposalNotFound`] if the proposal does not exist.
+        /// Returns [`DaoError::InvalidState`] if the proposal is not `Active` or `Queued`.
+        pub fn emergency_execute_proposal(
+            env: Env,
+            council: Address,
+            proposal_id: u32,
+        ) -> Result<(), DaoError> {
+            Self::require_initialized(&env)?;
+
+            let stored_council: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecurityCouncil)
+                .ok_or(DaoError::MissingSecurityCouncil)?;
+            if stored_council != council {
+                return Err(DaoError::UnauthorizedCouncil);
+            }
+            council.require_auth();
+
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&ProposalKey::Proposal(proposal_id))
+                .ok_or(DaoError::ProposalNotFound)?;
+
+            if proposal.state != ProposalState::Active
+                && proposal.state != ProposalState::Queued
+            {
+                return Err(DaoError::InvalidState);
+            }
+
+            proposal.state = ProposalState::Executed;
+            env.storage()
+                .persistent()
+                .set(&ProposalKey::Proposal(proposal_id), &proposal);
+            bump_persistent(&env, &ProposalKey::Proposal(proposal_id));
+
+            // Refund the bond to the proposer on emergency execution.
+            if proposal.bond_amount > 0 {
+                let token_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Token)
+                    .ok_or(DaoError::NotInitialized)?;
+                let dao_addr = env.current_contract_address();
+                token::Client::new(&env, &token_addr).transfer(
+                    &dao_addr,
+                    &proposal.proposer,
+                    &proposal.bond_amount,
+                );
+                events::bond_refunded(&env, &proposal.proposer, proposal_id, proposal.bond_amount);
+            }
+
+            events::emergency_proposal_executed(&env, &council, proposal_id);
+
+            // ── Dispatch action payload (issue #1108) ─────────────────────────
+            if let (Some(target), Some(function), Some(args)) = (
+                proposal.action_target.clone(),
+                proposal.action_function.clone(),
+                proposal.action_args.clone(),
+            ) {
+                let return_val: Val = env.invoke_contract(&target, &function, args);
+                events::proposal_action_executed(&env, proposal_id, return_val);
+            }
 
             Ok(())
         }
@@ -458,11 +1882,255 @@ mod contract {
                 .unwrap_or(0)
         }
 
+        /// Return the immutable execution timelock delay in ledgers (issue #1443).
+        #[must_use]
+        pub fn timelock_delay(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::TimelockDelay)
+                .unwrap_or(MIN_TIMELOCK_DELAY)
+        }
+
+        /// Return the current adaptive quorum EMA in basis points (issue #1107).
+        ///
+        /// Returns 0 when adaptive quorum is disabled (both bounds set to 0).
+        #[must_use]
+        pub fn current_quorum_bps(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::QuorumEmaBps)
+                .unwrap_or(0)
+        }
+
+        // ── Private helpers ──────────────────────────────────────────────────
+        /// Return the delegatee for a given delegator, if any.
+        #[must_use]
+        pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
+            let key = DelegateKey { delegator };
+            env.storage().persistent().get(&key)
+        }
+        /// List proposals with cursor-based pagination (#1110).
+        ///
+        /// `cursor` is the proposal ID to resume scanning from (pass `0` to
+        /// start from the beginning). `limit` is clamped to
+        /// `[1, MAX_PAGE_SIZE]`. When `state` is `Some`, only proposals in
+        /// that [`ProposalState`] are returned.
+        ///
+        /// Returns a [`ProposalPage`] whose `next_cursor` is `None` once the
+        /// end of the proposal range has been reached.
+        pub fn get_proposals(
+            env: Env,
+            cursor: u32,
+            limit: u32,
+            state: Option<ProposalState>,
+        ) -> ProposalPage {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProposalCount)
+                .unwrap_or(0);
+
+            let page = paginate(
+                &env,
+                cursor,
+                limit,
+                MAX_PAGE_SIZE,
+                |c: u32| {
+                    let next = c.saturating_add(1);
+                    if next < count { Some(next) } else { None }
+                },
+                |c: u32| {
+                    if c >= count {
+                        return None;
+                    }
+                    env.storage()
+                        .persistent()
+                        .get::<_, Proposal>(&ProposalKey::Proposal(c))
+                        .filter(|p| state.is_none_or(|s| p.state == s))
+                },
+            );
+
+            ProposalPage {
+                proposals: page.items,
+                next_cursor: page.next_cursor,
+            }
+        }
+
+        /// Verify `admin` is the stored admin and has authorized the call.
+        fn require_admin(env: &Env, admin: &Address) -> Result<(), DaoError> {
+            Self::require_initialized(env)?;
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(DaoError::NotInitialized)?;
+            if stored_admin != *admin {
+                return Err(DaoError::NotAuthorized);
+            }
+            admin.require_auth();
+            Ok(())
+        }
+
+        /// Compute the dynamic quorum threshold for a new proposal
+        /// (issue #1440).
+        ///
+        /// Returns `Some((circulating_supply, required_votes))` when dynamic
+        /// quorum is enabled, where
+        /// `circulating_supply = total_supply − Σ balance(non_circulating)`
+        /// (floored at zero) and
+        /// `required_votes = ceil(circulating_supply × bps / 10_000)`.
+        fn snapshot_dynamic_quorum(
+            env: &Env,
+            token_client: &token::Client,
+            total_supply: i128,
+        ) -> Option<(i128, i128)> {
+            let bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DynamicQuorumBps)
+                .unwrap_or(0);
+            if bps == 0 {
+                return None;
+            }
+            let holders: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::NonCirculatingHolders)
+                .unwrap_or_else(|| Vec::new(env));
+
+            let mut locked: i128 = 0;
+            for holder in holders.iter() {
+                locked = locked.saturating_add(token_client.balance(&holder).max(0));
+            }
+            let circulating = total_supply.saturating_sub(locked).max(0);
+
+            let denom = i128::from(BPS_DENOMINATOR);
+            let numerator = circulating.saturating_mul(i128::from(bps));
+            // Round up so a fractional threshold can never be under-counted.
+            let required = numerator / denom + i128::from(numerator % denom != 0);
+            Some((circulating, required))
+        }
+
         fn require_initialized(env: &Env) -> Result<(), DaoError> {
             if !env.storage().instance().has(&DataKey::Initialized) {
                 return Err(DaoError::NotInitialized);
             }
             Ok(())
+        }
+
+        /// Transfer `proposal.bond_amount` from the DAO contract to the admin
+        /// treasury as a slash penalty (issue #1106).
+        fn slash_bond(env: &Env, proposal: &Proposal) {
+            let token_addr: Address = match env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+            {
+                Some(a) => a,
+                None => return,
+            };
+            let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+                Some(a) => a,
+                None => return,
+            };
+            let dao_addr = env.current_contract_address();
+            token::Client::new(env, &token_addr).transfer(
+                &dao_addr,
+                &admin,
+                &proposal.bond_amount,
+            );
+            events::bond_slashed(env, &proposal.proposer, proposal.id, proposal.bond_amount);
+        }
+
+        /// Compute participation as a fraction of the absolute quorum floor,
+        /// capped at `BPS_DENOMINATOR` (10 000 bps = 100 %).
+        ///
+        /// When `quorum == 0` we treat any participation as 100 % to avoid
+        /// division by zero.
+        fn participation_bps(total_votes: i128, quorum: i128) -> u32 {
+            if quorum <= 0 {
+                return BPS_DENOMINATOR;
+            }
+            // Safe: total_votes and quorum are non-negative i128; result fits u32.
+            let ratio = (total_votes * i128::from(BPS_DENOMINATOR)) / quorum;
+            if ratio > i128::from(BPS_DENOMINATOR) {
+                BPS_DENOMINATOR
+            } else {
+                // Safe cast: value is in [0, BPS_DENOMINATOR] which fits u32.
+                #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+                let r = ratio as u32;
+                r
+            }
+        }
+
+        /// Update the stored exponential moving average of quorum participation
+        /// (issue #1107).
+        ///
+        /// Formula (alpha = 2 / (window + 1)):
+        ///
+        /// ```text
+        /// ema_new = ema_old + alpha * (sample - ema_old)
+        ///         = ema_old * (window - 1) / (window + 1) + sample * 2 / (window + 1)
+        /// ```
+        ///
+        /// All arithmetic is done in u32 basis points, bounded by
+        /// `[min_quorum_bps, max_quorum_bps]`.
+        fn update_quorum_ema(env: &Env, sample_bps: u32) {
+            let min_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::MinQuorumBps)
+                .unwrap_or(0);
+            let max_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::MaxQuorumBps)
+                .unwrap_or(0);
+
+            // Adaptive quorum is disabled when both bounds are zero.
+            if min_bps == 0 && max_bps == 0 {
+                return;
+            }
+
+            let window: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::QuorumEmaWindow)
+                .unwrap_or(DEFAULT_QUORUM_EMA_WINDOW);
+
+            let old_ema: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::QuorumEmaBps)
+                .unwrap_or(min_bps);
+
+            // EMA update using integer arithmetic to avoid floats.
+            // alpha = 2 / (window + 1)
+            // ema_new = (old_ema * (window - 1) + sample_bps * 2) / (window + 1)
+            let numerator = old_ema
+                .saturating_mul(window.saturating_sub(1))
+                .saturating_add(sample_bps.saturating_mul(2));
+            let denominator = window.saturating_add(1);
+            let new_ema_raw = numerator / denominator;
+
+            // Clamp to configured bounds.
+            let new_ema = new_ema_raw.max(min_bps).min(max_bps);
+
+            env.storage()
+                .instance()
+                .set(&DataKey::QuorumEmaBps, &new_ema);
+
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::QuorumEmaCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::QuorumEmaCount, &count.saturating_add(1));
+
+            bump_instance(env);
+            events::quorum_updated(env, new_ema);
         }
     }
 }

@@ -13,3 +13,7 @@ AuctionError::ReserveNotMet = 12
 AuctionError::BidAlreadyPlaced = 13
 AuctionError::BidIncrementTooLow = 14
 AuctionError::ArithmeticOverflow = 15
+AuctionError::Overflow = 14
+AuctionError::WrongMode = 15
+AuctionError::AuctionNotStarted = 16
+AuctionError::InvalidNftParams = 17

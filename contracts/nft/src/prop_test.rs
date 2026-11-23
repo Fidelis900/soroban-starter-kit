@@ -19,6 +19,7 @@ fn setup_nft<'a>(env: &'a Env) -> (NftContractClient<'a>, Address) {
         &0,
         &None,
         &None,
+    &false,
     );
     (client, admin)
 }

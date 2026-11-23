@@ -35,6 +35,10 @@ pub fn rewards_added(env: &Env, admin: &Address, amount: i128, new_total: i128) 
     );
 }
 
+/// Emitted when a staker auto-compounds claimed rewards back into their stake.
+///
+/// `reward` is the amount of rewards restaked; `new_stake` is the staker's
+/// resulting stake balance after compounding.
 pub fn compounded(env: &Env, staker: &Address, reward: i128, new_stake: i128) {
     env.events().publish(
         (Symbol::new(env, "compounded"), staker.clone()),
@@ -67,4 +71,26 @@ pub fn unbond_requested(env: &Env, staker: &Address, amount: i128, available_at:
 pub fn withdrawn(env: &Env, staker: &Address, amount: i128) {
     env.events()
         .publish((Symbol::new(env, "withdrawn"), staker.clone()), amount);
+}
+
+/// Emitted when the dynamic reward rate is recalculated.
+///
+/// `total_staked` is the staked TVL used in the calculation; `reward_rate` is the
+/// resulting per-ledger emission rate (or APY-scaled rate) applied going forward.
+pub fn reward_rate_updated(env: &Env, total_staked: i128, reward_rate: i128) {
+    env.events().publish(
+        (Symbol::new(env, "reward_rate_updated"),),
+        (total_staked, reward_rate),
+    );
+}
+
+/// Emitted when slashed tokens are credited to the insurance pool.
+///
+/// `amount` is the amount credited; `new_pool_total` is the insurance pool balance
+/// after the credit.
+pub fn insurance_pool_credited(env: &Env, amount: i128, new_pool_total: i128) {
+    env.events().publish(
+        (Symbol::new(env, "insurance_pool_credited"),),
+        (amount, new_pool_total),
+    );
 }

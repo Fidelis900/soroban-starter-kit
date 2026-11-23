@@ -95,6 +95,72 @@ jobs:
           sha256sum *.wasm > checksums.sha256
           cat checksums.sha256
 
+      # ------------------------------------------------------------------
+      # Reproducible build verification — Issue #1215
+      #
+      # Build WASMs inside the reproducible Docker container and compare
+      # their SHA-256 hashes against the hashes produced by the standard
+      # release build above. A mismatch means the Dockerfile.reproducible
+      # is out of sync with the release build environment and must be fixed
+      # before the release is published.
+      # ------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac2b4d3e82e63eaf394cd4fcf # v3
+
+      - name: Build reproducible Docker image
+        run: |
+          GIT_COMMIT_EPOCH=$(git log -1 --format="%ct")
+          docker build \
+            --build-arg "GIT_COMMIT_EPOCH=${GIT_COMMIT_EPOCH}" \
+            --no-cache \
+            -f docker/Dockerfile.reproducible \
+            -t soroban-reproducible:ci \
+            .
+
+      - name: Verify reproducible build matches release checksums
+        run: |
+          mkdir -p reproducible-wasm
+          docker run --rm \
+            -v "$PWD/reproducible-wasm:/out" \
+            soroban-reproducible:ci \
+            sh -c "cp /wasm/*.wasm /out/ && cp /wasm/checksums.sha256 /out/reproducible-checksums.sha256"
+
+          echo "=== Reproducible build checksums ==="
+          cat reproducible-wasm/reproducible-checksums.sha256
+
+          echo "=== Release build checksums ==="
+          cat target/wasm32-unknown-unknown/release/checksums.sha256
+
+          # Compare: every hash in the release checksums must appear in the
+          # reproducible checksums with the same value.
+          MISMATCH=0
+          while IFS= read -r line; do
+            REF_HASH=$(echo "$line" | awk '{print $1}')
+            FILENAME=$(echo "$line" | awk '{print $2}' | sed 's|^\./||')
+            REPRO_HASH=$(grep -F "$FILENAME" reproducible-wasm/reproducible-checksums.sha256 | awk '{print $1}' || true)
+            if [ "$REF_HASH" = "$REPRO_HASH" ]; then
+              echo "  ✓ $FILENAME"
+            else
+              echo "  ✗ $FILENAME"
+              echo "    Release:      $REF_HASH"
+              echo "    Reproducible: ${REPRO_HASH:-<not found>}"
+              MISMATCH=$((MISMATCH + 1))
+            fi
+          done < target/wasm32-unknown-unknown/release/checksums.sha256
+
+          if [ "$MISMATCH" -gt 0 ]; then
+            echo "::error::$MISMATCH WASM(s) do not reproduce. Update docker/Dockerfile.reproducible to match the release build environment."
+            exit 1
+          fi
+          echo "All WASMs reproduced successfully."
+
+      - name: Upload reproducible build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reproducible-wasm
+          path: reproducible-wasm/
+          retention-days: 30
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

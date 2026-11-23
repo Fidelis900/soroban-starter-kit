@@ -46,6 +46,33 @@ pub enum EscrowError {
     MilestoneNotFound = 12,
     /// The requested fee in basis points exceeds the maximum allowed (10 000).
     FeeTooHigh = 13,
+    /// A reentrant call was detected while a token transfer was in progress.
+    Reentrancy = 14,
+    /// At least one token/amount pair is required for a multi-token escrow.
+    EmptyTokenList = 15,
+    /// Token lists and amount lists must have the same length.
+    TokenListMismatch = 16,
+    /// The arbiter fee in basis points exceeds the hardcoded ceiling (1 000 = 10 %).
+    ArbiterFeeTooHigh = 17,
+    /// The arbiter threshold is zero or exceeds the number of configured arbiters.
+    InvalidThreshold = 18,
+    /// Not enough distinct arbiter approvals have been collected to resolve the dispute.
+    InsufficientArbiterApprovals = 19,
+    /// The same arbiter has already approved this dispute resolution.
+    DuplicateArbiterApproval = 20,
+    /// The partial release amount is negative or exceeds the milestone allocation.
+    InvalidPartialAmount = 21,
+    /// Mutual cancellation is not allowed in the escrow's current state.
+    MutualCancelNotAllowed = 22,
+    /// A milestone dispute was raised after the milestone's dispute window closed.
+    DisputeWindowClosed = 23,
+    /// A milestone was claimed while its dispute window is still open.
+    DisputeWindowOpen = 24,
+    /// The staged milestone schedule is empty, has a zero share or window, or
+    /// its percentages do not sum to exactly 10 000 bps.
+    InvalidMilestoneSchedule = 25,
+    /// A release was attempted before the configured lockup timestamp elapsed.
+    LockupPeriodActive = 23,
 }
 
 /// Converts the unit error returned by `soroban_common::validate_deadline`
@@ -75,6 +102,19 @@ impl_display_error!(
     NoDisputeTimeout          => "no dispute timeout configured",
     MilestoneNotFound         => "milestone not found",
     FeeTooHigh                => "fee exceeds maximum (10 000 bps)",
+    Reentrancy                => "reentrant call detected",
+    EmptyTokenList            => "token list must not be empty",
+    TokenListMismatch         => "token and amount lists must have the same length",
+    ArbiterFeeTooHigh         => "arbiter fee exceeds maximum (1 000 bps)",
+    InvalidThreshold          => "invalid arbiter threshold",
+    InsufficientArbiterApprovals => "insufficient arbiter approvals",
+    DuplicateArbiterApproval  => "duplicate arbiter approval",
+    InvalidPartialAmount      => "invalid partial release amount",
+    MutualCancelNotAllowed    => "mutual cancellation not allowed",
+    DisputeWindowClosed       => "milestone dispute window closed",
+    DisputeWindowOpen         => "milestone dispute window still open",
+    InvalidMilestoneSchedule  => "invalid milestone schedule",
+    LockupPeriodActive        => "lockup period has not elapsed",
 );
 
 #[cfg(test)]
@@ -101,7 +141,20 @@ EscrowError::InvalidParties = {}\n\
 EscrowError::DisputeTimeoutNotReached = {}\n\
 EscrowError::NoDisputeTimeout = {}\n\
 EscrowError::MilestoneNotFound = {}\n\
-EscrowError::FeeTooHigh = {}\n",
+EscrowError::FeeTooHigh = {}\n\
+EscrowError::Reentrancy = {}\n\
+EscrowError::EmptyTokenList = {}\n\
+EscrowError::TokenListMismatch = {}\n\
+EscrowError::ArbiterFeeTooHigh = {}\n\
+EscrowError::InvalidThreshold = {}\n\
+EscrowError::InsufficientArbiterApprovals = {}\n\
+EscrowError::DuplicateArbiterApproval = {}\n\
+EscrowError::InvalidPartialAmount = {}\n\
+EscrowError::MutualCancelNotAllowed = {}\n\
+EscrowError::DisputeWindowClosed = {}\n\
+EscrowError::DisputeWindowOpen = {}\n\
+EscrowError::InvalidMilestoneSchedule = {}\n",
+EscrowError::LockupPeriodActive = {}\n",
             EscrowError::NotAuthorized as u32,
             EscrowError::InvalidState as u32,
             EscrowError::DeadlinePassed as u32,
@@ -115,6 +168,19 @@ EscrowError::FeeTooHigh = {}\n",
             EscrowError::NoDisputeTimeout as u32,
             EscrowError::MilestoneNotFound as u32,
             EscrowError::FeeTooHigh as u32,
+            EscrowError::Reentrancy as u32,
+            EscrowError::EmptyTokenList as u32,
+            EscrowError::TokenListMismatch as u32,
+            EscrowError::ArbiterFeeTooHigh as u32,
+            EscrowError::InvalidThreshold as u32,
+            EscrowError::InsufficientArbiterApprovals as u32,
+            EscrowError::DuplicateArbiterApproval as u32,
+            EscrowError::InvalidPartialAmount as u32,
+            EscrowError::MutualCancelNotAllowed as u32,
+            EscrowError::DisputeWindowClosed as u32,
+            EscrowError::DisputeWindowOpen as u32,
+            EscrowError::InvalidMilestoneSchedule as u32,
+            EscrowError::LockupPeriodActive as u32,
         )
     }
 

@@ -86,13 +86,22 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Event | Symbol | Topics | Data Type | When Fired |
 |-------|--------|--------|-----------|-----------|
 | Initialized | `initialized` | `(Symbol, u32)` → event name, threshold | `u32` → signer count | `initialize()` called |
-| Signer Added | `added` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `add_signer()` called |
-| Signer Removed | `removed` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `remove_signer()` called |
+| Signer Added | `added` | `(Symbol, Address)` → event name, signer | `(u32, u32)` → signer weight, new threshold | `add_signer()` or `execute_signer_change()` called |
+| Signer Weight Updated | `weight_updated` | `(Symbol, Address)` → event name, signer | `(u32, u32)` → old weight, new weight | `update_signer_weight()` or `execute_signer_change()` called |
+| Threshold Changed | `threshold_changed` | `(Symbol,)` → event name | `(u32, u32)` → old threshold, new threshold | `execute_signer_change()` with `ChangeThreshold` |
+| Signer Removed | `removed` | `(Symbol, Address)` → event name, signer | `u32` → new threshold | `remove_signer()` or `execute_signer_change()` called |
 | Transaction Proposed | `proposed` | `(Symbol, Address)` → event name, proposer | `u64` → transaction ID | `propose()` called |
 | Transaction Signed | `signed` | `(Symbol, Address, u64)` → event name, signer, tx ID | `u32` → signature count | `sign()` called |
 | Transaction Executed | `executed` | `(Symbol, u64)` → event name, tx ID | `()` | `execute()` called (threshold met) |
 | Proposal Expired | `expired` | `(Symbol, u64)` → event name, tx ID | `()` | `cleanup_expired()` called |
-| Batch Executed | `batch_executed` | `(Symbol,)` → event name | `(Vec<u64>, u32)` → executed IDs, skipped count | `execute_batch()` called |
+| Transaction Cancelled | `cancelled` | `(Symbol, Address)` → event name, proposer | `u64` → transaction ID | `cancel_proposal()` called |
+| Signature Revoked | `revoked` | `(Symbol, Address, u64)` → event name, signer, tx ID | `(u32, u32)` → signature count, accumulated weight | `revoke_signature()` called |
+| Signer Change Proposed | `signer_change_proposed` | `(Symbol, Address)` → event name, proposer | `u64` → signer proposal ID | `propose_signer_change()` called |
+| Signer Change Signed | `signer_change_signed` | `(Symbol, Address, u64)` → event name, signer, proposal ID | `u32` → signature count | `sign_signer_change()` called |
+| Signer Change Executed | `signer_change_executed` | `(Symbol, u64)` → event name, proposal ID | `()` | `execute_signer_change()` called |
+| Signer Replaced | `signer_replaced` | `(Symbol, Address, Address)` → event name, old signer, new signer | `u32` → new configuration nonce | `replace_signer()` called (threshold met; pending transactions signed by the old key are invalidated) |
+| Proposal Expired | `proposal_expired` | `(Symbol, u64)` → event name, tx ID | `u32` → expiration ledger | `cleanup_expired()` called (garbage collection of stale unexecuted proposals) |
+| Batch Executed | `batch_executed` | `(Symbol,)` → event name | `(Vec<u64>, u32)` → executed IDs, skipped count | `execute_batch()` called (atomic sequential execution of approved proposals) |
 
 ---
 
@@ -125,7 +134,9 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Event | Symbol | Topics | Data Type | When Fired |
 |-------|--------|--------|-----------|-----------|
 | Merkle Root Set | `root_set` | `(Symbol,)` → event name | `Bytes` → new Merkle root | `set_root()` called by admin |
-| Claimed | `claimed` | `(Symbol,)` → event name | `(Address, i128)` → recipient, amount | `claim()` called with valid Merkle proof |
+| Claimed | `claimed` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, total amount | `claim()` / `claim_batch()` succeeded for an entry |
+| Locked | `locked` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, amount locked for vesting | Claim with vesting enabled locked a non-zero portion |
+| Released | `released` | `(Symbol,)` → event name | `(Address, Address, i128)` → recipient, token, amount released | `release()` called |
 
 ---
 
@@ -135,12 +146,19 @@ env.events().publish((topic_1, topic_2, ...), data);
 |-------|--------|--------|-----------|-----------|
 | Started | `started` | `(Symbol, Address)` → event name, seller | `(i128, u32)` → start price, deadline ledger | `start()` called |
 | Bid Placed | `bid_placed` | `(Symbol, Address)` → event name, bidder | `i128` → bid amount | `bid()` called |
+| Outbid | `outbid` | `(Symbol, Address)` → event name, outbid bidder | `(i128, i128)` → outbid amount, new highest bid | `bid()` called when an existing highest bidder is displaced |
+| Refund Queued | `refund_queued` | `(Symbol, Address)` → event name, refunded bidder | `i128` → refund amount queued | `bid()` called when previous highest bid is moved to pending refunds |
 | Ended (winner) | `ended` | `(Symbol, Address)` → event name, winner | `i128` → winning amount | `end()` called, winner exists |
 | Ended (no bids) | `ended_no_bids` | `(Symbol,)` → event name | `()` | `end()` called with no bids |
 | Ended (reserve not met) | `ended_reserve_not_met` | `(Symbol, Address)` → event name, highest bidder | `(i128, i128)` → highest bid, reserve price | `end()` called, bid < reserve |
 | Bid Withdrawn | `withdrawn` | `(Symbol, Address)` → event name, bidder | `i128` → amount returned | `withdraw()` called by losing bidder |
 | Auction Extended | `AuctionExtended` | `(Symbol, Address)` → event name, auction ID (contract address) | `u32` → new deadline ledger | `bid()` lands within the anti-snipe window (default: final 10 ledgers, +20 ledgers) |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, seller | `()` | `cancel()` called by seller (no bids placed) |
+| Credit Applied | `credit_applied` | `(Symbol, Address)` → event name, bidder | `(i128, i128)` → credit used, amount transferred | `bid_with_credit()` called |
+| Dutch Started | `dutch_started` | `(Symbol, Address)` → event name, seller | `(i128, i128, u32, u32)` → start price, floor price, start ledger, duration ledgers | `start_dutch()` called |
+| Dutch Bought | `dutch_bought` | `(Symbol, Address)` → event name, buyer | `i128` → price paid | `buy()` settles a Dutch auction |
+| NFT Escrowed | `nft_escrowed` | `(Symbol, Address)` → event name, NFT contract | `u32` → token id | `start()` / `start_dutch()` with a custodial NFT |
+| NFT Released | `nft_released` | `(Symbol, Address)` → event name, recipient | `u32` → token id | NFT delivered to the winner/buyer or returned to the seller |
 
 ---
 
@@ -200,14 +218,19 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Sold | `sold` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, price | `buy()` called |
 | Cancelled | `cancel` | `(Symbol, u64)` → event name, listing ID | `Address` → seller | `cancel()` called by seller |
 | Swept | `swept` | `(Symbol, u64)` → event name, listing ID | `Address` → seller | `sweep_expired()` called after listing expiry |
-| Offer Made | `offered` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, offer amount | `make_offer()` called |
+| Offer Made | `offered` | `(Symbol, u64)` → event name, listing ID | `(Address, i128, u32)` → buyer, offer amount, expiration ledger | `make_offer()` called |
+| Offers Batch Made | `offers_batch_made` | `(Symbol, Address)` → event name, buyer | `(Vec<u32>, i128, u32)` → token IDs, total escrow transferred, expiration ledger | `make_offers_batch()` called |
 | Offer Accepted | `offracc` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, accepted amount | `accept_offer()` called by seller |
 | Offer Cancelled | `offrcncl` | `(Symbol, u64)` → event name, listing ID | `Address` → buyer | `cancel_offer()` called by buyer |
 | Dutch Listed | `dutch_listed` | `(Symbol, u64)` → event name, listing ID | `(Address, i128, i128, u64)` → seller, starting price, reserve price, duration (s) | `list_dutch()` called |
 | Sale Split | `sale_split` | `(Symbol, u64)` → event name, listing ID | `(i128, i128, i128)` → seller amount, creator royalty, platform fee | `buy()` or `accept_offer()` settles |
 | Platform Fee Set | `platform_fee_set` | `(Symbol,)` → event name | `(u32, Address)` → fee bps, recipient | `set_platform_fee()` called by admin |
+| Offer Expired | `offrexp` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, refunded amount | `expire_offer()` called by anyone after the offer's expiration ledger |
+| Staking Contract Set | `stakecfg` | `(Symbol, Address)` → event name, admin | `Option<Address>` → staking contract (`None` to disable) | `set_staking_contract()` called |
+| Min Counter Offer BPS Set | `mincferbps` | `(Symbol, Address)` → event name, admin | `u32` → minimum counter-offer increment in basis points | `set_min_counter_offer_bps()` called |
+| Fee Discount Applied | `feedisc` | `(Symbol, Address)` → event name, fee payer | `(u32, u32)` → original fee bps, discounted fee bps | Fee charged on `buy()` / `accept_offer()` for a staker |
 
-> **Note:** The `cancel`, `offracc`, and `offrcncl` symbols are abbreviated to fit Soroban's 9-byte `symbol_short!` limit.
+> **Note:** The `cancel`, `offracc`, `offrcncl`, `offrexp`, `stakecfg`, `mincferbps`, and `feedisc` symbols are abbreviated to fit Soroban's 9-byte `symbol_short!` limit.
 
 ---
 

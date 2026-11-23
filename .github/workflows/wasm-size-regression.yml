@@ -1,207 +1,59 @@
-name: WASM Size Regression Check
+name: WASM Size Budget and Regression Check
 
 on:
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
-  size-regression:
-    name: Check WASM Size Regressions
+  wasm-size:
+    name: Optimized WASM size budget
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
+    timeout-minutes: 45
     steps:
-      - name: Checkout PR branch
+      - name: Checkout pull request
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain and WASM target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: 1.91.0
+          targets: wasm32v1-none
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --features opt
+      - name: Install pinned Stellar CLI
+        run: cargo install --locked stellar-cli@21.7.7 --features opt
 
-      - name: Build current branch contracts
-        run: ./scripts/contract-size-report.sh > current_sizes.txt 2>&1 || true
-        continue-on-error: true
+      - name: Measure pull request contracts
+        run: ./scripts/contract-size-report.sh --limit-bytes 65536 --json-out "$RUNNER_TEMP/current-sizes.json"
 
-      - name: Parse current sizes
-        id: current
-        run: |
-          python3 - <<'PYEOF'
-          import re
-          sizes = {}
-          with open('current_sizes.txt', 'r') as f:
-              for line in f:
-                  # Match lines like: "contract-name            XX.XX KB"
-                  match = re.match(r'(\S+)\s+(\d+\.\d+)\s+KB', line)
-                  if match:
-                      contract, size = match.groups()
-                      sizes[contract] = float(size)
-          import json
-          print(json.dumps(sizes))
-          PYEOF > current_sizes.json
-          cat current_sizes.json
-
-      - name: Checkout base branch
-        run: git fetch origin "${{ github.base_ref }}" && git checkout "origin/${{ github.base_ref }}"
-
-      - name: Build base branch contracts
-        run: ./scripts/contract-size-report.sh > base_sizes.txt 2>&1 || true
-        continue-on-error: true
-
-      - name: Parse base sizes
-        id: base
-        run: |
-          python3 - <<'PYEOF'
-          import re
-          sizes = {}
-          with open('base_sizes.txt', 'r') as f:
-              for line in f:
-                  match = re.match(r'(\S+)\s+(\d+\.\d+)\s+KB', line)
-                  if match:
-                      contract, size = match.groups()
-                      sizes[contract] = float(size)
-          import json
-          print(json.dumps(sizes))
-          PYEOF > base_sizes.json
-          cat base_sizes.json
-
-      - name: Compare sizes and report
-        id: comparison
+      - name: Measure base revision contracts
         env:
-          SIZE_THRESHOLD_PERCENT: 5
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
-          python3 - <<'PYEOF'
-          import json
-          import os
+          git worktree add --detach "$RUNNER_TEMP/base-worktree" "$BASE_SHA"
+          cd "$RUNNER_TEMP/base-worktree"
+          ./scripts/contract-size-report.sh --limit-bytes 65536 --json-out "$RUNNER_TEMP/base-sizes.json"
 
-          # Load sizes
-          with open('current_sizes.json') as f:
-              current = json.load(f)
-          with open('base_sizes.json') as f:
-              base = json.load(f)
+      - name: Enforce WASM size budgets
+        run: |
+          python3 .github/scripts/check_wasm_sizes.py \
+            --budgets .github/wasm_sizes.json \
+            --base "$RUNNER_TEMP/base-sizes.json" \
+            --current "$RUNNER_TEMP/current-sizes.json" \
+            --summary-out "$RUNNER_TEMP/wasm-size-summary.md"
 
-          threshold = float(os.getenv('SIZE_THRESHOLD_PERCENT', 5)) / 100
-
-          # Analyze differences
-          report_lines = []
-          regressions = []
-          improvements = []
-          new_contracts = []
-          removed_contracts = []
-
-          # Check existing contracts
-          for contract in sorted(set(list(current.keys()) + list(base.keys()))):
-              current_size = current.get(contract, 0)
-              base_size = base.get(contract, 0)
-
-              if contract not in base:
-                  new_contracts.append((contract, current_size))
-              elif contract not in current:
-                  removed_contracts.append((contract, base_size))
-              else:
-                  size_change = current_size - base_size
-                  size_change_pct = (size_change / base_size * 100) if base_size > 0 else 0
-
-                  if size_change > 0:
-                      regressions.append((contract, base_size, current_size, size_change, size_change_pct))
-                  elif size_change < 0:
-                      improvements.append((contract, base_size, current_size, abs(size_change), abs(size_change_pct)))
-
-          # Build markdown report
-          report_lines.append("## WASM Size Regression Analysis")
-          report_lines.append("")
-
-          if regressions:
-              report_lines.append("### Size Regressions ❌")
-              report_lines.append("")
-              report_lines.append("| Contract | Base | Current | Change | Change % | Status |")
-              report_lines.append("|----------|------|---------|--------|----------|--------|")
-
-              has_failures = False
-              for contract, base_size, current_size, change, pct in regressions:
-                  exceeds = pct > (threshold * 100)
-                  status = "🚨 EXCEEDS THRESHOLD" if exceeds else "✅ Within threshold"
-                  report_lines.append(f"| {contract} | {base_size:.2f} KB | {current_size:.2f} KB | +{change:.2f} KB | +{pct:.2f}% | {status} |")
-                  if exceeds:
-                      has_failures = True
-
-              report_lines.append("")
-              if has_failures:
-                  report_lines.append(f"⚠️ **Some contracts exceed the {threshold*100:.1f}% size increase threshold.**")
-              else:
-                  report_lines.append(f"✅ All size increases are within the {threshold*100:.1f}% threshold.")
-              report_lines.append("")
-
-          if improvements:
-              report_lines.append("### Size Improvements ✅")
-              report_lines.append("")
-              report_lines.append("| Contract | Base | Current | Reduction | Reduction % |")
-              report_lines.append("|----------|------|---------|-----------|-------------|")
-              for contract, base_size, current_size, reduction, pct in improvements:
-                  report_lines.append(f"| {contract} | {base_size:.2f} KB | {current_size:.2f} KB | -{reduction:.2f} KB | -{pct:.2f}% |")
-              report_lines.append("")
-
-          if new_contracts:
-              report_lines.append("### New Contracts 🆕")
-              report_lines.append("")
-              for contract, size in new_contracts:
-                  report_lines.append(f"- **{contract}**: {size:.2f} KB")
-              report_lines.append("")
-
-          if removed_contracts:
-              report_lines.append("### Removed Contracts 🗑️")
-              report_lines.append("")
-              for contract, size in removed_contracts:
-                  report_lines.append(f"- **{contract}**: was {size:.2f} KB")
-              report_lines.append("")
-
-          # Write report
-          report = "\n".join(report_lines)
-          with open("size_report.txt", "w") as f:
-              f.write(report)
-
-          print(report)
-
-          # Exit with error if thresholds exceeded
-          if any(pct > (threshold * 100) for _, _, _, _, pct in regressions):
-              exit(1)
-
-          PYEOF
-
-      - name: Comment on PR
-        if: always()
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      - name: Post WASM size comparison comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2
         with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('size_report.txt', 'utf8');
-            const marker = '<!-- wasm-size-regression -->';
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body.includes(marker));
-            const fullBody = `${marker}\n${report}`;
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-            }
+          header: wasm-size-budget
+          path: ${{ runner.temp }}/wasm-size-summary.md

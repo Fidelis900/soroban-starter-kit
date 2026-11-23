@@ -32,6 +32,35 @@ pub enum DataKey {
     Tranches,
     /// Bitmask tracking which tranches have been released (index -> true/false).
     ReleasedTranches,
+    /// Optional authorized staking contract for yield generation.
+    StakingContract,
+    /// Address that receives accrued yield on release.
+    YieldRecipient,
+    /// Whether the locked balance has been deposited into staking.
+    Deposited,
+    /// Principal currently deposited in the staking contract.
+    StakedAmount,
+    /// Individual release tranche stored in persistent storage (index -> tranche).
+    Tranche(u32),
+    /// Release flag for an individual tranche stored in persistent storage
+    /// (index -> true/false).
+    TrancheReleased(u32),
+    /// Pending beneficiary address proposed for two-step transfer.
+    PendingBeneficiary,
+    /// Early release penalty in basis points.
+    EarlyReleasePenaltyBps,
+    /// Address that receives the early release penalty.
+    PenaltyRecipient,
+    /// Locked balance for a specific token (token address -> amount).
+    LockedBalance(Address),
+    /// List of release tranches for a specific token (token address -> tranches).
+    TokenTranches(Address),
+    /// Individual release tranche for a specific token
+    /// (token address, index -> tranche).
+    TokenTranche(Address, u32),
+    /// Release flag for an individual tranche of a specific token
+    /// (token address, index -> true/false).
+    TokenTrancheReleased(Address, u32),
 }
 
 #[contracttype]
@@ -65,4 +94,14 @@ pub struct TimelockInfo {
     pub state: TimelockState,
     /// List of tranches (empty for legacy single-tranche timelocks).
     pub tranches: Vec<ReleaseTranche>,
+    /// Optional authorized staking contract for yield generation.
+    pub staking_contract: Option<Address>,
+    /// Address that receives accrued yield on release.
+    pub yield_recipient: Option<Address>,
+    /// Whether the locked balance has been deposited into staking.
+    pub deposited: bool,
+    /// Per-token locked balances keyed by token address.
+    pub locked_balances: Vec<(Address, i128)>,
+    /// Per-token release schedules keyed by token address.
+    pub token_tranches: Vec<(Address, Vec<ReleaseTranche>)>,
 }

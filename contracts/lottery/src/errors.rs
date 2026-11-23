@@ -24,6 +24,9 @@ pub enum LotteryError {
     InsufficientParticipants = 15,
     InvalidTicketCap = 16,
     TicketCapExceeded = 17,
+    /// `fee_bps` ≥ 10 000, or `fee_bps` > 0 without a `fee_recipient`, or
+    /// `fee_recipient` provided without a non-zero `fee_bps`.
+    InvalidFeeConfig = 18,
 }
 
 impl_display_error!(
@@ -45,6 +48,7 @@ impl_display_error!(
     InsufficientParticipants => "insufficient participants",
     InvalidTicketCap        => "invalid ticket cap",
     TicketCapExceeded       => "ticket cap exceeded",
+    InvalidFeeConfig        => "invalid fee config",
 );
 
 #[cfg(test)]
@@ -75,7 +79,8 @@ LotteryError::NothingToRefund = {}\n\
 LotteryError::InvalidWinnerConfig = {}\n\
 LotteryError::InsufficientParticipants = {}\n\
 LotteryError::InvalidTicketCap = {}\n\
-LotteryError::TicketCapExceeded = {}\n",
+LotteryError::TicketCapExceeded = {}\n\
+LotteryError::InvalidFeeConfig = {}\n",
             LotteryError::AlreadyInitialized as u32,
             LotteryError::NotInitialized as u32,
             LotteryError::Unauthorized as u32,
@@ -93,6 +98,7 @@ LotteryError::TicketCapExceeded = {}\n",
             LotteryError::InsufficientParticipants as u32,
             LotteryError::InvalidTicketCap as u32,
             LotteryError::TicketCapExceeded as u32,
+            LotteryError::InvalidFeeConfig as u32,
         )
     }
 

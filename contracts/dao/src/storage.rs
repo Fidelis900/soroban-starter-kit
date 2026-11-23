@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, String, contracttype};
+use soroban_sdk::{Address, BytesN, String, Symbol, Val, Vec, contracttype};
 
 /// Instance-storage keys (contract-level state).
 #[contracttype]
@@ -16,6 +16,51 @@ pub enum DataKey {
     QuorumBps,
     ProposalCount,
     Initialized,
+    /// Configurable bond amount escrowed per proposal (issue #1106).
+    ProposalBond,
+    /// Adaptive quorum parameters (issue #1107).
+    MinQuorumBps,
+    MaxQuorumBps,
+    /// Number of past proposals tracked for EMA smoothing (issue #1107).
+    QuorumEmaWindow,
+    /// Current smoothed quorum BPS (0–10_000). Stored as u32.
+    QuorumEmaBps,
+    /// Number of proposals included in the EMA so far.
+    QuorumEmaCount,
+    /// Number of ledgers a passed proposal must wait in `Queued` state before
+    /// it can be executed. Zero means immediate execution is allowed.
+    ExecutionDelay,
+    /// Execution delay (in ledgers) for `ProposalTier::Standard` proposals
+    /// (issue #1318).
+    StandardDelay,
+    /// Execution delay (in ledgers) for `ProposalTier::Financial` proposals
+    /// (issue #1318).
+    FinancialDelay,
+    /// Execution delay (in ledgers) for `ProposalTier::Critical` proposals
+    /// (issue #1318).
+    CriticalDelay,
+    /// Optional emergency security council address (multisig) allowed to
+    /// fast-track emergency proposals (issue #1320).
+    SecurityCouncil,
+    /// Number of ledgers between proposal creation and the opening of voting
+    /// (`u32`). During this review window the author may cancel the proposal
+    /// via `cancel_proposal` (issue #1441). Zero (default) opens voting
+    /// immediately.
+    VotingDelay,
+    /// Dynamic quorum, in basis points (0–10_000) of the *active circulating*
+    /// governance token supply snapshotted at proposal creation (`u32`,
+    /// issue #1440). Zero disables the dynamic quorum check.
+    DynamicQuorumBps,
+    /// Addresses whose balances are excluded from the circulating supply when
+    /// computing the dynamic quorum, e.g. staking pools, treasuries, or vesting
+    /// vaults (`Vec<Address>`, issue #1440).
+    NonCirculatingHolders,
+    /// Configured multi-sig guardian address allowed to veto pending proposals
+    /// during the timelock window (issue #1444).
+    Guardian,
+    /// Minimum timelock delay (in ledgers) between a proposal passing and its
+    /// execution. Defaults to 17_280 ledgers (~48h at 5s/ledger) (issue #1443).
+    TimelockDelay,
 }
 
 /// Persistent-storage keys (per-proposal and per-vote data).
@@ -23,6 +68,26 @@ pub enum DataKey {
 #[derive(Clone)]
 pub enum ProposalKey {
     Proposal(u32),
+    /// Marks a payload hash as belonging to an active (unexecuted) proposal,
+    /// used to reject duplicate submissions (issue #1319).
+    ActivePayloadHash(BytesN<32>),
+    /// Minimum total votes required for the proposal to meet the dynamic
+    /// quorum, computed from the circulating supply at creation (`i128`,
+    /// issue #1440). Absent when dynamic quorum was disabled at creation.
+    DynamicQuorumSnapshot(u32),
+    /// Ledger at which the proposal was created, used as the historical
+    /// balance snapshot for vote-weight calculation (`u32`, issue #1442).
+    ProposalSnapshot(u32),
+}
+
+/// Key for a voter's token balance snapshotted at proposal creation, used to
+/// compute voting power and prevent token recycling between votes
+/// (issue #1442). Stored in persistent storage.
+#[contracttype]
+#[derive(Clone)]
+pub struct VoteSnapshotKey {
+    pub proposal_id: u32,
+    pub voter: Address,
 }
 
 /// Composite key for vote deduplication.
@@ -33,24 +98,90 @@ pub struct VoteKey {
     pub voter: Address,
 }
 
+/// Key for the amount of governance tokens a voter locked into the DAO for a
+/// specific proposal. Stored in persistent storage.
+#[contracttype]
+#[derive(Clone)]
+pub struct LockedTokensKey {
+    pub proposal_id: u32,
+    pub voter: Address,
+}
+
+/// Key for a delegator → delegatee mapping (liquid-democracy delegation).
+/// Stored in persistent storage.
+#[contracttype]
+#[derive(Clone)]
+pub struct DelegateKey {
+    pub delegator: Address,
+}
+
+/// How a voter's token balance is converted into voting weight
+/// (issue #1316).
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VotingType {
+    /// One token equals one vote.
+    Linear = 0,
+    /// Vote weight is the integer square root of the token balance.
+    Quadratic = 1,
+}
+
+/// Impact classification of a proposal, used to select the execution
+/// timelock (issue #1318).
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProposalTier {
+    /// Routine parameter updates — shortest timelock.
+    Standard = 0,
+    /// Treasury withdrawals and other financial actions.
+    Financial = 1,
+    /// Bytecode upgrades and other high-impact actions — longest timelock.
+    Critical = 2,
+}
+
+/// Accumulated votes for a single choice of a multi-choice proposal
+/// (issue #1317).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ChoiceTally {
+    /// The choice symbol this tally belongs to.
+    pub choice: Symbol,
+    /// Total voting weight allocated to this choice.
+    pub votes: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProposalState {
+    /// Voting is open.
     Active = 0,
-    Executed = 1,
-    Cancelled = 2,
+    /// Voting closed and the proposal passed; waiting out the execution timelock.
+    Queued = 1,
+    /// Timelock expired — the proposal has been executed on-chain.
+    Executed = 2,
+    /// Cancelled by the admin, a security-council veto, or the original proposer.
+    Cancelled = 3,
+    /// Vetoed by the guardian during the timelock window (issue #1444).
+    Vetoed = 4,
 }
 
 impl core::fmt::Display for ProposalState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             ProposalState::Active => "active",
+            ProposalState::Queued => "queued",
             ProposalState::Executed => "executed",
             ProposalState::Cancelled => "cancelled",
+            ProposalState::Vetoed => "vetoed",
         })
     }
 }
 
+/// A governance proposal.
+///
+/// `action_target`, `action_function`, and `action_args` are optional; when
+/// `action_target` is `Some`, `execute_proposal` will dispatch the call via
+/// `env.invoke_contract` (issue #1108).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Proposal {
@@ -58,12 +189,60 @@ pub struct Proposal {
     pub proposer: Address,
     pub title: String,
     pub description: String,
+    /// Last ledger at which votes may be cast.
     pub deadline: u32,
     pub yes_votes: i128,
     pub no_votes: i128,
     pub state: ProposalState,
+    // ── Executable action payload (issue #1108) ──────────────────────────────
+    /// Optional target contract to call on execution.
+    pub action_target: Option<Address>,
+    /// Function name to invoke on the target contract.
+    pub action_function: Option<Symbol>,
+    /// Arguments forwarded to the target function.
+    pub action_args: Option<Vec<Val>>,
+    // ── Bond tracking (issue #1106) ──────────────────────────────────────────
+    /// Token amount escrowed by the proposer at submission time.
+    pub bond_amount: i128,
     /// Total token supply at the time the proposal was created.
     /// Used for quorum calculation and to cap voter voting power,
     /// preventing flash-loan-style manipulation.
     pub total_supply_at_creation: i128,
+    /// Earliest ledger at which this proposal may be executed once it is
+    /// queued (= `deadline` + `execution_delay`). Zero when not yet queued.
+    pub execution_eta: u32,
+    // ── Voting configuration (issue #1316) ───────────────────────────────────
+    /// How token balances are converted into voting weight.
+    pub voting_type: VotingType,
+    // ── Impact tier (issue #1318) ────────────────────────────────────────────
+    /// Impact classification determining the execution timelock.
+    pub tier: ProposalTier,
+    // ── Multi-choice voting (issue #1317) ────────────────────────────────────
+    /// Selectable choices for multi-choice proposals. Empty for binary
+    /// Yes/No proposals.
+    pub choices: Vec<Symbol>,
+    /// Per-choice vote tallies, parallel to `choices`.
+    pub choice_tallies: Vec<ChoiceTally>,
+    // ── Duplicate detection (issue #1319) ────────────────────────────────────
+    /// SHA-256 hash of the proposal payload, title, and action target.
+    pub payload_hash: BytesN<32>,
+    /// Ledger at which voting opens. The proposer may cancel the proposal
+    /// strictly before this ledger (issue #1321).
+    pub voting_start: u32,
+    // ── Vote-weight snapshot (issue #1442) ───────────────────────────────────
+    /// Ledger at which voter token balances are snapshotted for vote-weight
+    /// calculation. Set to the creation ledger; balances are evaluated as of
+    /// this ledger so tokens cannot be recycled into duplicate votes.
+    pub snapshot_ledger: u32,
+}
+
+/// One page of results from `get_proposals` (#1110).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalPage {
+    /// Proposals found in this page, in ascending ID order.
+    pub proposals: Vec<Proposal>,
+    /// The cursor to pass to the next call to continue scanning, or `None`
+    /// once the end of the proposal range has been reached.
+    pub next_cursor: Option<u32>,
 }

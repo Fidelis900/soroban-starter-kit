@@ -1,7 +1,6 @@
 // `#[contracterror]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
@@ -18,6 +17,107 @@ pub enum BallotError {
     InvalidWindow = 9,
     VotingNotStarted = 10,
     NoChoices = 11,
+    InvalidRanking = 12,
+    DuplicateRanking = 13,
+    VotingNotClosed = 14,
+    TallyNotAvailable = 15,
+}
+
+impl core::fmt::Display for BallotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BallotError::AlreadyInitialized => "already initialized",
+            BallotError::NotInitialized => "not initialized",
+            BallotError::Unauthorized => "not authorized",
+            BallotError::NotRegistered => "voter not registered",
+            BallotError::AlreadyVoted => "voter has already voted",
+            BallotError::InvalidChoice => "invalid vote choice",
+            BallotError::VotingClosed => "voting is closed",
+            BallotError::VotingAlreadyStarted => "voting already started",
+            BallotError::InvalidWindow => "invalid voting window",
+            BallotError::VotingNotStarted => "voting not started",
+            BallotError::NoChoices => "no choices provided",
+            BallotError::InvalidRanking => "invalid preference ranking",
+            BallotError::DuplicateRanking => "duplicate choice in ranking",
+            BallotError::VotingNotClosed => "voting window has not closed",
+            BallotError::TallyNotAvailable => "tally not available",
+        })
+    }
+}
+}
+
+impl core::fmt::Display for BallotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BallotError::AlreadyInitialized => "already initialized",
+            BallotError::NotInitialized => "not initialized",
+            BallotError::Unauthorized => "not authorized",
+            BallotError::NotRegistered => "voter not registered",
+            BallotError::AlreadyVoted => "voter has already voted",
+            BallotError::InvalidChoice => "invalid vote choice",
+            BallotError::VotingClosed => "voting is closed",
+            BallotError::VotingAlreadyStarted => "voting already started",
+            BallotError::InvalidWindow => "invalid voting window",
+            BallotError::VotingNotStarted => "voting not started",
+            BallotError::NoChoices => "no choices provided",
+            BallotError::InvalidRanking => "invalid preference ranking",
+            BallotError::DuplicateRanking => "duplicate choice in ranking",
+            BallotError::VotingNotClosed => "voting window has not closed",
+            BallotError::TallyNotAvailable => "tally not available",
+        })
+    }
+}
+}
+
+impl core::fmt::Display for BallotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BallotError::AlreadyInitialized => "already initialized",
+            BallotError::NotInitialized => "not initialized",
+            BallotError::Unauthorized => "not authorized",
+            BallotError::NotRegistered => "voter not registered",
+            BallotError::AlreadyVoted => "voter has already voted",
+            BallotError::InvalidChoice => "invalid vote choice",
+            BallotError::VotingClosed => "voting is closed",
+            BallotError::VotingAlreadyStarted => "voting already started",
+            BallotError::InvalidWindow => "invalid voting window",
+            BallotError::VotingNotStarted => "voting not started",
+            BallotError::NoChoices => "no choices provided",
+            BallotError::InvalidRanking => "invalid preference ranking",
+            BallotError::DuplicateRanking => "duplicate choice in ranking",
+            BallotError::VotingNotClosed => "voting window has not closed",
+            BallotError::TallyNotAvailable => "tally not available",
+        })
+    }
+}
+}
+
+impl core::fmt::Display for BallotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BallotError::AlreadyInitialized => "already initialized",
+            BallotError::NotInitialized => "not initialized",
+            BallotError::Unauthorized => "not authorized",
+            BallotError::NotRegistered => "voter not registered",
+            BallotError::AlreadyVoted => "voter has already voted",
+            BallotError::InvalidChoice => "invalid vote choice",
+            BallotError::VotingClosed => "voting is closed",
+            BallotError::VotingAlreadyStarted => "voting already started",
+            BallotError::InvalidWindow => "invalid voting window",
+            BallotError::VotingNotStarted => "voting not started",
+            BallotError::NoChoices => "no choices provided",
+            BallotError::InvalidRanking => "invalid preference ranking",
+            BallotError::DuplicateRanking => "duplicate choice in ranking",
+            BallotError::VotingNotClosed => "voting window has not closed",
+            BallotError::TallyNotAvailable => "tally not available",
+        })
+    }
+}
+    Tied = 16,
+    AlreadyCertified = 17,
+    QuorumNotMet = 18,
+    ResultsNotReady = 19,
+    InvalidTieResolution = 20,
 }
 
 impl_display_error!(
@@ -33,4 +133,13 @@ impl_display_error!(
     InvalidWindow        => "invalid voting window",
     VotingNotStarted     => "voting not started",
     NoChoices            => "no choices provided",
+    InvalidRanking       => "invalid preference ranking",
+    DuplicateRanking     => "duplicate choice in ranking",
+    VotingNotClosed      => "voting window has not closed",
+    TallyNotAvailable    => "tally not available",
+    Tied                 => "leading choices are tied",
+    AlreadyCertified     => "results already certified",
+    QuorumNotMet         => "quorum not met",
+    ResultsNotReady      => "no votes to certify",
+    InvalidTieResolution => "choice is not among the tied choices",
 );

@@ -14,11 +14,96 @@ harness = false
 name = "token_ops"
 harness = false
 
+[[bench]]
+name = "merkle_ops"
+harness = false
+
+[[bench]]
+name = "swap_ops"
+harness = false
+
+[[bench]]
+name = "staking_ops"
+harness = false
+
+[[bench]]
+name = "vesting_ops"
+harness = false
+
+[[bench]]
+name = "dao_ops"
+harness = false
+
+[[bench]]
+name = "multisig_ops"
+harness = false
+
+[[bench]]
+name = "marketplace_ops"
+harness = false
+
+[[bench]]
+name = "auction_ops"
+harness = false
+
+[[bench]]
+name = "airdrop_ops"
+harness = false
+
+[[bench]]
+name = "ballot_ops"
+harness = false
+
+[[bench]]
+name = "bonding_curve_ops"
+harness = false
+
+[[bench]]
+name = "crowdfund_ops"
+harness = false
+
+[[bench]]
+name = "lottery_ops"
+harness = false
+
+[[bench]]
+name = "nft_ops"
+harness = false
+
+[[bench]]
+name = "oracle_ops"
+harness = false
+
+[[bench]]
+name = "subscription_ops"
+harness = false
+
+[[bench]]
+name = "timelock_ops"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
+soroban-common = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 soroban-escrow-template = { path = "../contracts/escrow" }
 soroban-token-template = { path = "../contracts/token" }
+soroban-swap = { path = "../contracts/swap", package = "soroban-swap-template" }
+soroban-staking = { path = "../contracts/staking", package = "soroban-staking-template" }
+soroban-vesting = { path = "../contracts/vesting", package = "soroban-vesting-template" }
+soroban-dao = { path = "../contracts/dao", package = "soroban-dao-template" }
+soroban-multisig = { path = "../contracts/multisig", package = "soroban-multisig-template" }
+soroban-marketplace = { path = "../contracts/marketplace", package = "soroban-marketplace-template" }
+soroban-auction = { path = "../contracts/auction", package = "soroban-auction-template" }
+soroban-airdrop = { path = "../contracts/airdrop", package = "soroban-airdrop-template" }
+soroban-ballot = { path = "../contracts/ballot", package = "ballot" }
+soroban-bonding-curve = { path = "../contracts/bonding-curve", package = "bonding-curve" }
+soroban-crowdfund = { path = "../contracts/crowdfund", package = "soroban-crowdfund-template" }
+soroban-lottery = { path = "../contracts/lottery", package = "soroban-lottery-template" }
+soroban-nft = { path = "../contracts/nft", package = "soroban-nft-template" }
+soroban-oracle = { path = "../contracts/oracle", package = "soroban-oracle-template" }
+soroban-subscription = { path = "../contracts/subscription", package = "soroban-subscription-template" }
+soroban-timelock = { path = "../contracts/timelock", package = "soroban-timelock-template" }
 
 [lints]
 workspace = true

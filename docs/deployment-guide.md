@@ -728,7 +728,7 @@ below is what each contract ships with when deployed the standard way:
 |----------|-------------------|-------------------|
 | `token` | `pausable`, `upgradeable`, `capped-supply`, `freeze`, `transfer-hook` | `pause()`/`unpause()`; two-step `propose_upgrade()`/`execute_upgrade()`; a `max_supply` cap enforced on mint; `freeze_account()`/`unfreeze_account()`; an optional `on_transfer` hook contract |
 | `escrow` | `pausable` | `pause()`/`unpause()` and the same `propose_upgrade()`/`execute_upgrade()` timelock pair — both currently live under the single `pausable` gate in `contracts/escrow/src/lib.rs`, not a separate `upgradeable` gate |
-| `wrapped-token` | `pausable` | `pause()`/`unpause()` (closes #817) |
+| `wrapped-token` | `pausable` | `pause()`/`unpause()` (closes #817), `set_wrap_paused()`/`set_unwrap_paused()` (closes #1270) |
 | `multisig` | `pausable`, `upgradeable` | Neither currently guards any code — no pause or upgrade entry points exist yet in `contracts/multisig`. Both are declared for parity with the other contracts and defaulted on so they take effect automatically once implemented |
 
 To opt out of a default for a given deployment, build with
@@ -741,6 +741,104 @@ release WASM. It parses each WASM's export section directly (no `wasm-tools`
 dependency) and fails CI if an expected feature-gated function — e.g.
 `pause`, `execute_upgrade`, `max_supply` — is missing, so a default silently
 regressing to off is caught before it reaches a deploy.
+
+---
+
+## 14. Reproducible Builds and WASM Verification
+
+Cryptographic certainty that the on-chain WASM matches the open-source
+repository is critical for security-sensitive deployments. This section
+describes how to reproduce a build and verify it against a published release.
+
+### Why reproducible builds?
+
+When a contract is deployed on Stellar, only the compiled WASM binary is stored
+on-chain — not the source code. A reproducible build allows anyone to:
+
+1. Clone the repository at the exact release commit.
+2. Build the WASMs inside a pinned Docker container.
+3. Compare the SHA-256 hashes of the locally-built WASMs against the hashes
+   published in the GitHub Release.
+
+If the hashes match, the on-chain bytecode provably corresponds to the
+published source.
+
+### Dockerfile.reproducible
+
+The file [`docker/Dockerfile.reproducible`](../docker/Dockerfile.reproducible)
+creates a fully-pinned build environment:
+
+| Pin | Value | Purpose |
+|-----|-------|---------|
+| Rust toolchain | `rust-toolchain.toml` | Eliminates compiler version drift |
+| `stellar-cli` | `--version 21.7.7 --locked` | Matches SDK version |
+| `RUSTFLAGS` | `-C codegen-units=1 -C opt-level=z` | Removes parallelism non-determinism |
+| `SOURCE_DATE_EPOCH` | Git commit timestamp | Deterministic embedded timestamps |
+| `wasm-opt` | Deterministic flags (`-Oz --zero-filled-memory`) | Deterministic wasm-opt output |
+
+### Building locally
+
+```bash
+# Build with the git commit timestamp of the current HEAD
+docker build \
+  --build-arg GIT_COMMIT_EPOCH=$(git log -1 --format=%ct) \
+  --no-cache \
+  -f docker/Dockerfile.reproducible \
+  -t soroban-reproducible:local \
+  .
+
+# Extract the WASMs
+mkdir -p wasm-out
+docker run --rm \
+  -v "$PWD/wasm-out:/out" \
+  soroban-reproducible:local \
+  sh -c "cp /wasm/*.wasm /wasm/checksums.sha256 /out/"
+
+# Inspect checksums
+cat wasm-out/checksums.sha256
+```
+
+### Verifying against a published release
+
+Use `scripts/verify-reproducible-wasm.sh` to automate the comparison:
+
+```bash
+# Verify against a specific GitHub release tag
+./scripts/verify-reproducible-wasm.sh --tag v1.2.3
+
+# Verify against a locally-downloaded checksums file
+./scripts/verify-reproducible-wasm.sh --checksums path/to/checksums.sha256
+
+# Skip the Docker build (use an already-built image)
+./scripts/verify-reproducible-wasm.sh --tag v1.2.3 --skip-build
+```
+
+Exit code `0` means all hashes matched. Exit code `1` means at least one
+hash differs — the script prints a diff showing which files mismatched and
+their respective hashes.
+
+### CI integration
+
+The `release` job in `.github/workflows/release.yml` automatically:
+
+1. Builds all contracts with the standard `stellar contract build` pipeline.
+2. Builds the same contracts inside `docker/Dockerfile.reproducible`.
+3. Compares the two sets of SHA-256 hashes.
+4. Fails the release if any hash differs.
+5. Uploads the reproducible-build WASMs as a release artifact alongside the
+   standard ones, so end-users can download both and cross-check independently.
+
+### On-chain hash verification
+
+After deployment, verify the on-chain hash matches your build:
+
+```bash
+# Get the on-chain WASM hash for a deployed contract
+stellar contract info --id <CONTRACT_ID> --network mainnet | grep wasm_hash
+
+# Compare with your local build
+sha256sum wasm-out/soroban_token_template.wasm
+```
 
 ---
 

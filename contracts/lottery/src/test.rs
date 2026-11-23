@@ -9,7 +9,9 @@
 
 use super::*;
 use soroban_sdk::{
-    Address, Bytes, BytesN, Env, String, Vec, testutils::Address as _, token::TokenInterface,
+    Address, Bytes, BytesN, Env, MuxedAddress, String, Vec,
+    testutils::{Address as _, Ledger as _},
+    token::TokenInterface,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,7 +30,7 @@ impl TokenInterface for MockToken {
     fn balance(_env: Env, _id: Address) -> i128 {
         i128::MAX
     }
-    fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    fn transfer(_env: Env, _from: Address, _to: MuxedAddress, _amount: i128) {}
     fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
     fn burn(_env: Env, _from: Address, _amount: i128) {}
     fn burn_from(_env: Env, _spender: Address, _from: Address, _amount: i128) {}
@@ -58,17 +60,22 @@ fn single_winner_splits(env: &Env) -> Vec<u32> {
     Vec::from_array(env, [10_000u32])
 }
 
+fn two_winner_splits(env: &Env) -> Vec<u32> {
+    Vec::from_array(env, [6_000u32, 4_000u32])
+}
+
+/// Set up a basic lottery with one winner, no ticket cap, no min_participants.
 fn setup(env: &Env) -> (LotteryContractClient, Address, Address) {
     let admin = Address::generate(env);
     let token = env.register_contract(None, MockToken);
     let addr = env.register_contract(None, LotteryContract);
     let client = LotteryContractClient::new(env, &addr);
-    client.initialize(&admin, &token, &100, &1u32, &single_winner_splits(env), &None);
+    client.initialize(&admin, &token, &100, &1u32, &single_winner_splits(env), &None, &None, &None);
     (client, admin, token)
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Basic lifecycle tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -81,7 +88,7 @@ fn test_initialize() {
     assert_eq!(info.token, token);
     assert_eq!(info.ticket_price, 100);
     assert_eq!(info.state, LotteryState::Open);
-    assert!(info.participants.is_empty());
+    assert_eq!(info.total_tickets, 0);
 }
 
 #[test]
@@ -90,7 +97,7 @@ fn test_initialize_twice_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, token) = setup(&env);
-    client.initialize(&admin, &token, &100, &1u32, &single_winner_splits(&env), &None);
+    client.initialize(&admin, &token, &100, &1u32, &single_winner_splits(&env), &None, &None, &None);
 }
 
 #[test]
@@ -102,7 +109,7 @@ fn test_initialize_zero_price_fails() {
     let token = env.register_contract(None, MockToken);
     let addr = env.register_contract(None, LotteryContract);
     let client = LotteryContractClient::new(&env, &addr);
-    client.initialize(&admin, &token, &0, &1u32, &single_winner_splits(&env), &None);
+    client.initialize(&admin, &token, &0, &1u32, &single_winner_splits(&env), &None, &None, &None);
 }
 
 #[test]
@@ -112,7 +119,8 @@ fn test_buy_ticket() {
     let (client, _, _) = setup(&env);
     let buyer = Address::generate(&env);
     client.buy_ticket(&buyer);
-    assert_eq!(client.get_info().participants.len(), 1);
+    assert_eq!(client.get_info().total_tickets, 1);
+    assert_eq!(client.get_ticket_count(&buyer), 1);
 }
 
 #[test]
@@ -170,7 +178,6 @@ fn test_draw_wrong_preimage_fails() {
     let hash = make_commit(&env, &secret, &salt);
     client.commit(&hash, &(env.ledger().sequence() + 100));
 
-    // Reveal wrong secret.
     let bad_secret: BytesN<32> = BytesN::from_array(&env, &[9u8; 32]);
     let salt_bytes: BytesN<32> = BytesN::from_array(&env, &salt);
     client.draw(&bad_secret, &salt_bytes);
@@ -191,7 +198,6 @@ fn test_buy_ticket_after_commit_fails() {
     let hash = make_commit(&env, &secret, &salt);
     client.commit(&hash, &(env.ledger().sequence() + 100));
 
-    // Should fail — lottery is no longer Open.
     let another = Address::generate(&env);
     client.buy_ticket(&another);
 }
@@ -214,6 +220,96 @@ fn test_draw_after_draw_fails() {
     let secret_bytes: BytesN<32> = BytesN::from_array(&env, &secret);
     let salt_bytes: BytesN<32> = BytesN::from_array(&env, &salt);
     client.draw(&secret_bytes, &salt_bytes);
-    // Second draw should fail.
     client.draw(&secret_bytes, &salt_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// #1256 — claim_refund clears TicketCount persistent storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_claim_refund_clears_ticket_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    client.buy_ticket(&buyer);
+    assert_eq!(client.get_ticket_count(&buyer), 1);
+
+    let secret = [1u8; 32];
+    let salt = [2u8; 32];
+    let hash = make_commit(&env, &secret, &salt);
+    let deadline = env.ledger().sequence() + 10;
+    client.commit(&hash, &deadline);
+
+    // Advance past the reveal deadline.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    client.claim_refund(&buyer);
+
+    // TicketCount must be cleared after refund (#1256).
+    assert_eq!(client.get_ticket_count(&buyer), 0);
+    // Participant list must also be empty.
+    assert!(client.get_info().participants.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #1257 — Configurable fee (fee_bps + fee_recipient) deducted at draw time
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_fee_bps_without_recipient_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = env.register(super::test::MockToken, ());
+    let addr = env.register(LotteryContract, ());
+    let client = LotteryContractClient::new(&env, &addr);
+    // fee_bps set but fee_recipient = None should be rejected.
+    client.initialize(
+        &admin,
+        &token,
+        &100,
+        &1u32,
+        &single_winner_splits(&env),
+        &None,
+        &Some(500u32),
+        &None,
+    );
+}
+
+#[test]
+fn test_fee_config_accepted_and_draw_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    let token = env.register(super::test::MockToken, ());
+    let addr = env.register(LotteryContract, ());
+    let client = LotteryContractClient::new(&env, &addr);
+
+    client.initialize(
+        &admin,
+        &token,
+        &100,
+        &1u32,
+        &single_winner_splits(&env),
+        &None,
+        &Some(500u32),     // 5% rake
+        &Some(fee_recipient),
+    );
+
+    let buyer = Address::generate(&env);
+    client.buy_ticket(&buyer);
+
+    let secret = [7u8; 32];
+    let salt = [8u8; 32];
+    let hash = make_commit(&env, &secret, &salt);
+    client.commit(&hash, &(env.ledger().sequence() + 100));
+
+    let secret_bytes = BytesN::from_array(&env, &secret);
+    let salt_bytes = BytesN::from_array(&env, &salt);
+    let winners = client.draw(&secret_bytes, &salt_bytes);
+    assert_eq!(winners.len(), 1);
 }

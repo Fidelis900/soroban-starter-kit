@@ -13,6 +13,41 @@ pub enum BondingCurveError {
     InvalidAmount = 4,
     InsufficientReserve = 5,
     Overflow = 6,
+    InvalidFee = 7,
+    InvalidConfiguration = 8,
+    /// Returned when a buyer attempts more than `MAX_BUYS_PER_LEDGER` purchases
+    /// in the same ledger sequence, preventing atomic same-ledger sandwiching.
+    RateLimitExceeded = 9,
+    /// Returned when a buyer attempts to buy before `BUY_COOLDOWN_LEDGERS` have
+    /// elapsed since their last purchase.
+    CooldownActive = 10,
+    /// Returned when an operation is attempted on a graduated curve that is
+    /// only valid while the curve is still active (e.g. buying / minting).
+    CurveGraduated = 11,
+    /// Returned when `migrate_to_amm` is called but the curve has not yet
+    /// graduated.
+    NotGraduated = 12,
+    /// Returned when a single purchase exceeds the configured maximum buy
+    /// limit (`max_buy_bps` of total supply).
+    PurchaseExceedsLimit = 13,
+    /// Returned when a buy is halted because the spot price surged beyond the
+    /// configured volatility threshold within the observation window.
+    PriceSurgeDetected = 14,
+    /// Returned when sigmoid curve parameters (midpoint / steepness) are
+    /// invalid, e.g. a non-positive midpoint or a steepness that would make
+    /// the fixed-point integral overflow.
+    InvalidSigmoidParameters = 15,
+    /// Returned when the dynamic exit-fee arithmetic overflows or produces an
+    /// out-of-range fee.
+    ExitFeeOverflow = 14,
+    /// Returned when a sell would reduce the real reserve balance below the
+    /// permanent virtual reserve floor, which is locked in the contract to
+    /// keep pricing formulas from dividing by zero.
+    ReserveBelowFloor = 15,
+    ExitFeeOverflow = 16,
+    /// Returned when a buy or sell executes at a price worse than the
+    /// caller-supplied slippage bound (`min_tokens_out` / `min_collateral_out`).
+    SlippageExceeded = 17,
 }
 
 impl_display_error!(
@@ -23,6 +58,18 @@ impl_display_error!(
     InvalidAmount        => "invalid amount",
     InsufficientReserve  => "insufficient reserve",
     Overflow             => "arithmetic overflow",
+    InvalidFee           => "invalid fee",
+    InvalidConfiguration => "invalid curve configuration",
+    RateLimitExceeded    => "rate limit exceeded: too many buys in this ledger",
+    CooldownActive       => "buy cooldown active: wait before buying again",
+    CurveGraduated       => "curve has graduated: minting is locked",
+    NotGraduated         => "curve has not graduated yet",
+    PurchaseExceedsLimit => "purchase exceeds single-transaction limit",
+    PriceSurgeDetected   => "price surge detected: buys temporarily halted",
+    InvalidSigmoidParameters => "invalid sigmoid curve parameters",
+    ExitFeeOverflow      => "exit fee arithmetic overflow",
+    ReserveBelowFloor    => "sell would reduce reserve below the virtual floor",
+    SlippageExceeded     => "slippage tolerance exceeded",
 );
 
 #[cfg(test)]
@@ -42,13 +89,37 @@ BondingCurveError::NotInitialized = {}\n\
 BondingCurveError::Unauthorized = {}\n\
 BondingCurveError::InvalidAmount = {}\n\
 BondingCurveError::InsufficientReserve = {}\n\
-BondingCurveError::Overflow = {}\n",
+BondingCurveError::Overflow = {}\n\
+BondingCurveError::InvalidFee = {}\n\
+BondingCurveError::InvalidConfiguration = {}\n\
+BondingCurveError::RateLimitExceeded = {}\n\
+BondingCurveError::CooldownActive = {}\n\
+BondingCurveError::CurveGraduated = {}\n\
+BondingCurveError::NotGraduated = {}\n\
+BondingCurveError::PurchaseExceedsLimit = {}\n\
+BondingCurveError::PriceSurgeDetected = {}\n\
+BondingCurveError::InvalidSigmoidParameters = {}\n\
+BondingCurveError::ExitFeeOverflow = {}\n\
+BondingCurveError::ReserveBelowFloor = {}\n",
+BondingCurveError::SlippageExceeded = {}\n",
             BondingCurveError::AlreadyInitialized as u32,
             BondingCurveError::NotInitialized as u32,
             BondingCurveError::Unauthorized as u32,
             BondingCurveError::InvalidAmount as u32,
             BondingCurveError::InsufficientReserve as u32,
             BondingCurveError::Overflow as u32,
+            BondingCurveError::InvalidFee as u32,
+            BondingCurveError::InvalidConfiguration as u32,
+            BondingCurveError::RateLimitExceeded as u32,
+            BondingCurveError::CooldownActive as u32,
+            BondingCurveError::CurveGraduated as u32,
+            BondingCurveError::NotGraduated as u32,
+            BondingCurveError::PurchaseExceedsLimit as u32,
+            BondingCurveError::PriceSurgeDetected as u32,
+            BondingCurveError::InvalidSigmoidParameters as u32,
+            BondingCurveError::ExitFeeOverflow as u32,
+            BondingCurveError::ReserveBelowFloor as u32,
+            BondingCurveError::SlippageExceeded as u32,
         )
     }
 

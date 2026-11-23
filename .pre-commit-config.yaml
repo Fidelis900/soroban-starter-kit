@@ -23,3 +23,11 @@ repos:
         # are caught before they reach CI.
         files: (^|/)Cargo\.toml$
         pass_filenames: false
+
+      - id: pin-github-actions
+        name: pin GitHub Actions to commit SHAs
+        description: Ensure every `uses:` in .github/workflows/*.yml is pinned to a full 40-char commit SHA.
+        entry: python3 .github/scripts/check_pinned_actions.py
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: false

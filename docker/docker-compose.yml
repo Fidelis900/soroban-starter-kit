@@ -26,6 +26,15 @@ services:
       - "${LOCAL_HORIZON_PORT:-8001}:8001"
     environment:
       - ENABLE_SOROBAN_RPC=true
+    # Health probe: queries the Soroban RPC JSON-RPC getHealth method on port 8000.
+    # The node is considered healthy once it responds with a "healthy" status.
+    # Verify manually with:
+    #   docker compose -f docker/docker-compose.yml ps
+    #   docker inspect --format '{{json .State.Health}}' $(docker compose -f docker/docker-compose.yml ps -q stellar-node)
+    # Or directly:
+    #   curl -sf -X POST -H 'Content-Type: application/json' \
+    #     -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+    #     http://localhost:8000/soroban/rpc
     healthcheck:
       test: ["CMD-SHELL", "curl -sf -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' http://localhost:8000/soroban/rpc | grep -q healthy"]
       interval: 10s

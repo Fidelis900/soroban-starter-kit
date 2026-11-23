@@ -36,6 +36,35 @@ proptest! {
     }
 
     #[test]
+    fn prop_threshold_change_requires_valid_range_and_quorum(signer_count in 1u32..=10, new_threshold in 0u32..=12) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = signer_vec(&env, signer_count);
+        let contract_address = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_address);
+        client.initialize(&signers, &1, &None);
+
+        let proposer = signers.get(0).unwrap();
+        let result = client.try_propose_threshold_change(&proposer, &new_threshold);
+
+        if new_threshold >= 1 && new_threshold <= signer_count {
+            prop_assert!(result.is_ok());
+
+            // Execution must fail until the current threshold (1) approves.
+            let no_approvals = soroban_sdk::Vec::new(&env);
+            prop_assert!(client.try_execute_threshold_change(&no_approvals).is_err());
+
+            let approvals = vec![&env, proposer.clone()];
+            let exec = client.try_execute_threshold_change(&approvals);
+            prop_assert!(exec.is_ok());
+            prop_assert_eq!(client.get_threshold(), Some(new_threshold));
+        } else {
+            prop_assert!(result.is_err());
+            prop_assert_eq!(client.get_threshold(), Some(1));
+        }
+    }
+
+    #[test]
     fn prop_duplicate_approvals_never_satisfy_threshold(extra_signers in 0u32..=6) {
         let env = Env::default();
         env.mock_all_auths();
@@ -48,14 +77,83 @@ proptest! {
 
         let new_signer = Address::generate(&env);
         let duplicate_approvals = vec![&env, alice.clone(), alice.clone()];
-        let result = client.try_add_signer(&duplicate_approvals, &new_signer, &2);
+        let result = client.try_add_signer(&duplicate_approvals, &new_signer, &1, &2);
 
         prop_assert!(result.is_err());
         prop_assert!(!client.is_signer(&new_signer));
 
         let valid_approvals = vec![&env, alice, bob];
-        let result = client.try_add_signer(&valid_approvals, &new_signer, &2);
+        let result = client.try_add_signer(&valid_approvals, &new_signer, &1, &2);
         prop_assert!(result.is_ok());
         prop_assert!(client.is_signer(&new_signer));
+    }
+
+    #[test]
+    fn prop_duplicate_signatures_never_satisfy_threshold(
+        signer_count in 2u32..=8,
+        threshold in 2u32..=8,
+        duplicate_count in 2u32..=8,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = signer_vec(&env, signer_count);
+        let alice = signers.get(0).unwrap();
+        let contract_address = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_address);
+        client.initialize(&signers, &threshold, &None);
+
+        // A single signer repeated many times must never reach the threshold.
+        let mut duplicates = soroban_sdk::Vec::new(&env);
+        for _ in 0..duplicate_count {
+            duplicates.push_back(alice.clone());
+        }
+        let new_signer = Address::generate(&env);
+        let result = client.try_add_signer(&duplicates, &new_signer, &1, &threshold);
+        prop_assert!(result.is_err());
+        prop_assert!(!client.is_signer(&new_signer));
+
+        // The same signer repeated exactly `threshold` times must still fail.
+        let mut threshold_duplicates = soroban_sdk::Vec::new(&env);
+        for _ in 0..threshold {
+            threshold_duplicates.push_back(alice.clone());
+        }
+        let result = client.try_add_signer(&threshold_duplicates, &new_signer, &1, &threshold);
+        prop_assert!(result.is_err());
+        prop_assert!(!client.is_signer(&new_signer));
+    }
+
+    #[test]
+    fn prop_expired_proposals_never_execute(
+        signer_count in 2u32..=8,
+        threshold in 1u32..=8,
+        expiry_offset in 0u32..=100,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = signer_vec(&env, signer_count);
+        let contract_address = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_address);
+        client.initialize(&signers, &threshold, &None);
+
+        let new_signer = Address::generate(&env);
+        let mut approvals = soroban_sdk::Vec::new(&env);
+        for i in 0..threshold.min(signer_count) {
+            approvals.push_back(signers.get(i).unwrap());
+        }
+
+        let expiry = env.ledger().sequence() + expiry_offset;
+        let result = client.try_add_signer(&approvals, &new_signer, &1, &expiry);
+        if expiry_offset == 0 {
+            // Expiry at or before the current ledger sequence must not execute.
+            prop_assert!(result.is_err());
+            prop_assert!(!client.is_signer(&new_signer));
+        } else {
+            // A future expiry may succeed; if it does, the signer is added.
+            if result.is_ok() {
+                prop_assert!(client.is_signer(&new_signer));
+            } else {
+                prop_assert!(!client.is_signer(&new_signer));
+            }
+        }
     }
 }

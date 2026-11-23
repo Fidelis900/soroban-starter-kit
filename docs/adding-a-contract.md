@@ -12,8 +12,6 @@ Create the following layout under `contracts/<name>/`:
 contracts/<name>/
 ├── Cargo.toml
 ├── build.rs
-├── scripts/
-│   └── deploy.sh
 └── src/
     ├── lib.rs          # contract entry points
     ├── storage.rs      # DataKey enum and storage helpers
@@ -21,14 +19,19 @@ contracts/<name>/
     ├── events.rs       # event emission helpers
     ├── admin.rs        # admin auth helpers
     ├── test.rs         # unit tests (minimum 8 cases)
-    ├── prop_test.rs    # property-based tests
-    └── bin/
-        └── deploy.rs   # CLI deploy binary
+    └── prop_test.rs    # property-based tests
 ```
 
 ```bash
-mkdir -p contracts/<name>/src/bin contracts/<name>/scripts
+mkdir -p contracts/<name>/src
 ```
+
+> **Note:** Some existing contracts also ship a per-contract `src/bin/deploy.rs`
+> binary and/or a `scripts/deploy.sh` script. These are **legacy** and are not
+> required for new contracts — deployment is handled by the top-level
+> `scripts/deploy.sh` / `scripts/deploy-all.sh`, which deploy every contract
+> from the workspace root. The contracts that still carry these files are not
+> broken; they simply predate the workspace-level deploy tooling.
 
 ---
 
@@ -40,7 +43,7 @@ Copy this template and replace `<name>` and `<description>`:
 [package]
 name = "soroban-<name>-template"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors.workspace = true
 description = "<description>"
 license.workspace = true
@@ -59,11 +62,6 @@ soroban-common = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = { workspace = true }
-
-[[bin]]
-name = "deploy"
-path = "src/bin/deploy.rs"
-doc = false
 
 [lints]
 workspace = true
@@ -135,30 +133,17 @@ cargo test -p soroban-<name>-template --features pausable,upgradeable
 
 ---
 
-## 5. Deploy Script
+## 5. Deployment
 
-`scripts/deploy.sh` must accept a network argument (`testnet` or `mainnet`) and use the `stellar` CLI:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-NETWORK=${1:-testnet}
-WASM=target/wasm32-unknown-unknown/release/soroban_<name>_template.wasm
-
-stellar contract build --manifest-path contracts/<name>/Cargo.toml
-
-stellar contract deploy \
-  --wasm "$WASM" \
-  --network "$NETWORK" \
-  --source "$STELLAR_SECRET_KEY"
-```
-
-Make it executable:
+New contracts do **not** need a per-contract deploy script. Deployment is handled
+by the top-level scripts, which build and deploy every contract in the workspace:
 
 ```bash
-chmod +x contracts/<name>/scripts/deploy.sh
+./scripts/deploy.sh <network>       # deploy a single contract
+./scripts/deploy-all.sh <network>   # deploy every contract
 ```
+
+See the top-level `scripts/` directory for the supported networks and options.
 
 ---
 
@@ -177,11 +162,10 @@ Also add a `### <Name> Contract Features` section listing the key capabilities.
 ## 7. Final Checklist
 
 - [ ] Directory structure matches the layout in section 1
-- [ ] `Cargo.toml` uses workspace-inherited fields and includes `pausable` / `upgradeable` features
+- [ ] `Cargo.toml` uses `edition = "2024"` and workspace-inherited fields, and includes `pausable` / `upgradeable` features
 - [ ] Crate added to root `Cargo.toml` `members`
 - [ ] `cargo check --workspace` passes
 - [ ] At least 8 unit tests and 1 property-based test
 - [ ] `cargo test -p soroban-<name>-template` passes (with and without features)
-- [ ] `scripts/deploy.sh` is present and executable
 - [ ] Row added to the template table in `README.md`
 - [ ] Entry added under `[Unreleased]` in `CHANGELOG.md`

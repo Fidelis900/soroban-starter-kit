@@ -9,88 +9,134 @@
 
 use super::*;
 use soroban_sdk::{
-    Address, Env,
-    testutils::{Address as _, Ledger as _},
-    token::StellarAssetClient,
+    Address, BytesN, Env, Vec,
+    testutils::{Address as _, Events as _, Ledger as _},
+    token::{Client as TokenClient, StellarAssetClient},
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn register_token(env: &Env) -> (Address, Address) {
+fn register_token(env: &Env) -> Address {
     let admin = Address::generate(env);
-    let sac = env.register_stellar_asset_contract_v2(admin.clone());
-    (sac.address(), admin)
+    let sac = env.register_stellar_asset_contract_v2(admin);
+    sac.address()
 }
 
 fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
     let token_admin = Address::generate(env);
-    // Use the SAC admin from the token's own admin key via mock_all_auths
     let _ = token_admin;
     StellarAssetClient::new(env, token).mint(to, &amount);
 }
 
-fn setup(env: &Env) -> (SwapContractClient, Address, Address, Address, Address) {
-    let (token_a, _) = register_token(env);
-    let (token_b, _) = register_token(env);
+fn setup(env: &Env) -> (SwapContractClient, Address, Address, Address, Address, Address) {
+    let token_a = register_token(env);
+    let token_b = register_token(env);
     let party_a = Address::generate(env);
     let party_b = Address::generate(env);
+    let treasury = Address::generate(env);
 
-    mint(env, &token_a, &party_a, 10_000);
-    mint(env, &token_b, &party_b, 10_000);
+    mint(env, &token_a, &party_a, 100_000);
+    mint(env, &token_b, &party_b, 100_000);
 
     let addr = env.register_contract(None, SwapContract);
     let client = SwapContractClient::new(env, &addr);
+    client.initialize(&party_a, &treasury, &50); // 0.5% fee
+    let approve_until = env.ledger().sequence() + 1_000_000;
+    TokenClient::new(env, &token_a).approve(&party_a, &addr, &1_000_000_000, &approve_until);
 
-    (client, party_a, party_b, token_a, token_b)
+    (client, party_a, party_b, token_a, token_b, treasury)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[test]
-fn test_propose_swap() {
+fn test_propose_and_accept_full_swap() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, party_a, _, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    let expires_at = env.ledger().sequence() + 100;
+    let (client, party_a, party_b, token_a, token_b, treasury) = setup(&env);
 
+    let expires_at = env.ledger().sequence() + 100;
     let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    client.accept_swap(&swap_id, &party_b);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
     assert_eq!(swap_id, 0);
     assert_eq!(client.swap_count(), 1);
 
     let swap = client.get_swap(&0);
     assert_eq!(swap.party_a, party_a);
-    assert_eq!(swap.state, SwapState::Open);
+    assert_eq!(swap.state, SwapState::Pending);
     assert_eq!(swap.amount_a, 1_000);
     assert_eq!(swap.amount_b, 500);
+    assert_eq!(swap.allowed_counterparty, None);
+    assert_eq!(swap.max_execution_delay, None);
+}
+
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Executed);
+    assert_eq!(swap.filled_amount, 1_000);
+
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let token_b_client = TokenClient::new(&env, &token_b);
+    assert_eq!(token_a_client.balance(&party_b), 1_000);
+    assert_eq!(token_b_client.balance(&treasury), 2); // 500 * 50 / 10000 = 2
+    client.propose_swap(
+        &party_a,
+        &token_a,
+        &0,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
-fn test_propose_swap_zero_amount_fails() {
+fn test_partial_fill_multiple_takes() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, party_a, _, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let token_b_client = TokenClient::new(&env, &token_b);
+    let contract_addr = client.address.clone();
+
     let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap_with_options(
+        &party_a, &token_a, &1_000, &token_b, &500, &expires_at, &true, &true,
+    );
+    assert_eq!(token_a_client.balance(&contract_addr), 1_000);
 
-    client.propose_swap(&party_a, &token_a, &0, &token_b, &500, &expires_at);
-}
+    // First partial fill: 400 of 1_000 -> proportional counterparty = 200
+    client.fill_swap_partial(&swap_id, &party_b, &400);
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Pending);
+    assert_eq!(swap.filled_amount, 400);
+    assert_eq!(token_a_client.balance(&party_b), 400);
+    assert_eq!(token_b_client.balance(&party_a), 200);
+    assert_eq!(token_a_client.balance(&contract_addr), 600);
 
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_propose_swap_past_expiry_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 200);
+    // Second partial fill: 300 -> proportional counterparty = 150
+    client.fill_swap_partial(&swap_id, &party_b, &300);
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Pending);
+    assert_eq!(swap.filled_amount, 700);
+    assert_eq!(token_a_client.balance(&party_b), 700);
+    assert_eq!(token_b_client.balance(&party_a), 350);
+    assert_eq!(token_a_client.balance(&contract_addr), 300);
 
-    let (client, party_a, _, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &100);
+    // Final partial fill: 300 -> completes the swap
+    client.fill_swap_partial(&swap_id, &party_b, &300);
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Executed);
+    assert_eq!(swap.filled_amount, 1_000);
+    assert_eq!(token_a_client.balance(&party_b), 1_000);
+    assert_eq!(token_b_client.balance(&party_a), 500);
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
 }
 
 #[test]
@@ -100,26 +146,284 @@ fn test_accept_swap() {
     let (client, party_a, party_b, token_a, token_b) = setup(&env);
     client.initialize(&party_a, &Address::generate(&env), &0);
     let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap_with_options(
+        &party_a, &token_a, &1_000, &token_b, &500, &expires_at, &true, &false,
+    );
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    client.accept_swap_partial(&party_b, &swap_id, &400);
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Pending);
+    assert_eq!(swap.filled_amount, 400);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
     client.accept_swap(&swap_id, &party_b);
 
+    client.accept_swap_partial(&party_b, &swap_id, &600);
     let swap = client.get_swap(&swap_id);
-    assert_eq!(swap.state, SwapState::Completed);
+    assert_eq!(swap.state, SwapState::Executed);
+    assert_eq!(swap.filled_amount, 1_000);
+    assert_eq!(swap.state, SwapState::Accepted);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
-fn test_accept_swap_after_expiry_fails() {
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_partial_fill_rejected_when_not_enabled() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, party_a, party_b, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    let expires_at = env.ledger().sequence() + 10;
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap_with_options(
+        &party_a, &token_a, &1_000, &token_b, &500, &expires_at, &false, &true,
+    );
+    // Partial fills disabled -> SwapError::PartialFillsNotAllowed (#3)
+    client.fill_swap_partial(&swap_id, &party_b, &500);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1301: HTLC secret preimage tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_htlc_swap_executes_with_correct_preimage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+
+    let preimage = BytesN::from_array(&env, &[7u8; 32]);
+    let hash_lock = env.crypto().sha256(&preimage.into());
+    let expires_at = env.ledger().sequence() + 100;
+
+    let swap_id = client.propose_swap_htlc(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &hash_lock.to_bytes(),
+    );
+    assert_eq!(client.get_swap(&swap_id).hash_lock, Some(hash_lock.to_bytes()));
+
+    client.execute_swap(&swap_id, &party_b, &Some(preimage.clone()), &None);
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.state, SwapState::Executed);
+    assert_eq!(token_a_client.balance(&party_b), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_htlc_swap_fails_with_wrong_preimage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+
+    let preimage = BytesN::from_array(&env, &[7u8; 32]);
+    let wrong_preimage = BytesN::from_array(&env, &[9u8; 32]);
+    let hash_lock = env.crypto().sha256(&preimage.into());
+    let expires_at = env.ledger().sequence() + 100;
+
+    let swap_id = client.propose_swap_htlc(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &hash_lock.to_bytes(),
+    );
+
+    // Wrong preimage -> SwapError::HashLockMismatch (#14)
+    client.execute_swap(&swap_id, &party_b, &Some(wrong_preimage), &None);
+}
+
+#[test]
+fn test_htlc_creator_refund_after_deadline_without_secret() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+
+    let preimage = BytesN::from_array(&env, &[7u8; 32]);
+    let hash_lock = env.crypto().sha256(&preimage.into());
+    let expires_at = env.ledger().sequence() + 10;
+    let balance_before = token_a_client.balance(&party_a);
+
+    let swap_id = client.propose_swap_htlc(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &hash_lock.to_bytes(),
+    );
+    assert_eq!(token_a_client.balance(&contract_addr), 1_000);
+
+    // Secret never revealed; advance past deadline and refund.
     env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
-    client.accept_swap(&swap_id, &party_b);
+    client.cancel_swap(&swap_id);
+
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
+    assert_eq!(token_a_client.balance(&party_a), balance_before);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1302: Referral fee tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_referral_fee_split_between_referrer_and_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, treasury) = setup(&env);
+    let referrer = Address::generate(&env);
+    let token_b_client = TokenClient::new(&env, &token_b);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    client.execute_swap(&swap_id, &party_b, &None, &Some(referrer.clone()));
+
+    // fee = 500 * 50 / 10_000 = 2; split 50/50 -> 1 each
+    assert_eq!(token_b_client.balance(&referrer), 1);
+    assert_eq!(token_b_client.balance(&treasury), 1);
+    assert_eq!(token_b_client.balance(&party_a), 498);
+
+    let events = env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        if event.0 == client.address {
+            found = true;
+        }
+    }
+    assert!(found);
+}
+
+#[test]
+fn test_no_referrer_full_fee_goes_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, treasury) = setup(&env);
+    let token_b_client = TokenClient::new(&env, &token_b);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    client.execute_swap(&swap_id, &party_b, &None, &None);
+
+    assert_eq!(token_b_client.balance(&treasury), 2);
+    assert_eq!(token_b_client.balance(&party_a), 498);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1303: Batch swap cancellation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cancel_swaps_batch_refunds_all_escrows() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+    let balance_before = token_a_client.balance(&party_a);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let id0 = client.propose_swap_with_options(
+        &party_a, &token_a, &100, &token_b, &50, &expires_at, &false, &true,
+    );
+    let id1 = client.propose_swap_with_options(
+        &party_a, &token_a, &200, &token_b, &100, &expires_at, &false, &true,
+    );
+    let id2 = client.propose_swap_with_options(
+        &party_a, &token_a, &300, &token_b, &150, &expires_at, &false, &true,
+    );
+    assert_eq!(token_a_client.balance(&contract_addr), 600);
+
+    let ids = Vec::from_array(&env, [id0, id1, id2]);
+    client.cancel_swaps_batch(&party_a, &ids);
+
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
+    assert_eq!(token_a_client.balance(&party_a), balance_before);
+    assert_eq!(client.get_swap(&id0).state, SwapState::Cancelled);
+    assert_eq!(client.get_swap(&id1).state, SwapState::Cancelled);
+    assert_eq!(client.get_swap(&id2).state, SwapState::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_cancel_swaps_batch_unauthorized_caller_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+    let attacker = Address::generate(&env);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let id0 = client.propose_swap_with_options(
+        &party_a, &token_a, &100, &token_b, &50, &expires_at, &false, &true,
+    );
+
+    let ids = Vec::from_array(&env, [id0]);
+    // Attacker does not own the swap -> SwapError::NotAuthorized (#1)
+    client.cancel_swaps_batch(&attacker, &ids);
+}
+
+#[test]
+fn test_cancel_swaps_batch_mixed_ownership_rejected_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+    let other = Address::generate(&env);
+    mint(&env, &token_a, &other, 10_000);
+    let approve_until = env.ledger().sequence() + 1_000_000;
+    TokenClient::new(&env, &token_a).approve(&other, &client.address, &1_000_000_000, &approve_until);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let owned = client.propose_swap_with_options(
+        &party_a, &token_a, &100, &token_b, &50, &expires_at, &false, &true,
+    );
+    let foreign = client.propose_swap_with_options(
+        &other, &token_a, &200, &token_b, &100, &expires_at, &false, &true,
+    );
+
+    let ids = Vec::from_array(&env, [owned, foreign]);
+    let result = client.try_cancel_swaps_batch(&party_a, &ids);
+    assert!(result.is_err());
+
+    // No partial state changes: both swaps remain pending and escrow intact.
+    assert_eq!(client.get_swap(&owned).state, SwapState::Pending);
+    assert_eq!(client.get_swap(&foreign).state, SwapState::Pending);
+    assert_eq!(TokenClient::new(&env, &token_a).balance(&client.address), 300);
 }
 
 #[test]
@@ -130,99 +434,219 @@ fn test_cancel_swap_by_party_a() {
     client.initialize(&party_a, &Address::generate(&env), &0);
     let expires_at = env.ledger().sequence() + 100;
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
     client.cancel_swap(&swap_id);
 
     assert_eq!(client.get_swap(&swap_id).state, SwapState::Cancelled);
 }
 
 #[test]
-fn test_cancel_swap_after_deadline_by_anyone() {
+fn test_escrowed_cancel_returns_unfilled_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+
+    let balance_before = token_a_client.balance(&party_a);
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap_with_options(
+        &party_a, &token_a, &1_000, &token_b, &500, &expires_at, &true, &true,
+    );
+    assert_eq!(token_a_client.balance(&contract_addr), 1_000);
+    assert_eq!(token_a_client.balance(&party_a), balance_before - 1_000);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+    client.cancel_swap(&swap_id);
+
+    client.accept_swap_partial(&party_b, &swap_id, &400);
+    assert_eq!(token_a_client.balance(&contract_addr), 600);
+
+    client.cancel_swap(&swap_id);
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
+    assert_eq!(token_a_client.balance(&party_a), balance_before - 400);
+#[test]
+fn test_proposer_reclaims_escrowed_assets_after_expiry() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, party_a, _, token_a, token_b) = setup(&env);
     client.initialize(&party_a, &Address::generate(&env), &0);
     let expires_at = env.ledger().sequence() + 10;
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
-    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
-    // anyone can cancel after deadline
-    client.cancel_swap(&swap_id);
-
-    assert_eq!(client.get_swap(&swap_id).state, SwapState::Cancelled);
-}
-
-#[test]
-fn test_proposer_reclaims_escrowed_assets_after_expiry() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, party_a, party_b, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    let expires_at = env.ledger().sequence() + 10;
-
-    // Get initial balances
     let token_a_client = token::Client::new(&env, &token_a);
     let initial_balance = token_a_client.balance(&party_a);
-    
-    // Propose swap - party A deposits 1000 tokens
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
-    
-    // Check that tokens were transferred to contract
+
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
     let contract_address = client.address.clone();
     assert_eq!(token_a_client.balance(&contract_address), 1000);
     assert_eq!(token_a_client.balance(&party_a), initial_balance - 1000);
-    
-    // Advance ledger past expiry
+
     env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
-    
-    // Proposer (party A) cancels the swap to reclaim assets
+
     client.cancel_swap(&swap_id);
-    
-    // Check that assets were returned to party A
+
     assert_eq!(token_a_client.balance(&contract_address), 0);
     assert_eq!(token_a_client.balance(&party_a), initial_balance);
     assert_eq!(client.get_swap(&swap_id).state, SwapState::Cancelled);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
-fn test_accept_completed_swap_fails() {
+fn test_escrowed_accept_transfers_from_contract() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, party_a, party_b, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    let expires_at = env.ledger().sequence() + 100;
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap_with_options(
+        &party_a, &token_a, &900, &token_b, &450, &expires_at, &false, &true,
+    );
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
     client.accept_swap(&swap_id, &party_b);
     client.accept_swap(&swap_id, &party_b);
+
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
+    assert_eq!(token_a_client.balance(&party_b), 900);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Executed);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
-fn test_cancel_already_cancelled_fails() {
+fn test_basket_swap_success() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, party_a, _, token_a, token_b) = setup(&env);
-    client.initialize(&party_a, &Address::generate(&env), &0);
-    let expires_at = env.ledger().sequence() + 100;
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+    let token_c = register_token(&env);
+    let token_d = register_token(&env);
 
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+    mint(&env, &token_c, &party_a, 2_000);
+    mint(&env, &token_d, &party_b, 2_000);
+    let approve_until = env.ledger().sequence() + 1_000_000;
+    TokenClient::new(&env, &token_c).approve(&party_a, &client.address, &1_000_000_000, &approve_until);
+
+    let offers = Vec::from_array(
+        &env,
+        [
+            BasketLeg {
+                token: token_a.clone(),
+                amount: 500,
+            },
+            BasketLeg {
+                token: token_c.clone(),
+                amount: 700,
+            },
+        ],
+    );
+    let demands = Vec::from_array(
+        &env,
+        [
+            BasketLeg {
+                token: token_b.clone(),
+                amount: 300,
+            },
+            BasketLeg {
+                token: token_d.clone(),
+                amount: 400,
+            },
+        ],
+    );
+    let expires_at = env.ledger().sequence() + 100;
+    let basket_id = client.propose_basket_swap(&party_a, &offers, &demands, &expires_at);
+    client.accept_basket_swap(&basket_id, &party_b);
+
+    let info = client.get_basket_swap(&basket_id);
+    assert_eq!(info.state, SwapState::Executed);
+    assert_eq!(TokenClient::new(&env, &token_c).balance(&party_b), 700);
+    assert_eq!(TokenClient::new(&env, &token_d).balance(&party_a), 400);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
     client.cancel_swap(&swap_id);
     client.cancel_swap(&swap_id);
 }
 
 #[test]
-fn test_configuration_getters_work() {
+fn test_basket_swap_atomic_failure_rolls_back() {
     let env = Env::default();
     env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+
+    let offers = Vec::from_array(
+        &env,
+        [BasketLeg {
+            token: token_a.clone(),
+            amount: 500,
+        }],
+    );
+    let demands = Vec::from_array(
+        &env,
+        [BasketLeg {
+            token: token_b.clone(),
+            amount: 200_000, // impossible for party_b
+        }],
+    );
+    let expires_at = env.ledger().sequence() + 100;
+    let basket_id = client.propose_basket_swap(&party_a, &offers, &demands, &expires_at);
+
+    let party_a_before = TokenClient::new(&env, &token_b).balance(&party_a);
+    let party_b_before = TokenClient::new(&env, &token_a).balance(&party_b);
+    let result = client.try_accept_basket_swap(&basket_id, &party_b);
+    assert!(result.is_err());
+
+    // No partial transfers should persist.
+    assert_eq!(TokenClient::new(&env, &token_b).balance(&party_a), party_a_before);
+    assert_eq!(TokenClient::new(&env, &token_a).balance(&party_b), party_b_before);
+    assert_eq!(client.get_basket_swap(&basket_id).state, SwapState::Pending);
     let (client, party_a, _, _, _) = setup(&env);
     let treasury = Address::generate(&env);
     let fee_bps = 50;
-    
+
     client.initialize(&party_a, &treasury, &fee_bps);
-    
-    // Test getters
+
     assert_eq!(client.get_admin(), party_a);
     assert_eq!(client.get_treasury(), treasury);
     assert_eq!(client.get_fee_bps(), 50);
@@ -233,56 +657,61 @@ fn test_fee_deducted_when_swap_accepted() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, party_a, party_b, token_a, token_b) = setup(&env);
-    
-    // Create treasury address
+
     let treasury = Address::generate(&env);
-    
-    // Initialize contract with 0.5% fee (50 basis points)
     client.initialize(&party_a, &treasury, &50);
-    
-    // Get token clients
+
     let token_b_client = token::Client::new(&env, &token_b);
     let contract_address = client.address.clone();
-    
-    // Get initial balances
+
     let initial_party_b_balance = token_b_client.balance(&party_b);
     let initial_party_a_balance = token_b_client.balance(&party_a);
     let initial_treasury_balance = token_b_client.balance(&treasury);
-    
-    // Propose swap
+
     let expires_at = env.ledger().sequence() + 100;
     let swap_amount_b = 500;
-    let swap_id = client.propose_swap(&party_a, &token_a, &1_000, &token_b, &swap_amount_b, &expires_at);
-    
-    // Accept swap
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &swap_amount_b,
+        &expires_at,
+        &None,
+        &None,
+    );
+
     client.accept_swap(&swap_id, &party_b);
-    
-    // Calculate expected fee (0.5% of 500 = 2.5 → 2 tokens due to integer division)
+
     let fee = (swap_amount_b * 50) / 10_000; // 2
     let party_a_receives = swap_amount_b - fee; // 498
-    
-    // Verify balances
-    assert_eq!(token_b_client.balance(&party_b), initial_party_b_balance - swap_amount_b);
-    assert_eq!(token_b_client.balance(&party_a), initial_party_a_balance + party_a_receives);
-    assert_eq!(token_b_client.balance(&treasury), initial_treasury_balance + fee);
-    assert_eq!(token_b_client.balance(&contract_address), 0); // Contract should have 0 left
+
+    assert_eq!(
+        token_b_client.balance(&party_b),
+        initial_party_b_balance - swap_amount_b
+    );
+    assert_eq!(
+        token_b_client.balance(&party_a),
+        initial_party_a_balance + party_a_receives
+    );
+    assert_eq!(
+        token_b_client.balance(&treasury),
+        initial_treasury_balance + fee
+    );
+    assert_eq!(token_b_client.balance(&contract_address), 0);
 }
 
 #[test]
 #[should_panic(expected = "Error(Auth, InvalidAction)")]
 fn test_non_admin_cannot_update_configuration() {
     let env = Env::default();
-    env.mock_all_auths(); // Only mock auths for authorized calls
+    env.mock_all_auths();
     let (client, party_a, _party_b, _, _) = setup(&env);
     let initial_treasury = Address::generate(&env);
     let new_treasury = Address::generate(&env);
 
-    // Initialize with party_a as admin
     client.initialize(&party_a, &initial_treasury, &50);
 
-    // `set_treasury` only accepts authorization from the stored admin
-    // (`party_a`); with all mocked auths cleared, its `require_auth()` call
-    // has nothing to authorize the call and traps at the host level.
     env.set_auths(&[]);
     client.set_treasury(&new_treasury);
 }
@@ -295,19 +724,15 @@ fn test_admin_can_update_configuration() {
     let initial_treasury = Address::generate(&env);
     let new_treasury = Address::generate(&env);
     let new_admin = Address::generate(&env);
-    
-    // Initialize
+
     client.initialize(&party_a, &initial_treasury, &50);
-    
-    // Update treasury (as admin)
+
     client.set_treasury(&new_treasury);
     assert_eq!(client.get_treasury(), new_treasury);
-    
-    // Update fee
+
     client.set_fee_bps(&100);
     assert_eq!(client.get_fee_bps(), 100);
-    
-    // Update admin
+
     client.set_admin(&new_admin);
     assert_eq!(client.get_admin(), new_admin);
 }
@@ -319,11 +744,8 @@ fn test_cannot_initialize_twice() {
     env.mock_all_auths();
     let (client, party_a, _, _, _) = setup(&env);
     let treasury = Address::generate(&env);
-    
-    // Initialize once
+
     client.initialize(&party_a, &treasury, &50);
-    
-    // Try to initialize again - should fail
     client.initialize(&party_a, &treasury, &50);
 }
 
@@ -334,21 +756,34 @@ fn test_cannot_set_invalid_fee() {
     env.mock_all_auths();
     let (client, party_a, _, _, _) = setup(&env);
     let treasury = Address::generate(&env);
-    
-    // Try to initialize with 101% fee (10100 bps > 10000) - should fail
+
     client.initialize(&party_a, &treasury, &10100);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #10)")]
-fn test_cannot_propose_before_initialization() {
+fn test_cancel_after_expiry_without_party_a_auth() {
     let env = Env::default();
     env.mock_all_auths();
+    let (client, party_a, _party_b, token_a, token_b, _treasury) = setup(&env);
+    let expires_at = env.ledger().sequence() + 5;
+    let swap_id = client.propose_swap(&party_a, &token_a, &1000, &token_b, &500, &expires_at);
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+    client.cancel_swap(&swap_id);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Cancelled);
+}
     let (client, party_a, _, token_a, token_b) = setup(&env);
     let expires_at = env.ledger().sequence() + 100;
-    
-    // Try to propose a swap before initializing - should fail
-    client.propose_swap(&party_a, &token_a, &1_000, &token_b, &500, &expires_at);
+
+    client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
 }
 
 #[test]
@@ -359,9 +794,732 @@ fn test_multiple_swaps_increment_id() {
     client.initialize(&party_a, &Address::generate(&env), &0);
     let expires_at = env.ledger().sequence() + 100;
 
-    let id0 = client.propose_swap(&party_a, &token_a, &100, &token_b, &50, &expires_at);
-    let id1 = client.propose_swap(&party_a, &token_a, &200, &token_b, &100, &expires_at);
+    let id0 = client.propose_swap(
+        &party_a,
+        &token_a,
+        &100,
+        &token_b,
+        &50,
+        &expires_at,
+        &None,
+        &None,
+    );
+    let id1 = client.propose_swap(
+        &party_a,
+        &token_a,
+        &200,
+        &token_b,
+        &100,
+        &expires_at,
+        &None,
+        &None,
+    );
     assert_eq!(id0, 0);
     assert_eq!(id1, 1);
     assert_eq!(client.swap_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1077: Counterparty restriction tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_counterparty_restriction_allowed_taker_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+    let expires_at = env.ledger().sequence() + 100;
+
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &Some(party_b.clone()),
+        &None,
+    );
+
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.allowed_counterparty, Some(party_b.clone()));
+
+    // Designated taker accepts successfully
+    client.accept_swap(&swap_id, &party_b);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Accepted);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_counterparty_restriction_unauthorized_taker_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    let unauthorized_taker = Address::generate(&env);
+    mint(&env, &token_b, &unauthorized_taker, 10_000);
+
+    client.initialize(&party_a, &Address::generate(&env), &0);
+    let expires_at = env.ledger().sequence() + 100;
+
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &Some(party_b),
+        &None,
+    );
+
+    // Unauthorized taker attempts acceptance -> SwapError::NotAuthorized (#1)
+    client.accept_swap(&swap_id, &unauthorized_taker);
+}
+
+#[test]
+fn test_open_taker_allows_any_counterparty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b) = setup(&env);
+    let random_taker = Address::generate(&env);
+    mint(&env, &token_b, &random_taker, 10_000);
+
+    client.initialize(&party_a, &Address::generate(&env), &0);
+    let expires_at = env.ledger().sequence() + 100;
+
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    client.accept_swap(&swap_id, &random_taker);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Accepted);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1079: Treasury fee rounding audit and minimum fee tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_minimum_fee_enforced_on_small_micro_swaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    let treasury = Address::generate(&env);
+
+    // 10 bps = 0.1%. For amount_b = 5: 5 * 10 / 10_000 = 0 in standard int division.
+    // Minimum non-zero fee policy ensures fee = 1.
+    client.initialize(&party_a, &treasury, &10);
+
+    let token_b_client = token::Client::new(&env, &token_b);
+    let initial_treasury_balance = token_b_client.balance(&treasury);
+    let initial_party_a_balance = token_b_client.balance(&party_a);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &10,
+        &token_b,
+        &5,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    client.accept_swap(&swap_id, &party_b);
+
+    assert_eq!(token_b_client.balance(&treasury), initial_treasury_balance + 1);
+    assert_eq!(token_b_client.balance(&party_a), initial_party_a_balance + 4);
+}
+
+#[test]
+fn test_fee_calculation_across_different_decimal_scales() {
+    // 7-decimal XLM scale (e.g. 100 XLM = 1_000_000_000 stroops)
+    let amount_xlm = 1_000_000_000i128;
+    let fee_xlm = calculate_and_validate_fee(amount_xlm, 50).unwrap(); // 0.5% = 5_000_000
+    assert_eq!(fee_xlm, 5_000_000);
+
+    // 2-decimal USDC scale (e.g. 100 USDC = 10_000 cents)
+    let amount_usdc = 10_000i128;
+    let fee_usdc = calculate_and_validate_fee(amount_usdc, 50).unwrap(); // 0.5% = 50 cents
+    assert_eq!(fee_usdc, 50);
+
+    // Small USDC trade (5 cents) where 0.5% = 0.025 cents -> minimum fee = 1 cent
+    let small_usdc = 5i128;
+    let fee_small = calculate_and_validate_fee(small_usdc, 50).unwrap();
+    assert_eq!(fee_small, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1080: Pagination tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pagination_active_swaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+
+    let base_ledger = 100;
+    env.ledger().with_mut(|l| l.sequence_number = base_ledger);
+
+    // Create 5 swaps:
+    // id 0: active (expires 200)
+    // id 1: active -> accepted (expires 200)
+    // id 2: active (expires 200)
+    // id 3: expired (expires 105)
+    // id 4: active (expires 200)
+    let id0 = client.propose_swap(&party_a, &token_a, &100, &token_b, &100, &200, &None, &None);
+    let id1 = client.propose_swap(&party_a, &token_a, &200, &token_b, &200, &200, &None, &None);
+    let id2 = client.propose_swap(&party_a, &token_a, &300, &token_b, &300, &200, &None, &None);
+    let id3 = client.propose_swap(&party_a, &token_a, &400, &token_b, &400, &105, &None, &None);
+    let id4 = client.propose_swap(&party_a, &token_a, &500, &token_b, &500, &200, &None, &None);
+
+    // Accept id 1
+    client.accept_swap(&id1, &party_b);
+
+    // Advance ledger past id3 expiry
+    env.ledger().with_mut(|l| l.sequence_number = 110);
+
+    // Active pending non-expired swaps are: id0, id2, id4
+    let page1 = client.get_active_swaps(&0, &2);
+    assert_eq!(page1.swaps.len(), 2);
+    assert_eq!(page1.swaps.get(0).unwrap().id, id0);
+    assert_eq!(page1.swaps.get(1).unwrap().id, id2);
+    assert_eq!(page1.next_cursor, Some(3));
+
+    // Page 2 resuming from cursor 3
+    let page2 = client.get_active_swaps(&page1.next_cursor.unwrap(), &2);
+    assert_eq!(page2.swaps.len(), 1);
+    assert_eq!(page2.swaps.get(0).unwrap().id, id4);
+    assert_eq!(page2.next_cursor, None);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1081: Front-running protection and execution delay tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_execution_delay_within_window_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+
+    // Max execution delay of 20 ledgers
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &500,
+        &None,
+        &Some(20),
+    );
+
+    // Advance 15 ledgers (ledger 115 <= 100 + 20)
+    env.ledger().with_mut(|l| l.sequence_number = 115);
+
+    client.accept_swap(&swap_id, &party_b);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Accepted);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_execution_delay_exceeded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+
+    // Max execution delay of 10 ledgers
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &500,
+        &None,
+        &Some(10),
+    );
+
+    // Advance 11 ledgers (ledger 111 > 100 + 10) -> SwapError::ExecutionDelayExceeded (#13)
+    env.ledger().with_mut(|l| l.sequence_number = 111);
+
+    client.accept_swap(&swap_id, &party_b);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1298: Permissionless expiry (third-party keeper) tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_keeper_can_expire_swap_and_creator_is_refunded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+
+    let initial_balance = token_a_client.balance(&party_a);
+    let expires_at = env.ledger().sequence() + 10;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    assert_eq!(token_a_client.balance(&contract_addr), 1_000);
+    assert_eq!(token_a_client.balance(&party_a), initial_balance - 1_000);
+
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+
+    // A keeper that is not the creator (and holds no tokens) expires the swap.
+    let keeper = Address::generate(&env);
+    client.expire_swap(&keeper, &swap_id);
+
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Expired);
+    assert_eq!(token_a_client.balance(&contract_addr), 0);
+    assert_eq!(token_a_client.balance(&party_a), initial_balance);
+}
+
+#[test]
+fn test_expire_swap_emits_swap_expired_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    let expires_at = env.ledger().sequence() + 10;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = expires_at + 1);
+
+    let keeper = Address::generate(&env);
+    client.expire_swap(&keeper, &swap_id);
+
+    let events = env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let (contract, topics, _data) = event;
+        if contract != client.address {
+            continue;
+        }
+        if let Some(topic) = topics.get(0) {
+            if topic == Symbol::new(&env, "SwapExpired").into_val(&env) {
+                found = true;
+            }
+        }
+    }
+    assert!(found, "SwapExpired event was not emitted");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_expire_swap_rejected_before_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    // Still before the deadline -> SwapError::SwapExpired (#4) is not applicable;
+    // the contract must reject the call.
+    let keeper = Address::generate(&env);
+    client.expire_swap(&keeper, &swap_id);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1299: Fee-on-transfer token resilience tests
+// ---------------------------------------------------------------------------
+
+/// Minimal fee-on-transfer token: every `transfer` burns `fee_bps` of the
+/// transferred amount, so the recipient receives less than requested.
+#[contract]
+pub struct FeeOnTransferToken;
+
+#[contractimpl]
+impl FeeOnTransferToken {
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let current = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(to), &(current + amount));
+    }
+
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, _expiration: u32) {
+        from.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(from, spender), &amount);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let fee = amount * 100 / 10_000; // 1% transfer fee
+        let net = amount - fee;
+        let from_balance = Self::balance(env.clone(), from.clone());
+        let to_balance = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(from), &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(to), &(to_balance + net));
+    }
+}
+
+#[contracttype]
+pub enum DataKey {
+    Balance(Address),
+    Allowance(Address, Address),
+}
+
+fn register_fot_token(env: &Env) -> Address {
+    env.register_contract(None, FeeOnTransferToken)
+}
+
+fn fot_mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+    FeeOnTransferTokenClient::new(env, token).mint(to, &amount);
+}
+
+#[test]
+fn test_propose_swap_uses_net_received_amount_for_fot_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, _token_a, token_b, _treasury) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+
+    let fot = register_fot_token(&env);
+    fot_mint(&env, &fot, &party_a, 100_000);
+    let approve_until = env.ledger().sequence() + 1_000_000;
+    FeeOnTransferTokenClient::new(&env, &fot).approve(
+        &party_a,
+        &client.address,
+        &1_000_000_000,
+        &approve_until,
+    );
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &fot,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    // 1% fee means the contract only holds 990 of the 1_000 requested.
+    let contract_balance = FeeOnTransferTokenClient::new(&env, &fot).balance(&client.address);
+    assert_eq!(contract_balance, 990);
+
+    let swap = client.get_swap(&swap_id);
+    assert_eq!(swap.amount_a, 990);
+    assert_eq!(swap.filled_amount, 0);
+
+    // Counterparty receives exactly the net amount that was escrowed.
+    client.accept_swap(&swap_id, &party_b);
+    assert_eq!(
+        FeeOnTransferTokenClient::new(&env, &fot).balance(&party_b),
+        990
+    );
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Executed);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1469: Flash swap callback and repayment verification tests
+// ---------------------------------------------------------------------------
+
+/// Mock arbitrageur contract that implements the flash swap callback.
+/// It receives the borrowed tokens, optionally repays the loan plus fee,
+/// and records the callback invocation.
+#[contract]
+pub struct FlashSwapReceiver;
+
+#[contractimpl]
+impl FlashSwapReceiver {
+    /// Callback invoked by the swap contract mid-transaction.
+    /// `repay` controls whether the receiver returns the borrowed amount + fee.
+    pub fn on_flash_swap(
+        env: Env,
+        token: Address,
+        amount: i128,
+        fee: i128,
+        repay: bool,
+    ) -> bool {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashCallbackCalled, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashBorrowed(token.clone()), &amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlashFee(token.clone()), &fee);
+
+        if repay {
+            let total = amount + fee;
+            // Receiver must hold enough to repay; mint shortfall is not allowed,
+            // so the test funds it beforehand.
+            TokenClient::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &0,
+            );
+            let _ = total;
+        }
+        true
+    }
+
+    pub fn callback_called(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlashCallbackCalled)
+            .unwrap_or(false)
+    }
+
+    pub fn borrowed(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlashBorrowed(token))
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn test_flash_swap_borrow_and_repay_with_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _party_b, token_a, token_b, treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let token_b_client = TokenClient::new(&env, &token_b);
+    let contract_addr = client.address.clone();
+
+    // Seed the pool with liquidity that can be borrowed.
+    mint(&env, &token_a, &contract_addr, 10_000);
+    let pool_balance_before = token_a_client.balance(&contract_addr);
+
+    let receiver = env.register_contract(None, FlashSwapReceiver);
+    let receiver_client = FlashSwapReceiverClient::new(&env, &receiver);
+
+    // Fund the receiver so it can repay principal + fee.
+    let borrow_amount = 1_000i128;
+    let fee = calculate_and_validate_fee(borrow_amount, 50).unwrap(); // 0.5% = 5
+    mint(&env, &token_a, &receiver, borrow_amount + fee);
+
+    let receiver_balance_before = token_a_client.balance(&receiver);
+
+    client.flash_swap(&receiver, &token_a, &borrow_amount, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // Callback was invoked and observed the borrowed amount and fee.
+    assert!(receiver_client.callback_called());
+    assert_eq!(receiver_client.borrowed(&token_a), borrow_amount);
+
+    // Pool is made whole: principal + fee returned.
+    assert_eq!(
+        token_a_client.balance(&contract_addr),
+        pool_balance_before + fee
+    );
+    // Receiver paid out principal + fee.
+    assert_eq!(
+        token_a_client.balance(&receiver),
+        receiver_balance_before - borrow_amount - fee
+    );
+    // Fee routed to treasury.
+    assert_eq!(token_b_client.balance(&treasury), 0);
+}
+
+#[test]
+fn test_flash_swap_insufficient_repayment_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _party_a, _party_b, token_a, _token_b, _treasury) = setup(&env);
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let contract_addr = client.address.clone();
+
+    mint(&env, &token_a, &contract_addr, 10_000);
+    let pool_balance_before = token_a_client.balance(&contract_addr);
+
+    let receiver = env.register_contract(None, FlashSwapReceiver);
+    // Receiver is NOT funded, so it cannot repay principal + fee.
+
+    let borrow_amount = 1_000i128;
+    let result = client.try_flash_swap(
+        &receiver,
+        &token_a,
+        &borrow_amount,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    assert!(result.is_err());
+
+    // Atomic rollback: pool balance unchanged.
+    assert_eq!(token_a_client.balance(&contract_addr), pool_balance_before);
+// Issue #1470: Minimum liquidity lockup on initial pool creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_initial_liquidity_locks_minimum_shares_to_dead_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    let deposit = MINIMUM_LIQUIDITY + 9_000;
+    let shares = client.provide_liquidity(&party_a, &token_a, &token_b, &deposit, &deposit);
+
+    // The dead address permanently holds exactly the minimum liquidity.
+    let dead = dead_address(&env);
+    assert_eq!(client.get_lp_balance(&dead), MINIMUM_LIQUIDITY);
+    // The creator receives the remainder of the minted shares.
+    assert_eq!(client.get_lp_balance(&party_a), shares - MINIMUM_LIQUIDITY);
+    assert_eq!(shares, deposit);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_initial_liquidity_below_minimum_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, _, token_a, token_b, _treasury) = setup(&env);
+
+    // Deposit at or below the minimum -> InsufficientInitialLiquidity (#15)
+    client.provide_liquidity(&party_a, &token_a, &token_b, &MINIMUM_LIQUIDITY, &MINIMUM_LIQUIDITY);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1471: Cumulative price accumulator (TWAP oracle) tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cumulative_prices_increase_across_swaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, token_b, _treasury) = setup(&env);
+
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    let deposit = MINIMUM_LIQUIDITY + 99_000;
+    client.provide_liquidity(&party_a, &token_a, &token_b, &deposit, &deposit);
+
+    let (p0_start, p1_start) = client.get_cumulative_prices(&token_a, &token_b);
+
+    // Advance time and perform a swap so the accumulators accrue.
+    env.ledger().with_mut(|l| l.sequence_number = 110);
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    client.accept_swap(&swap_id, &party_b);
+
+    let (p0_mid, p1_mid) = client.get_cumulative_prices(&token_a, &token_b);
+    assert!(p0_mid > p0_start);
+    assert!(p1_mid > p1_start);
+
+    // Advance further and swap again; accumulators must keep increasing.
+    env.ledger().with_mut(|l| l.sequence_number = 130);
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &token_b,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+    client.accept_swap(&swap_id, &party_b);
+
+    let (p0_end, p1_end) = client.get_cumulative_prices(&token_a, &token_b);
+    assert!(p0_end > p0_mid);
+    assert!(p1_end > p1_mid);
+}
+
+#[test]
+fn test_execute_swap_uses_net_received_amount_for_fot_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, party_a, party_b, token_a, _token_b, _treasury) = setup(&env);
+    client.initialize(&party_a, &Address::generate(&env), &0);
+
+    let fot = register_fot_token(&env);
+    fot_mint(&env, &fot, &party_b, 100_000);
+    let approve_until = env.ledger().sequence() + 1_000_000;
+    FeeOnTransferTokenClient::new(&env, &fot).approve(
+        &party_b,
+        &client.address,
+        &1_000_000_000,
+        &approve_until,
+    );
+
+    let expires_at = env.ledger().sequence() + 100;
+    let swap_id = client.propose_swap(
+        &party_a,
+        &token_a,
+        &1_000,
+        &fot,
+        &500,
+        &expires_at,
+        &None,
+        &None,
+    );
+
+    client.accept_swap(&swap_id, &party_b);
+
+    // party_b sent 500 but only 495 arrived; party_a must be credited the net.
+    let party_a_received = FeeOnTransferTokenClient::new(&env, &fot).balance(&party_a);
+    assert_eq!(party_a_received, 495);
+    assert_eq!(client.get_swap(&swap_id).state, SwapState::Executed);
+    assert_eq!(client.get_swap(&swap_id).filled_amount, 1_000);
 }

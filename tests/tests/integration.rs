@@ -495,7 +495,7 @@ fn deploy_nft<'a>(env: &'a Env, admin: &Address) -> (NftContractClient<'a>, Addr
         admin,
         &String::from_str(env, "Test NFT"),
         &String::from_str(env, "TNFT"),
-        &10u32,
+        &Some(10u32),
         &None,
         &None,
     );
@@ -555,14 +555,14 @@ fn test_marketplace_full_lifecycle_with_royalty() {
     nft.approve(&token_id, &marketplace_addr);
 
     // Seller lists the NFT
-    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &price);
+    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &price, &token_addr);
     let listing = marketplace.get_listing(&listing_id).unwrap();
     assert_eq!(listing.seller, seller);
     assert_eq!(listing.price, price);
     assert_eq!(listing.active, true);
 
     // Buyer purchases the NFT
-    marketplace.buy(&buyer, &listing_id);
+    marketplace.buy(&buyer, &listing_id, &price);
 
     // Verify NFT ownership transferred to buyer
     assert_eq!(nft.owner_of(&token_id), buyer);
@@ -613,7 +613,7 @@ fn test_marketplace_cancel_listing() {
 
     // Seller approves and lists the NFT
     nft.approve(&token_id, &marketplace_addr);
-    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &1_000i128);
+    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &1_000i128, &token_addr);
 
     // Seller cancels the listing
     marketplace.cancel(&seller, &listing_id);
@@ -629,6 +629,134 @@ fn test_marketplace_cancel_listing() {
 // ── #855: auction integration test ───────────────────────────────────────────
 
 use soroban_auction_template::{AuctionContract, AuctionContractClient};
+
+// ── #1462 / #1463: crowdfund milestone tranches & deadline enforcement ───────
+
+use soroban_crowdfund_template::{
+    CampaignStatus, ContractError, CrowdfundContract, CrowdfundContractClient, Milestone,
+};
+
+fn deploy_crowdfund<'a>(env: &'a Env) -> (CrowdfundContractClient<'a>, Address) {
+    let addr = env.register_contract(None, CrowdfundContract);
+    let client = CrowdfundContractClient::new(env, &addr);
+    (client, addr)
+}
+
+/// Full milestone-gated disbursement flow (#1462) plus post-deadline pledge
+/// rejection (#1463).
+///
+/// Verifies that:
+/// - Backers can pledge into a live campaign and funds are held by the contract.
+/// - A milestone release request opens a weighted backer vote.
+/// - Votes accumulate until the required quorum is reached.
+/// - Releasing the tranche pays the creator exactly the tranche amount while the
+///   remaining raised capital stays locked in the contract.
+/// - A pledge submitted after the campaign deadline is rejected with
+///   `ContractError::CampaignExpired`.
+#[test]
+fn test_crowdfund_milestone_approval_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let backer1 = Address::generate(&env);
+    let backer2 = Address::generate(&env);
+    let backer3 = Address::generate(&env);
+
+    // SAC token used for pledges and disbursements
+    let sac = env.register_stellar_asset_contract_v2(creator.clone());
+    let token_addr = sac.address();
+    let sac_client = StellarAssetClient::new(&env, &token_addr);
+    let token = soroban_sdk::token::Client::new(&env, &token_addr);
+
+    let pledge1 = 4_000i128;
+    let pledge2 = 3_000i128;
+    let pledge3 = 3_000i128;
+    let total_raised = pledge1 + pledge2 + pledge3; // 10 000
+    sac_client.mint(&backer1, &pledge1);
+    sac_client.mint(&backer2, &pledge2);
+    sac_client.mint(&backer3, &pledge3);
+
+    let (crowdfund, crowdfund_addr) = deploy_crowdfund(&env);
+
+    // Two milestones: 40 % then 60 % of the raise.
+    let tranche1 = 4_000i128;
+    let tranche2 = 6_000i128;
+    let mut milestones = SorobanVec::new(&env);
+    milestones.push_back(Milestone {
+        description: String::from_str(&env, "Prototype"),
+        amount: tranche1,
+        approved: false,
+        released: false,
+    });
+    milestones.push_back(Milestone {
+        description: String::from_str(&env, "Production"),
+        amount: tranche2,
+        approved: false,
+        released: false,
+    });
+
+    let deadline = env.ledger().timestamp() + 1_000;
+    let quorum_bps = 5_000u32; // 50 % of pledged weight must approve
+
+    crowdfund.initialize(
+        &creator,
+        &token_addr,
+        &total_raised,
+        &deadline,
+        &milestones,
+        &quorum_bps,
+    );
+
+    // ── Backers pledge while the campaign is live ────────────────────────
+    crowdfund.pledge(&backer1, &pledge1);
+    crowdfund.pledge(&backer2, &pledge2);
+    crowdfund.pledge(&backer3, &pledge3);
+
+    assert_eq!(token.balance(&crowdfund_addr), total_raised);
+    assert_eq!(token.balance(&creator), 0);
+    assert_eq!(crowdfund.get_status(), CampaignStatus::Funded);
+
+    // ── Request release of the first milestone tranche ───────────────────
+    crowdfund.request_milestone_release(&creator, &0u32);
+
+    // Weighted votes: backer1 (40 %) alone is below the 50 % quorum.
+    crowdfund.vote_milestone(&backer1, &0u32, &true);
+    assert!(!crowdfund.is_milestone_approved(&0u32));
+
+    // backer2 (30 %) pushes approval weight to 70 % → quorum reached.
+    crowdfund.vote_milestone(&backer2, &0u32, &true);
+    assert!(crowdfund.is_milestone_approved(&0u32));
+
+    // ── Release the approved tranche ─────────────────────────────────────
+    crowdfund.release_milestone(&creator, &0u32);
+
+    // Creator receives exactly the first tranche; the rest stays locked.
+    assert_eq!(token.balance(&creator), tranche1);
+    assert_eq!(token.balance(&crowdfund_addr), total_raised - tranche1);
+    assert_eq!(token.balance(&crowdfund_addr), tranche2);
+
+    // ── Second tranche still requires its own approval ───────────────────
+    crowdfund.request_milestone_release(&creator, &1u32);
+    crowdfund.vote_milestone(&backer3, &1u32, &true);
+    assert!(!crowdfund.is_milestone_approved(&1u32));
+    crowdfund.vote_milestone(&backer1, &1u32, &true);
+    assert!(crowdfund.is_milestone_approved(&1u32));
+
+    crowdfund.release_milestone(&creator, &1u32);
+    assert_eq!(token.balance(&creator), total_raised);
+    assert_eq!(token.balance(&crowdfund_addr), 0);
+
+    // ── #1463: pledges after the deadline are rejected ───────────────────
+    env.ledger().with_mut(|l| l.timestamp = deadline + 1);
+
+    let late_backer = Address::generate(&env);
+    sac_client.mint(&late_backer, &1_000i128);
+    let late = crowdfund.try_pledge(&late_backer, &1_000i128);
+    assert_eq!(late, Err(Ok(ContractError::CampaignExpired)));
+    assert_eq!(token.balance(&late_backer), 1_000);
+    assert_eq!(token.balance(&crowdfund_addr), 0);
+}
 
 fn deploy_auction<'a>(env: &'a Env) -> (AuctionContractClient<'a>, Address) {
     let addr = env.register_contract(None, AuctionContract);
@@ -678,6 +806,11 @@ fn test_auction_full_lifecycle_competing_bids_and_withdrawal() {
         &deadline,
         &None,
         &0,
+        &u32::MAX,
+        &0,
+        &0,
+        &None,
+        &None,
     );
 
     // bidder1 places the opening bid at start_price
@@ -740,6 +873,11 @@ fn test_auction_reserve_not_met_refunds_bidder() {
         &deadline,
         &Some(reserve_price),
         &0,
+        &u32::MAX,
+        &0,
+        &0,
+        &None,
+        &None,
     );
 
     // bid below reserve
@@ -753,6 +891,126 @@ fn test_auction_reserve_not_met_refunds_bidder() {
     assert_eq!(token.balance(&bidder), 50_000);
     assert_eq!(token.balance(&seller), 0);
     assert_eq!(token.balance(&auction_addr), 0);
+}
+
+/// Custodial NFT auction with refund-credit counter-bidding (#1068, #1069, #1070).
+///
+/// Verifies that:
+/// - The NFT is escrowed into the auction contract on `start`.
+/// - An outbid bidder can counter-bid with `bid_with_credit`, paying only the delta.
+/// - `end` pays the seller and delivers the NFT to the winner atomically.
+/// - The contract is left holding exactly the losing bidder's pending refund.
+#[test]
+fn test_auction_custodial_nft_with_credit_counter_bid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let bidder1 = Address::generate(&env);
+    let bidder2 = Address::generate(&env);
+    let nft_admin = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(seller.clone());
+    let token_addr = sac.address();
+    let sac_client = StellarAssetClient::new(&env, &token_addr);
+    sac_client.mint(&bidder1, &10_000);
+    sac_client.mint(&bidder2, &10_000);
+    let token = soroban_sdk::token::Client::new(&env, &token_addr);
+
+    let (nft, nft_addr) = deploy_nft(&env, &nft_admin);
+    let token_id = nft.mint(
+        &seller,
+        &String::from_str(&env, "ipfs://auction-lot"),
+        &None,
+        &None,
+    );
+
+    let (auction, auction_addr) = deploy_auction(&env);
+    let deadline = env.ledger().sequence() + 100;
+    auction.start(
+        &seller,
+        &token_addr,
+        &1_000,
+        &100,
+        &deadline,
+        &Some(1_500i128),
+        &0,
+        &Some(nft_addr),
+        &Some(token_id),
+    );
+    assert_eq!(nft.owner_of(&token_id), auction_addr);
+
+    auction.bid(&bidder1, &1_000);
+    auction.bid(&bidder2, &1_200);
+    assert_eq!(auction.get_pending(&bidder1), 1_000);
+
+    // bidder1 counter-bids 1 600 using the 1 000 credit: only 600 leaves the wallet.
+    auction.bid_with_credit(&bidder1, &1_600);
+    assert_eq!(token.balance(&bidder1), 10_000 - 1_000 - 600);
+    assert_eq!(auction.get_pending(&bidder1), 0);
+    assert_eq!(auction.get_pending(&bidder2), 1_200);
+
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    auction.end();
+
+    assert_eq!(nft.owner_of(&token_id), bidder1);
+    assert_eq!(token.balance(&seller), 1_600);
+    assert_eq!(token.balance(&auction_addr), 1_200);
+
+    auction.withdraw(&bidder2);
+    assert_eq!(token.balance(&bidder2), 10_000);
+    assert_eq!(token.balance(&auction_addr), 0);
+}
+
+/// Dutch auction with custodial NFT: `buy` settles payment and delivery at once (#1071).
+#[test]
+fn test_dutch_auction_custodial_nft_buy() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let nft_admin = Address::generate(&env);
+
+    let sac = env.register_stellar_asset_contract_v2(seller.clone());
+    let token_addr = sac.address();
+    StellarAssetClient::new(&env, &token_addr).mint(&buyer, &10_000);
+    let token = soroban_sdk::token::Client::new(&env, &token_addr);
+
+    let (nft, nft_addr) = deploy_nft(&env, &nft_admin);
+    let token_id = nft.mint(
+        &seller,
+        &String::from_str(&env, "ipfs://dutch-auction-lot"),
+        &None,
+        &None,
+    );
+
+    let (auction, auction_addr) = deploy_auction(&env);
+    let start_ledger = env.ledger().sequence();
+    auction.start_dutch(
+        &seller,
+        &token_addr,
+        &8_000,
+        &2_000,
+        &start_ledger,
+        &60,
+        &Some(nft_addr),
+        &Some(token_id),
+    );
+    assert_eq!(nft.owner_of(&token_id), auction_addr);
+
+    // Halfway through the schedule the price is (8 000 + 2 000) / 2.
+    env.ledger()
+        .with_mut(|l| l.sequence_number = start_ledger + 30);
+    assert_eq!(auction.get_current_price(), 5_000);
+
+    let paid = auction.buy(&buyer, &5_000);
+    assert_eq!(paid, 5_000);
+    assert_eq!(nft.owner_of(&token_id), buyer);
+    assert_eq!(token.balance(&seller), 5_000);
+    assert_eq!(token.balance(&buyer), 5_000);
+    assert_eq!(token.balance(&auction_addr), 0);
+    assert!(auction.get_info().settled);
 }
 
 // ── #856: lottery integration test ───────────────────────────────────────────
@@ -943,7 +1201,7 @@ fn test_marketplace_nft_token_end_to_end() {
 
     // ── Seller approves marketplace to transfer the NFT, then lists it ───
     nft.approve(&token_id, &marketplace_addr);
-    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &price);
+    let listing_id = marketplace.list(&seller, &nft_addr, &token_id, &price, &token_addr);
 
     // Confirm listing is active
     let listing = marketplace.get_listing(&listing_id).unwrap();
@@ -952,7 +1210,7 @@ fn test_marketplace_nft_token_end_to_end() {
     assert!(listing.active);
 
     // ── Buyer purchases the NFT ──────────────────────────────────────────
-    marketplace.buy(&buyer, &listing_id);
+    marketplace.buy(&buyer, &listing_id, &price);
 
     // ── Assert NFT ownership transferred ────────────────────────────────
     assert_eq!(nft.owner_of(&token_id), buyer);
@@ -1045,8 +1303,10 @@ fn test_marketplace_nft_token_with_per_token_royalty() {
 
     // ── List and buy ─────────────────────────────────────────────────────
     nft.approve(&token_id, &marketplace_addr);
-    let listing_id = marketplace.list(&seller, &nft_addr_raw, &token_id, &sale_price);
+    let listing_id = marketplace.list(&seller, &nft_addr_raw, &token_id, &sale_price, &token_addr);
     marketplace.buy(&buyer, &listing_id);
+    let listing_id = marketplace.list(&seller, &nft_addr_raw, &token_id, &sale_price);
+    marketplace.buy(&buyer, &listing_id, &sale_price);
 
     // Buyer owns the NFT
     assert_eq!(nft.owner_of(&token_id), buyer);

@@ -337,7 +337,7 @@ Property tests live in `prop_test.rs` inside each contract and run as part of th
 ### Benchmarks
 
 ```bash
-cargo bench -p benches
+cargo bench -p contract-benchmarks
 ```
 
 ### Build WASM artifacts

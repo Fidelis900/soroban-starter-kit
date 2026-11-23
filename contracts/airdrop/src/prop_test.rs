@@ -35,7 +35,7 @@ proptest! {
         let client = AirdropContractClient::new(&env, &airdrop_addr);
 
         let deadline = env.ledger().sequence() + 1000;
-        let _ = client.try_initialize(&admin, &token_addr, &deadline);
+        let _ = client.try_initialize(&admin, &deadline, &None);
 
         // Fund airdrop
         StellarAssetClient::new(&env, &token_addr).transfer(&admin, &airdrop_addr, &initial_supply);
@@ -44,7 +44,7 @@ proptest! {
 
         // Try to claim (will likely fail without valid proof, but that's ok)
         let proof = Vec::new(&env);
-        let _ = client.try_claim(&claimer, &claim_amount, &proof);
+        let _ = client.try_claim(&claimer, &token_addr, &claim_amount, &0u32, &proof);
 
         let contract_balance_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&airdrop_addr);
         let claimed = contract_balance_before - contract_balance_after;
@@ -78,18 +78,18 @@ proptest! {
         let client = AirdropContractClient::new(&env, &airdrop_addr);
 
         let deadline = env.ledger().sequence() + 1000;
-        client.initialize(&admin, &token_addr, &deadline);
+        client.initialize(&admin, &deadline, &None);
 
         StellarAssetClient::new(&env, &token_addr).transfer(&admin, &airdrop_addr, &(amount * 2));
 
         let proof = Vec::new(&env);
 
         // First claim
-        let first_claim = client.try_claim(&claimer, &amount, &proof);
+        let first_claim = client.try_claim(&claimer, &token_addr, &amount, &0u32, &proof);
 
         // Second claim (should fail if first succeeded)
         if first_claim.is_ok() {
-            let second_claim = client.try_claim(&claimer, &amount, &proof);
+            let second_claim = client.try_claim(&claimer, &token_addr, &amount, &0u32, &proof);
             prop_assert!(second_claim.is_err(), "Double claim should be prevented");
         }
     }

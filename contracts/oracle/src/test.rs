@@ -193,3 +193,102 @@ fn test_get_median_price_all_stale_fails() {
     // max_staleness = 1000 seconds, all submissions age > 1000 → NoPublisherData
     client.get_median_price(&1000);
 }
+
+// ---------------------------------------------------------------------------
+// #1258 — update_price rejects zero and negative prices
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_price_zero_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    client.update_price(&0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_price_negative_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    client.update_price(&-1);
+}
+
+// ---------------------------------------------------------------------------
+// #1259 — Multi-asset price feed with decimals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_update_asset_price_and_get_price_for() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let asset = soroban_sdk::symbol_short!("XLM");
+    client.update_asset_price(&asset, &7_500_000i128, &7u32);
+    assert_eq!(client.get_price_for(&asset), 7_500_000i128);
+}
+
+#[test]
+fn test_get_decimals_for_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let asset = soroban_sdk::symbol_short!("BTC");
+    client.update_asset_price(&asset, &30_000_000_000i128, &8u32);
+    assert_eq!(client.get_decimals(&asset), 8u32);
+}
+
+#[test]
+fn test_get_asset_feed_full_snapshot() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let asset = soroban_sdk::symbol_short!("USDC");
+    client.update_asset_price(&asset, &10_000_000i128, &7u32);
+    let feed = client.get_asset_feed(&asset);
+    assert_eq!(feed.price, 10_000_000i128);
+    assert_eq!(feed.decimals, 7u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_get_price_for_unknown_asset_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let unknown = soroban_sdk::symbol_short!("UNKWN");
+    client.get_price_for(&unknown);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_asset_price_zero_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let asset = soroban_sdk::symbol_short!("XLM");
+    client.update_asset_price(&asset, &0i128, &7u32);
+}
+
+#[test]
+fn test_multiple_assets_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let xlm = soroban_sdk::symbol_short!("XLM");
+    let btc = soroban_sdk::symbol_short!("BTC");
+
+    client.update_asset_price(&xlm, &1_000_000i128, &7u32);
+    client.update_asset_price(&btc, &50_000_000_000i128, &8u32);
+
+    assert_eq!(client.get_price_for(&xlm), 1_000_000i128);
+    assert_eq!(client.get_price_for(&btc), 50_000_000_000i128);
+    assert_eq!(client.get_decimals(&xlm), 7u32);
+    assert_eq!(client.get_decimals(&btc), 8u32);
+}

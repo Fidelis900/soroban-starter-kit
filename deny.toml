@@ -31,9 +31,13 @@ skip = [
     { crate = "darling@0.20.11", reason = "soroban-sdk-macros requires 0.20; serde_with_macros requires 0.23" },
     { crate = "darling_core@0.20.11", reason = "transitive dep of darling 0.20" },
     { crate = "darling_macro@0.20.11", reason = "transitive dep of darling 0.20" },
-    # getrandom 0.2 is reached via k256 -> soroban-env-host -> soroban-sdk;
-    # getrandom 0.4 is dev-only via tempfile -> proptest and never ships in WASM.
-    { crate = "getrandom@0.2.17", reason = "required by soroban-env-host crypto stack (rand_core 0.6); 0.4 is dev-only via proptest/tempfile" },
+    # getrandom is linked at three versions. 0.2 is reached via k256 ->
+    # soroban-env-host -> soroban-sdk; 0.3 is a build-time dep via jobserver
+    # 0.1.34 (cc); 0.4 is dev-only via tempfile -> proptest and never ships in
+    # WASM. None can be unified without upstream bumps, so all three are skipped.
+    { crate = "getrandom@0.2.17", reason = "required by soroban-env-host crypto stack (rand_core 0.6)" },
+    { crate = "getrandom@0.3.4", reason = "build-time dep via jobserver 0.1.34 (cc); not linked into the shipped WASM" },
+    { crate = "getrandom@0.4.3", reason = "dev-only via tempfile -> proptest; never ships in WASM" },
     # itertools 0.11 is required by soroban-builtin-sdk-macros (in the pinned SDK
     # tree); itertools 0.10 is dev-only via the criterion benchmark harness.
     { crate = "itertools@0.10.5", reason = "criterion benchmark harness requires 0.10; soroban-builtin-sdk-macros requires 0.11" },

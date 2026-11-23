@@ -14,8 +14,25 @@ mkdir -p "$RESULTS_DIR"
 
 # ── list of (bench-name  package) pairs ────────────────────────────────────
 declare -a BENCHES=(
-    "escrow_ops contract-benchmarks"
-    "token_ops  contract-benchmarks"
+    "escrow_ops        contract-benchmarks"
+    "token_ops         contract-benchmarks"
+    "merkle_ops        contract-benchmarks"
+    "swap_ops          contract-benchmarks"
+    "staking_ops       contract-benchmarks"
+    "vesting_ops       contract-benchmarks"
+    "dao_ops           contract-benchmarks"
+    "multisig_ops      contract-benchmarks"
+    "marketplace_ops   contract-benchmarks"
+    "auction_ops       contract-benchmarks"
+    "airdrop_ops       contract-benchmarks"
+    "ballot_ops        contract-benchmarks"
+    "bonding_curve_ops contract-benchmarks"
+    "crowdfund_ops     contract-benchmarks"
+    "lottery_ops       contract-benchmarks"
+    "nft_ops           contract-benchmarks"
+    "oracle_ops        contract-benchmarks"
+    "subscription_ops  contract-benchmarks"
+    "timelock_ops      contract-benchmarks"
 )
 
 PASS=0

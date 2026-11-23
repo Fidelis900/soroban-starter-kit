@@ -107,11 +107,16 @@ This document details the storage keys, types, and TTL management policy for eac
 | `Weights` | Instance | `Map<Address, u32>` | Extended on init / signer change | Per-signer vote weight for weighted voting; signers not listed default to 1 |
 | `Threshold` | Instance | `u32` | Extended on threshold change | Required number of signatures (N-of-M) |
 | `NextTransactionId` | Instance | `u64` | Extended on proposal | Auto-incrementing transaction ID counter |
-| `Transaction(u64)` | Persistent | `Transaction` | Extended on propose/sign/execute | Proposed transaction details and signatures |
+| `Transaction(u64)` | Persistent | `Transaction` | Extended on propose/sign/execute/GC | Proposed transaction details, signatures, expiration, and execution status |
+| `ConfigNonce` | Instance | `u64` | Extended on init / `replace_signer` | Monotonic configuration nonce; incremented on every signer-set change to invalidate stale approvals |
 | `Paused` | Instance | `bool` | Extended on pause/unpause | Whether contract is paused |
 | `Version` | Instance | `u32` | Extended on init | Contract version number |
 
-**Transaction Struct:** Contains proposer, target, function name, arguments, signatures, and execution status.
+**Transaction Struct:** Contains proposer, target, function name, arguments, signatures, execution status, and `expiry_ledger` — the ledger sequence after which the proposal can no longer be executed.
+
+**Proposal Expiration:** `expiry_ledger` is recorded at `propose` time (current ledger + a configurable expiration window). `execute` rejects any proposal whose `expiry_ledger` has been passed, so stale proposals cannot be executed months later. Because unexecuted proposals otherwise linger in persistent storage indefinitely (consuming rent and creating accidental-execution risk), a garbage-collection entry point removes expired proposals from storage; anyone may call it, and it only deletes proposals that are already past `expiry_ledger` and not yet executed.
+
+**Signer Replacement:** `replace_signer(old_signer, new_signer)` requires full threshold approval, rejects a `new_signer` that is already an authorized signer, and increments `ConfigNonce`. Pending transactions signed by the old key are invalidated by the nonce bump, so approvals gathered before the replacement cannot be replayed against the new signer set.
 
 ---
 
@@ -268,10 +273,14 @@ Uses per-address persistent storage (`TicketCount`) for the ticket cap, while th
 | `RoyaltyBps` | Instance | `u32` | Extended on init | Royalty in basis points (e.g. `250` = 2.5%) |
 | `RoyaltyRecipient` | Instance | `Address` | Extended on init | Royalty recipient address |
 | `NextListingId` | Instance | `u64` | Extended on `list` | Auto-incrementing listing ID counter |
+| `StakingContract` | Instance | `Option<Address>` | Extended on init / `set_staking_contract` | Optional staking contract queried for fee-discount tiers; `None` disables discounts |
+| `MinCounterOfferBps` | Instance | `u32` | Extended on init / `set_min_counter_offer_bps` | Minimum percentage increment (basis points) required for a counter-offer over the current highest offer on a listing |
 | `Listing(u64)` | Persistent | `Listing` | Extended on list/buy/cancel | Per-listing seller, price, and active state |
-| `Offer(u64, Address)` | Persistent | `i128` | Extended on offer activity | Escrowed offer amount for a `(listing_id, buyer)` pair |
+| `Offer(u64, Address)` | Persistent | `Offer` | Extended on offer activity | Escrowed offer for a `(listing_id, buyer)` pair |
 
-Per-listing (`Listing(u64)`) and per-`(listing, buyer)` (`Offer`) persistent keys let each listing/offer expire independently of the shared instance config. See `contract-api.md` and `error-reference.md` for a note on `contracts/marketplace/src/lib.rs` currently containing corrupted/duplicated code — this storage layout reflects the authoritative `storage.rs` definitions.
+**`Offer` fields:** `amount`, `expiration_ledger`
+
+Per-listing (`Listing(u64)`) and per-`(listing, buyer)` (`Offer`) persistent keys let each listing/offer expire independently of the shared instance config. Each `Offer` records an `expiration_ledger` set at `make_offer` time; `accept_offer` rejects offers past that ledger, and anyone may call `expire_offer` to refund the escrowed funds to the bidder once expired. When `StakingContract` is configured, the marketplace queries the buyer's/seller's staked balance there to apply a tiered fee discount (20–50% off) before charging the trading fee. See `contract-api.md` and `error-reference.md` for a note on `contracts/marketplace/src/lib.rs` currently containing corrupted/duplicated code — this storage layout reflects the authoritative `storage.rs` definitions.
 
 ---
 
@@ -350,13 +359,13 @@ Per-subscriber (`Subscription(Address)`) and per-plan (`Plan(Symbol)`) persisten
 | `Treasury` | Instance | `Address` | Extended on `set_treasury` | Fee-collection treasury address |
 | `FeeBps` | Instance | `u32` | Extended on init/`set_fee_bps` | Swap fee in basis points |
 
-### Persistent-Storage Keys (`SwapKey`)
+### Persistent-Storage Keys (`DataKey`)
 
 | Key | Tier | Type | TTL Policy | Description |
 |-----|------|------|------------|-------------|
 | `Swap(u32)` | Persistent | `SwapInfo` | Extended on propose/accept/cancel | Per-swap parties, tokens, amounts, expiry, and state |
 
-Per-swap persistent storage (`Swap(u32)`) lets each proposed swap expire independently of the shared instance config. See `error-reference.md`'s Swap section for a note on `contracts/swap/src/lib.rs` currently containing corrupted/duplicated code; this storage layout reflects the authoritative `storage.rs` definitions.
+Per-swap persistent storage (`DataKey::Swap(u32)`) lets each proposed swap expire independently of the shared instance configuration. The contract bumps the record TTL whenever a swap is proposed, read, accepted, or cancelled, while the instance tier contains only configuration and the monotonic counter.
 
 ---
 

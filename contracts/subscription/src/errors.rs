@@ -20,6 +20,28 @@ pub enum SubscriptionError {
     PlanAlreadyExists = 11,
     PlanNotFound = 12,
     PlanInactive = 13,
+    /// Prepay discount is outside 0..=10_000 basis points.
+    InvalidDiscount = 14,
+    /// A billing calculation overflowed.
+    ArithmeticOverflow = 15,
+    /// Subscription was suspended for non-payment after its grace period expired.
+    SubscriptionSuspended = 16,
+    /// The current billing period is due or overdue and must be charged first.
+    PaymentOverdue = 17,
+    /// Referral voucher discount is outside 0..=10_000 basis points.
+    InvalidVoucher = 18,
+    /// Provider has not configured a minimum payout threshold.
+    PayoutThresholdNotSet = 20,
+    /// Accumulated revenue is below the provider's minimum payout threshold.
+    BelowPayoutThreshold = 21,
+    /// Payout threshold must be positive.
+    InvalidPayoutThreshold = 22,
+    /// A fixed-term subscription must allow at least one billing cycle.
+    InvalidMaxBillingCycles = 23,
+    /// The caller is not a registered keeper bot.
+    KeeperNotRegistered = 24,
+    /// Keeper bounty is outside 0..=10_000 basis points.
+    InvalidBounty = 25,
 }
 
 impl_display_error!(
@@ -37,6 +59,17 @@ impl_display_error!(
     PlanAlreadyExists      => "plan already exists",
     PlanNotFound           => "plan not found",
     PlanInactive           => "plan inactive",
+    InvalidDiscount        => "invalid discount",
+    ArithmeticOverflow     => "arithmetic overflow",
+    SubscriptionSuspended  => "subscription suspended",
+    PaymentOverdue         => "payment overdue",
+    InvalidVoucher         => "invalid voucher",
+    PayoutThresholdNotSet  => "payout threshold not set",
+    BelowPayoutThreshold   => "accumulated revenue is below payout threshold",
+    InvalidPayoutThreshold => "payout threshold must be positive",
+    InvalidMaxBillingCycles => "max billing cycles must be at least one",
+    KeeperNotRegistered    => "caller is not a registered keeper",
+    InvalidBounty          => "invalid keeper bounty",
 );
 
 #[cfg(test)]

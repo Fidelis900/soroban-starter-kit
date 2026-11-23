@@ -867,3 +867,393 @@ groups:
 ```
 
 The 10% warning threshold is intended to identify degradation before it becomes a widespread outage. The 25% critical threshold requires at least 20 attempts so that a low-volume contract does not page on a single failure. The burst rule is complementary: it detects a sustained absolute spike and is useful for contracts with uneven traffic. Route alerts by `contract_id`, include the deployment environment in the metric labels, and link each alert to the relevant runbook and transaction/event dashboard.
+
+
+---
+
+## 13. TTL Monitoring and Automated Renewal (Issue #1214)
+
+Soroban ledger entries have a Time-To-Live (TTL). When a contract's instance
+storage or persistent keys fall below `LEDGER_LIFETIME_THRESHOLD` (~7 days at
+5 s/ledger ≈ 120 960 ledgers), the entry enters an **archived** state. An
+archived entry is not directly readable and must be restored via
+`restoreFootprint` before the contract can process transactions — this is an
+operational incident. Proactive TTL renewal prevents archival from ever
+occurring in production.
+
+### TTL constants (from soroban-common)
+
+| Constant | Value | Approximate time |
+|----------|------:|-----------------|
+| `LEDGER_LIFETIME_THRESHOLD` | 120 960 ledgers | ~7 days |
+| `LEDGER_BUMP_AMOUNT` | 518 400 ledgers | ~30 days |
+
+Every state-mutating contract function calls `extend_ttl_instance` / `extend_ttl_persistent`,
+which bumps the TTL to `LEDGER_BUMP_AMOUNT` when it falls below `LEDGER_LIFETIME_THRESHOLD`.
+The TTL daemon is a belt-and-suspenders measure for contracts that may be
+idle for extended periods (e.g., timelocks awaiting their release ledger).
+
+### scripts/renew-ttl.py
+
+The daemon script is at [`scripts/renew-ttl.py`](../scripts/renew-ttl.py).
+It queries TTL via the Soroban RPC `getLedgerEntries` endpoint, submits
+`extendFootprintTtl` transactions via the `stellar` CLI when entries are near
+expiry, and sends webhook alerts when entries enter the alert window.
+
+#### Quick start
+
+```bash
+# Install dependencies
+pip install requests stellar-sdk
+
+# Create a config file (see script docstring for full schema)
+cat > renew-ttl.json <<'EOF'
+{
+  "rpc_url": "https://soroban-testnet.stellar.org",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "source_account": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "contracts": [
+    { "id": "CTOKEN...", "name": "token",  "keys": ["instance"] },
+    { "id": "CESCROW.", "name": "escrow",  "keys": ["instance"] },
+    { "id": "CSUBS...", "name": "subscription", "keys": ["instance"] }
+  ],
+  "ledger_lifetime_threshold": 120960,
+  "ledger_bump_amount": 518400,
+  "alert_threshold_ledgers": 17280,
+  "poll_interval_seconds": 300,
+  "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+}
+EOF
+
+# Dry run first (no transactions submitted)
+python3 scripts/renew-ttl.py --config renew-ttl.json --dry-run
+
+# One-shot check and exit
+python3 scripts/renew-ttl.py --config renew-ttl.json --once
+
+# Run as a daemon (polls every poll_interval_seconds)
+STELLAR_SECRET_KEY=SXXX... python3 scripts/renew-ttl.py --config renew-ttl.json
+```
+
+#### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `STELLAR_SECRET_KEY` | Signing key for `extendFootprintTtl` transactions |
+| `RPC_URL` | Override `rpc_url` in config |
+| `NETWORK_PASSPHRASE` | Override `network_passphrase` in config |
+| `WEBHOOK_URL` | Override `webhook_url` in config |
+
+#### Running as a systemd service
+
+```ini
+# /etc/systemd/system/soroban-ttl-renew.service
+[Unit]
+Description=Soroban TTL Renewal Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=soroban
+WorkingDirectory=/opt/soroban
+ExecStart=/usr/bin/python3 /opt/soroban/scripts/renew-ttl.py --config /etc/soroban/renew-ttl.json
+Environment=STELLAR_SECRET_KEY=SXXX...
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now soroban-ttl-renew
+journalctl -u soroban-ttl-renew -f
+```
+
+#### Running in Kubernetes (CronJob)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: soroban-ttl-renew
+spec:
+  schedule: "*/5 * * * *"   # Every 5 minutes
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: renew-ttl
+              image: python:3.12-slim
+              command:
+                - python3
+                - /scripts/renew-ttl.py
+                - --config
+                - /config/renew-ttl.json
+                - --once
+              env:
+                - name: STELLAR_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: stellar-keys
+                      key: secret-key
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: config
+              configMap:
+                name: soroban-ttl-config
+            - name: scripts
+              configMap:
+                name: soroban-scripts
+```
+
+### Prometheus alert rules for TTL
+
+Add these to your Prometheus rules file. They assume the daemon exports
+metrics via a Prometheus pushgateway or a metrics exporter sidecar.
+
+```yaml
+groups:
+  - name: soroban-ttl
+    rules:
+      - alert: SorobanEntryApproachingArchival
+        expr: |
+          soroban_ttl_remaining_ledgers < 17280
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Soroban entry TTL low: {{ $labels.contract_name }}"
+          description: |
+            Contract {{ $labels.contract_name }} ({{ $labels.contract_id }})
+            has only {{ $value }} ledgers (~{{ printf "%.1f" (div $value 720.0) }} hours)
+            before archival. Check that renew-ttl.py is running and STELLAR_SECRET_KEY is set.
+
+      - alert: SorobanEntryArchivedOrMissing
+        expr: |
+          soroban_ttl_entry_missing == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Soroban entry archived or missing: {{ $labels.contract_name }}"
+          description: |
+            The entry for {{ $labels.contract_name }} ({{ $labels.contract_id }})
+            could not be found via getLedgerEntries. It may already be archived.
+            Run 'stellar contract restore --id <CONTRACT_ID>' immediately to restore it.
+```
+
+### Recovering from archival
+
+If an entry has already been archived before the daemon could renew it:
+
+```bash
+# Restore the archived entry (requires a funded account)
+stellar contract restore \
+  --id <CONTRACT_ID> \
+  --source-account <ACCOUNT> \
+  --network testnet
+
+# Verify the entry is accessible again
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- <any_read_function>
+
+# Restart the TTL renewal daemon to prevent re-archival
+python3 scripts/renew-ttl.py --config renew-ttl.json --once
+```
+
+### Recommended operational thresholds
+
+| Threshold | Ledgers | Approximate time | Action |
+|-----------|--------:|-----------------|--------|
+| `LEDGER_BUMP_AMOUNT` | 518 400 | ~30 days | Target TTL after renewal |
+| `LEDGER_LIFETIME_THRESHOLD` | 120 960 | ~7 days | Daemon triggers renewal |
+| `alert_threshold_ledgers` | 17 280 | ~24 hours | Webhook alert fired |
+| Critical alert | < 1 440 | ~2 hours | Page on-call immediately |
+
+Set `poll_interval_seconds = 300` (5 minutes) in production. This gives the
+daemon 288 opportunities to renew before an entry at `LEDGER_LIFETIME_THRESHOLD`
+reaches zero. A single transient RPC failure will not cause archival.
+
+---
+
+## 13. TTL Monitoring and Automated Renewal
+
+Soroban ledger entries have a Time-To-Live (TTL). When a contract's instance
+storage or persistent keys fall below `LEDGER_LIFETIME_THRESHOLD` (~7 days),
+the entry enters an **archived** state and is no longer directly readable.
+Proactive TTL renewal prevents archival from ever occurring in production.
+
+### TTL constants (from soroban-common)
+
+| Constant | Ledgers | Approximate time |
+|----------|--------:|-----------------|
+| `LEDGER_LIFETIME_THRESHOLD` | 120 960 | ~7 days |
+| `LEDGER_BUMP_AMOUNT` | 518 400 | ~30 days |
+
+### scripts/renew-ttl.py
+
+The daemon at [`scripts/renew-ttl.py`](../scripts/renew-ttl.py) queries TTL via
+the Soroban RPC `getLedgerEntries` endpoint, submits `extendFootprintTtl`
+transactions via the `stellar` CLI when entries are near expiry, and sends
+webhook alerts when entries enter the alert window.
+
+#### Quick start
+
+```bash
+# Install dependencies
+pip install requests stellar-sdk
+
+# Create a config file
+cat > renew-ttl.json <<'EOF'
+{
+  "rpc_url": "https://soroban-testnet.stellar.org",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "source_account": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "contracts": [
+    { "id": "CTOKEN...", "name": "token",  "keys": ["instance"] },
+    { "id": "CESCROW.", "name": "escrow",  "keys": ["instance"] }
+  ],
+  "ledger_lifetime_threshold": 120960,
+  "ledger_bump_amount": 518400,
+  "alert_threshold_ledgers": 17280,
+  "poll_interval_seconds": 300,
+  "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+}
+EOF
+
+# Dry run (no transactions submitted)
+python3 scripts/renew-ttl.py --config renew-ttl.json --dry-run
+
+# One-shot check and exit
+python3 scripts/renew-ttl.py --config renew-ttl.json --once
+
+# Daemon mode
+STELLAR_SECRET_KEY=SXXX... python3 scripts/renew-ttl.py --config renew-ttl.json
+```
+
+#### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `STELLAR_SECRET_KEY` | Signing key for `extendFootprintTtl` transactions |
+| `RPC_URL` | Override `rpc_url` in config |
+| `NETWORK_PASSPHRASE` | Override `network_passphrase` in config |
+| `WEBHOOK_URL` | Override `webhook_url` in config |
+
+#### systemd service
+
+```ini
+# /etc/systemd/system/soroban-ttl-renew.service
+[Unit]
+Description=Soroban TTL Renewal Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=soroban
+WorkingDirectory=/opt/soroban
+ExecStart=/usr/bin/python3 /opt/soroban/scripts/renew-ttl.py --config /etc/soroban/renew-ttl.json
+Environment=STELLAR_SECRET_KEY=SXXX...
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now soroban-ttl-renew
+journalctl -u soroban-ttl-renew -f
+```
+
+#### Kubernetes CronJob
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: soroban-ttl-renew
+spec:
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: renew-ttl
+              image: python:3.12-slim
+              command: ["python3", "/scripts/renew-ttl.py", "--config", "/config/renew-ttl.json", "--once"]
+              env:
+                - name: STELLAR_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: stellar-keys
+                      key: secret-key
+```
+
+### Prometheus alert rules for TTL
+
+```yaml
+groups:
+  - name: soroban-ttl
+    rules:
+      - alert: SorobanEntryApproachingArchival
+        expr: soroban_ttl_remaining_ledgers < 17280
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Soroban entry TTL low: {{ $labels.contract_name }}"
+          description: "Only {{ $value }} ledgers before archival. Verify renew-ttl.py is running."
+
+      - alert: SorobanEntryArchivedOrMissing
+        expr: soroban_ttl_entry_missing == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Soroban entry archived: {{ $labels.contract_name }}"
+          description: "Entry not found via getLedgerEntries. Run 'stellar contract restore --id <ID>' immediately."
+```
+
+### Recovering from archival
+
+```bash
+# Restore the archived entry
+stellar contract restore \
+  --id <CONTRACT_ID> \
+  --source-account <ACCOUNT> \
+  --network testnet
+
+# Restart the daemon to prevent re-archival
+python3 scripts/renew-ttl.py --config renew-ttl.json --once
+```
+
+### Recommended operational thresholds
+
+| Threshold | Ledgers | ~Time | Action |
+|-----------|--------:|-------|--------|
+| `LEDGER_BUMP_AMOUNT` | 518 400 | ~30 days | Target TTL after renewal |
+| `LEDGER_LIFETIME_THRESHOLD` | 120 960 | ~7 days | Daemon triggers renewal |
+| `alert_threshold_ledgers` | 17 280 | ~24 hours | Webhook alert fired |
+| Critical page | < 1 440 | ~2 hours | Page on-call immediately |
+
+Set `poll_interval_seconds = 300` (5 minutes) in production — this gives the
+daemon 288 renewal opportunities before an entry at `LEDGER_LIFETIME_THRESHOLD`
+reaches zero.

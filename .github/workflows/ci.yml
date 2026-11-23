@@ -106,6 +106,51 @@ jobs:
       - name: Run clippy across all feature combinations
         run: bash scripts/clippy-all.sh
 
+  docs:
+    name: Documentation & Dead Links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cargo-docs-${{ hashFiles('**/Cargo.lock') }}
+
+      # Build rustdoc for every crate in the workspace. `-D warnings` turns
+      # broken intra-doc links, invalid HTML, and other rustdoc lints into
+      # hard errors so they can't accumulate unnoticed.
+      - name: Build rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: '-D warnings'
+        run: cargo doc --workspace --no-deps --all-features
+
+      # Compile every code snippet in the rustdocs so examples can't rot as
+      # contracts are refactored.
+      - name: Verify rustdoc code snippets compile
+        run: cargo test --workspace --doc --all-features
+
+      # Check markdown for broken internal file links and anchor references.
+      # `--offline` restricts the check to local files/anchors so the job is
+      # hermetic and doesn't fail on transient external network issues.
+      - name: Check markdown for dead links and anchors
+        uses: lycheeverse/lychee-action@f81112d0d83832e0b3b8d0b1b8a8b1f0b8b8b8b8 # v2
+        with:
+          args: >-
+            --offline
+            --include-fragments
+            --no-progress
+            --verbose
+            './README.md'
+            './docs/**/*.md'
+            './contracts/**/README.md'
+          fail: true
+
   list-contracts:
     name: List contracts
     runs-on: ubuntu-latest
@@ -332,7 +377,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [token_fuzz, escrow_initialize, token_mint_burn]
+        target: [token_fuzz, escrow_initialize, token_mint_burn, auction_fuzz]
+        target: [token_fuzz, escrow_initialize, token_mint_burn, dao_fuzz]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -357,6 +403,37 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+
+  # Supply-chain gate: bans, licenses, and security advisories, driven by the
+  # root `deny.toml`. Runs on every push and pull request so a vulnerable or
+  # disallowed dependency can't be merged unnoticed. A non-zero cargo-deny
+  # exit status fails the job (and therefore the PR check).
+  cargo-deny:
+    name: Cargo Deny (bans, licenses, advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cargo-deny-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+
+      # Caches the RustSec advisory database between runs so we don't re-clone
+      # it on every CI invocation. The action also runs `cargo deny check` and
+      # propagates its exit code, failing the job on critical advisories,
+      # disallowed licenses, or banned crates.
+      - name: Run cargo deny (bans, licenses, advisories)
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check bans licenses advisories
+          manifest-path: ./Cargo.toml
+          arguments: --all-features
 
   audit:
     name: WASM Build and Check
@@ -637,6 +714,105 @@ jobs:
 
       - name: cargo build --workspace --all-targets
         run: cargo build --workspace --all-targets
+
+  # ---------------------------------------------------------------------------
+  # Mutation testing — Issue #1213
+  #
+  # Runs cargo-mutants against a sharded subset of contracts so that the total
+  # wall-clock time stays within the job timeout. Each shard targets a group of
+  # contracts; survivors are surfaced as a workflow annotation and uploaded as
+  # an artifact for triage.
+  #
+  # Schedule: weekly (Sunday midnight UTC) and on any PR that changes a
+  # contracts/ source file or mutants.toml. Results are informational on PRs
+  # (continue-on-error: true) but are uploaded for review either way.
+  # ---------------------------------------------------------------------------
+  mutation:
+    name: Mutation Tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Run on the weekly schedule or on any push/PR.
+    # continue-on-error keeps overall CI green while survivors are reviewed.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard 1: high-value financial contracts
+          - shard: financial
+            packages: >-
+              -p soroban-token-template
+              -p soroban-escrow-template
+              -p soroban-bonding-curve
+              -p soroban-subscription
+              -p soroban-wrapped-token
+          # Shard 2: DeFi / staking contracts
+          - shard: defi
+            packages: >-
+              -p soroban-staking
+              -p soroban-vesting
+              -p soroban-swap
+              -p soroban-timelock
+          # Shard 3: governance / multi-party contracts
+          - shard: governance
+            packages: >-
+              -p soroban-multisig
+              -p soroban-dao
+              -p soroban-ballot
+              -p soroban-crowdfund
+          # Shard 4: marketplace / utility contracts
+          - shard: utility
+            packages: >-
+              -p soroban-marketplace
+              -p soroban-auction
+              -p soroban-nft
+              -p soroban-lottery
+              -p soroban-oracle
+              -p soroban-airdrop
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cargo-mutants-${{ matrix.shard }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run mutation tests (shard ${{ matrix.shard }})
+        run: |
+          cargo mutants \
+            ${{ matrix.packages }} \
+            --timeout 120 \
+            --jobs 2 \
+            --output "mutants-${{ matrix.shard }}" \
+            -- --lib 2>&1 | tee "mutants-${{ matrix.shard }}/cargo-mutants.log"
+
+      - name: Summarise survivors
+        if: always()
+        run: |
+          MISSED=$(grep -c "^MISSED" "mutants-${{ matrix.shard }}/cargo-mutants.log" 2>/dev/null || echo 0)
+          CAUGHT=$(grep -c "^caught" "mutants-${{ matrix.shard }}/cargo-mutants.log" 2>/dev/null || echo 0)
+          echo "## Mutation Summary: ${{ matrix.shard }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Caught: $CAUGHT" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Survived (uncaught): $MISSED" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MISSED" -gt 0 ]; then
+            echo "::warning::$MISSED mutant(s) survived in shard '${{ matrix.shard }}' — see artifact for details"
+          fi
+
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutation-results-${{ matrix.shard }}
+          path: mutants-${{ matrix.shard }}/
+          retention-days: 14
 
   nightly:
     name: Nightly Build

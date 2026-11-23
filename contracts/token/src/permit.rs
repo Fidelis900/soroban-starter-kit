@@ -18,6 +18,12 @@
 //! `expiration_ledger` — the same ledger-sequence expiration model `approve`
 //! already uses. `nonce` must match the owner's current [`permit_nonce`] and
 //! is incremented on success, so a consumed permit can never be replayed.
+//!
+//! An owner can also proactively invalidate an unused permit via
+//! [`cancel_permit_nonce`], which marks a specific nonce as cancelled in
+//! persistent storage. [`approve_with_signature`] rejects any permit whose
+//! nonce has been cancelled, so a signature handed to an untrusted relayer can
+//! be revoked without executing a dummy permit.
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{Address, Bytes, BytesN, Env, panic_with_error};
@@ -52,6 +58,31 @@ pub fn permit_nonce(env: Env, owner: Address) -> u32 {
         .unwrap_or(0u32)
 }
 
+/// Returns `true` if `owner` has cancelled `nonce`, meaning any permit signed
+/// for that nonce can no longer be applied.
+pub fn is_permit_nonce_cancelled(env: Env, owner: Address, nonce: u32) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelledPermitNonce(owner, nonce))
+        .unwrap_or(false)
+}
+
+/// Cancels `nonce` for `owner`, permanently invalidating any permit signature
+/// that was signed for it.
+///
+/// This lets an owner revoke an unused off-chain permit (for example one handed
+/// to an untrusted relayer) without having to execute a dummy permit. The
+/// cancellation is recorded in persistent storage and is checked by
+/// [`approve_with_signature`], which rejects any permit whose nonce has been
+/// cancelled.
+pub fn cancel_permit_nonce(env: Env, owner: Address, nonce: u32) {
+    owner.require_auth();
+    let key = DataKey::CancelledPermitNonce(owner.clone(), nonce);
+    env.storage().persistent().set(&key, &true);
+    extend_ttl_persistent(&env, &key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+    events::permit_nonce_cancelled(&env, &owner, nonce);
+}
+
 /// Grants `spender` an allowance over `owner`'s tokens using an owner-signed
 /// message instead of the owner submitting the transaction themselves.
 ///
@@ -84,6 +115,12 @@ pub fn approve_with_signature(
     let nonce_key = DataKey::PermitNonce(owner.clone());
     let expected_nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
     if nonce != expected_nonce {
+        return Err(TokenError::InvalidNonce);
+    }
+
+    // A cancelled nonce is permanently invalid, even if it is still the
+    // owner's current expected nonce.
+    if is_permit_nonce_cancelled(env.clone(), owner.clone(), nonce) {
         return Err(TokenError::InvalidNonce);
     }
 

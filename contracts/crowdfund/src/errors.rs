@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CrowdfundError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
@@ -23,6 +23,25 @@ pub enum CrowdfundError {
     InvalidTier = 14,
     PledgeCapExceeded = 15,
     DeadlineAlreadyExtended = 16,
+    CampaignCancelled = 17,
+    TierCapacityExceeded = 18,
+    InvalidTierId = 19,
+    ClaimDeadlineExpired = 20,
+    Overflow = 21,
+    MilestoneNotFound = 22,
+    MilestoneNotReady = 23,
+    MilestoneAlreadyReleased = 24,
+    InvalidTokenPrice = 25,
+    TokenNotWhitelisted = 26,
+    /// Milestone release needs approval from >50% of pledged voting power.
+    MilestoneApprovalThresholdNotMet = 27,
+    /// The creator has not proposed this milestone for release.
+    MilestoneNotRequested = 28,
+    /// The campaign deadline has passed; pledges are no longer accepted.
+    CampaignExpired = 29,
+    MilestoneNotRequested = 25,
+    /// The KYC attestation hash supplied on campaign init is empty or invalid.
+    InvalidKycHash = 26,
 }
 
 impl_display_error!(
@@ -43,6 +62,20 @@ impl_display_error!(
     InvalidTier             => "invalid funding tier",
     PledgeCapExceeded       => "pledge would exceed the per-address cap",
     DeadlineAlreadyExtended => "deadline has already been extended once",
+    CampaignCancelled       => "campaign has been cancelled",
+    TierCapacityExceeded    => "tier has reached maximum capacity",
+    InvalidTierId           => "invalid tier id",
+    ClaimDeadlineExpired    => "creator claim window has expired",
+    Overflow                => "arithmetic overflow",
+    MilestoneNotFound       => "milestone not found",
+    MilestoneNotReady       => "milestone not ready for release",
+    MilestoneAlreadyReleased => "milestone already released",
+    InvalidTokenPrice       => "invalid token price from oracle",
+    TokenNotWhitelisted     => "token not whitelisted for contributions",
+    MilestoneApprovalThresholdNotMet => "milestone approval threshold not met",
+    MilestoneNotRequested   => "milestone release has not been proposed",
+    CampaignExpired         => "campaign has expired",
+    InvalidKycHash          => "invalid or empty KYC attestation hash",
 );
 
 #[cfg(test)]
@@ -72,7 +105,21 @@ CrowdfundError::InvalidGoal = {}\n\
 CrowdfundError::NotAuthorized = {}\n\
 CrowdfundError::InvalidTier = {}\n\
 CrowdfundError::PledgeCapExceeded = {}\n\
-CrowdfundError::DeadlineAlreadyExtended = {}\n",
+CrowdfundError::DeadlineAlreadyExtended = {}\n\
+CrowdfundError::CampaignCancelled = {}\n\
+CrowdfundError::TierCapacityExceeded = {}\n\
+CrowdfundError::InvalidTierId = {}\n\
+CrowdfundError::ClaimDeadlineExpired = {}\n\
+CrowdfundError::Overflow = {}\n\
+CrowdfundError::MilestoneNotFound = {}\n\
+CrowdfundError::MilestoneNotReady = {}\n\
+CrowdfundError::MilestoneAlreadyReleased = {}\n\
+CrowdfundError::InvalidTokenPrice = {}\n\
+CrowdfundError::TokenNotWhitelisted = {}\n\
+CrowdfundError::MilestoneApprovalThresholdNotMet = {}\n\
+CrowdfundError::MilestoneNotRequested = {}\n\
+CrowdfundError::CampaignExpired = {}\n",
+CrowdfundError::InvalidKycHash = {}\n",
             CrowdfundError::AlreadyInitialized as u32,
             CrowdfundError::NotInitialized as u32,
             CrowdfundError::DeadlinePassed as u32,
@@ -89,7 +136,21 @@ CrowdfundError::DeadlineAlreadyExtended = {}\n",
             CrowdfundError::InvalidTier as u32,
             CrowdfundError::PledgeCapExceeded as u32,
             CrowdfundError::DeadlineAlreadyExtended as u32,
-        )
+            CrowdfundError::CampaignCancelled as u32,
+            CrowdfundError::TierCapacityExceeded as u32,
+            CrowdfundError::InvalidTierId as u32,
+            CrowdfundError::ClaimDeadlineExpired as u32,
+            CrowdfundError::Overflow as u32,
+            CrowdfundError::MilestoneNotFound as u32,
+            CrowdfundError::MilestoneNotReady as u32,
+            CrowdfundError::MilestoneAlreadyReleased as u32,
+            CrowdfundError::InvalidTokenPrice as u32,
+            CrowdfundError::TokenNotWhitelisted as u32,
+            CrowdfundError::MilestoneApprovalThresholdNotMet as u32,
+            CrowdfundError::MilestoneNotRequested as u32,
+            CrowdfundError::CampaignExpired as u32,
+            CrowdfundError::InvalidKycHash as u32,
+        );
     }
 
     #[test]

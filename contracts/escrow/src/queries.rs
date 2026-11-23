@@ -20,6 +20,13 @@ pub fn get_escrow_info(env: Env) -> Result<EscrowInfo, EscrowError> {
             .instance()
             .get(&MetadataHash)
             .unwrap_or_else(|| soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
+        arbiter_fee_bps: env.storage().instance().get(&ArbiterFeeBps).unwrap_or(0),
+        arbiters: env
+            .storage()
+            .instance()
+            .get(&Arbiters)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env)),
+        threshold: env.storage().instance().get(&Threshold).unwrap_or(0),
     })
 }
 

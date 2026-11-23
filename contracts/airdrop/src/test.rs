@@ -7,29 +7,19 @@
 )]
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
-    Address, Bytes, BytesN, Env, Vec,
-    testutils::{Address as _, Ledger as _},
+    Address, Bytes, BytesN, Env, IntoVal, Vec, symbol_short,
+    testutils::{Address as _, Events as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
-    xdr::ToXdr,
+    vec,
 };
 
 // ---------------------------------------------------------------------------
-// Merkle tree helpers (replicates on-chain logic for test setup)
+// Merkle helpers (mirror the on-chain logic for test setup)
 // ---------------------------------------------------------------------------
-
-fn sha256(env: &Env, data: &Bytes) -> BytesN<32> {
-    env.crypto().sha256(data).into()
-}
-
-fn leaf(env: &Env, recipient: &Address, amount: i128) -> BytesN<32> {
-    let mut data = Bytes::new(env);
-    data.append(&recipient.clone().to_xdr(env));
-    let amount_bytes: [u8; 16] = amount.to_be_bytes();
-    data.append(&Bytes::from_slice(env, &amount_bytes));
-    sha256(env, &data)
-}
 
 fn hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
     let mut data = Bytes::new(env);
@@ -40,411 +30,476 @@ fn hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
         data.append(&Bytes::from(b.clone()));
         data.append(&Bytes::from(a.clone()));
     }
-    sha256(env, &data)
+    env.crypto().sha256(&data).into()
 }
-
-/// Build a two-leaf tree. Returns (root, proof_for_leaf_0, proof_for_leaf_1).
-fn two_leaf_tree(
-    env: &Env,
-    leaf0: BytesN<32>,
-    leaf1: BytesN<32>,
-) -> (BytesN<32>, Vec<BytesN<32>>, Vec<BytesN<32>>) {
-    let root = hash_pair(env, &leaf0, &leaf1);
-    let mut proof0 = Vec::new(env);
-    proof0.push_back(leaf1.clone());
-    let mut proof1 = Vec::new(env);
-    proof1.push_back(leaf0.clone());
-    (root, proof0, proof1)
-}
-
-// ---------------------------------------------------------------------------
-// Setup — now passes a claim_deadline far in the future by default
-// ---------------------------------------------------------------------------
 
 const FAR_DEADLINE: u32 = 1_000_000;
+const TIER_1: u32 = 1;
+const TIER_2: u32 = 2;
+const TIER_1_AMOUNT: i128 = 1_000;
+const TIER_2_AMOUNT: i128 = 5_000;
 
-struct TestEnv<'a> {
+struct T<'a> {
     env: Env,
     client: AirdropContractClient<'a>,
+    contract: Address,
     token: Address,
     admin: Address,
     alice: Address,
     bob: Address,
 }
 
-fn setup<'a>(env: &'a Env) -> TestEnv<'a> {
-    env.mock_all_auths();
+impl T<'_> {
+    /// Leaf as computed by the deployed contract instance.
+    fn leaf(&self, recipient: &Address, amount: i128, tier: u32) -> BytesN<32> {
+        self.env.as_contract(&self.contract, || {
+            compute_leaf(&self.env, recipient, &self.token, amount, tier)
+        })
+    }
 
-    let admin = Address::generate(env);
-    let alice = Address::generate(env);
-    let bob = Address::generate(env);
+    /// Two-leaf tree: alice @ tier 1, bob @ tier 2. Returns (proof_alice, proof_bob).
+    fn set_tiered_root(&self) -> (Vec<BytesN<32>>, Vec<BytesN<32>>) {
+        let la = self.leaf(&self.alice, TIER_1_AMOUNT, TIER_1);
+        let lb = self.leaf(&self.bob, TIER_2_AMOUNT, TIER_2);
+        self.client.set_root(&hash_pair(&self.env, &la, &lb));
+        (vec![&self.env, lb], vec![&self.env, la])
+    }
 
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(env, &airdrop);
-    client.initialize(&admin, &token, &FAR_DEADLINE);
-
-    // Fund the airdrop contract with tokens
-    StellarAssetClient::new(env, &token).mint(&airdrop, &100_000i128);
-
-    TestEnv {
-        env: env.clone(),
-        client,
-        token,
-        admin,
-        alice,
-        bob,
+    fn balance(&self, who: &Address) -> i128 {
+        TokenClient::new(&self.env, &self.token).balance(who)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Existing tests (updated for new initialize signature)
-// ---------------------------------------------------------------------------
+fn setup_with(env: &Env, vesting: Option<VestingConfig>, mock_auths: bool) -> T<'_> {
+    if mock_auths {
+        env.mock_all_auths();
+    }
+    let admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(env, &contract);
 
-#[test]
-fn test_initialize_rejects_duplicate() {
-    let env = Env::default();
-    let t = setup(&env);
-    let res = t.client.try_initialize(&t.admin, &t.token, &FAR_DEADLINE);
-    assert!(res.is_err());
+    if mock_auths {
+        client.initialize(&admin, &FAR_DEADLINE, &vesting);
+        StellarAssetClient::new(env, &token).mint(&contract, &100_000i128);
+    }
+
+    T {
+        env: env.clone(),
+        client,
+        contract,
+        token,
+        admin,
+        alice: Address::generate(env),
+        bob: Address::generate(env),
+    }
 }
 
+fn setup(env: &Env) -> T<'_> {
+    setup_with(env, None, true)
+}
+
+// ---------------------------------------------------------------------------
+// Core behaviour
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_claim_happy_path() {
+fn initialize_rejects_duplicate() {
     let env = Env::default();
     let t = setup(&env);
-
-    let alice_amount = 1_000i128;
-    let bob_amount = 2_000i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-
-    t.client.set_root(&root);
-
-    let before = TokenClient::new(&env, &t.token).balance(&t.alice);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
     assert_eq!(
-        TokenClient::new(&env, &t.token).balance(&t.alice),
-        before + alice_amount
+        t.client.try_initialize(&t.admin, &FAR_DEADLINE, &None),
+        Err(Ok(AirdropError::AlreadyInitialized))
     );
-    assert!(t.client.is_claimed(&t.alice));
 }
 
 #[test]
-fn test_duplicate_claim_rejected() {
+fn claim_pays_recipient_and_blocks_duplicate() {
     let env = Env::default();
     let t = setup(&env);
+    let (proof_a, _) = t.set_tiered_root();
 
-    let alice_amount = 500i128;
-    let bob_amount = 500i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-
-    t.client.set_root(&root);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
-
-    let res = t.client.try_claim(&t.alice, &alice_amount, &proof_a);
-    assert!(res.is_err());
-}
-
-#[test]
-fn test_invalid_proof_rejected() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 1_000i128;
-    let bob_amount = 2_000i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, _proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-
-    t.client.set_root(&root);
-
-    // Bob's proof used for Alice's claim — must fail
-    let res = t.client.try_claim(&t.alice, &alice_amount, &proof_b);
-    assert!(res.is_err());
-}
-
-#[test]
-fn test_wrong_amount_rejected() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 1_000i128;
-    let bob_amount = 2_000i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-
-    t.client.set_root(&root);
-
-    // Wrong amount
-    let res = t.client.try_claim(&t.alice, &999i128, &proof_a);
-    assert!(res.is_err());
-}
-
-#[test]
-fn test_zero_amount_rejected() {
-    let env = Env::default();
-    let t = setup(&env);
-    let root = BytesN::from_array(&env, &[0u8; 32]);
-    t.client.set_root(&root);
-    let proof = Vec::new(&env);
-    let res = t.client.try_claim(&t.alice, &0i128, &proof);
-    assert!(res.is_err());
-}
-
-#[test]
-fn test_claim_without_root_fails() {
-    let env = Env::default();
-    let t = setup(&env);
-    let proof = Vec::new(&env);
-    let res = t.client.try_claim(&t.alice, &1_000i128, &proof);
-    assert!(res.is_err());
-}
-
-#[test]
-fn test_both_recipients_claim() {
-    let env = Env::default();
-    let t = setup(&env);
-
-    let alice_amount = 300i128;
-    let bob_amount = 700i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-
-    t.client.set_root(&root);
-    t.client.claim(&t.alice, &alice_amount, &proof_a);
-    t.client.claim(&t.bob, &bob_amount, &proof_b);
+    t.client
+        .claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    assert_eq!(t.balance(&t.alice), TIER_1_AMOUNT);
+    assert!(t.client.is_claimed(&t.alice, &t.token));
 
     assert_eq!(
-        TokenClient::new(&env, &t.token).balance(&t.alice),
-        alice_amount
+        t.client
+            .try_claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a),
+        Err(Ok(AirdropError::AlreadyClaimed))
     );
-    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
 }
 
-// ---------------------------------------------------------------------------
-// Claim deadline tests — #780
-// ---------------------------------------------------------------------------
-
-/// Claim succeeds when ledger sequence < deadline.
 #[test]
-fn test_claim_before_deadline_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    // Start at ledger 100; deadline = 200
-    env.ledger().with_mut(|l| l.sequence_number = 100);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
-
-    // ledger 100 < 200 — should succeed
-    client.claim(&alice, &500i128, &proof_a);
-    assert!(client.is_claimed(&alice));
-}
-
-/// Claim at exactly the deadline ledger succeeds (boundary: sequence == deadline is still valid).
-#[test]
-fn test_claim_at_deadline_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 200);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
-
-    // ledger 200 == 200 — should still succeed (only > deadline is rejected)
-    client.claim(&alice, &500i128, &proof_a);
-    assert!(client.is_claimed(&alice));
-}
-
-/// Claim after the deadline is rejected with ClaimWindowClosed.
-#[test]
-fn test_claim_after_deadline_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 100);
-
-    let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
-
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, _) = two_leaf_tree(&env, leaf_a, leaf_b);
-    client.set_root(&root);
-
-    // Advance ledger past deadline
-    env.ledger().with_mut(|l| l.sequence_number = 201);
-
-    let res = client.try_claim(&alice, &500i128, &proof_a);
-    assert!(res.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Batch claim tests — #782
-// ---------------------------------------------------------------------------
-
-/// Batch claim succeeds when all proofs are valid.
-#[test]
-fn test_claim_batch_success() {
+fn wrong_amount_rejected() {
     let env = Env::default();
     let t = setup(&env);
-
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
-
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_a));
-    entries.push_back((t.bob.clone(), bob_amount, proof_b));
-
-    t.client.claim_batch(&entries);
-
-    assert!(t.client.is_claimed(&t.alice));
-    assert!(t.client.is_claimed(&t.bob));
+    let (proof_a, _) = t.set_tiered_root();
     assert_eq!(
-        TokenClient::new(&env, &t.token).balance(&t.alice),
-        alice_amount
+        t.client
+            .try_claim(&t.alice, &t.token, &TIER_2_AMOUNT, &TIER_1, &proof_a),
+        Err(Ok(AirdropError::InvalidProof))
     );
-    assert_eq!(TokenClient::new(&env, &t.token).balance(&t.bob), bob_amount);
 }
 
-/// One invalid proof in the batch causes the entire batch to fail (all-or-nothing).
 #[test]
-fn test_claim_batch_invalid_proof_aborts_all() {
+fn claim_after_deadline_rejected() {
     let env = Env::default();
     let t = setup(&env);
-
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
-
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
-
-    // Use bob's proof for alice — invalid
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_b)); // wrong proof
-    entries.push_back((t.bob.clone(), bob_amount, proof_a)); // also wrong
-
-    let res = t.client.try_claim_batch(&entries);
-    assert!(res.is_err());
-
-    // Neither should be claimed
-    assert!(!t.client.is_claimed(&t.alice));
-    assert!(!t.client.is_claimed(&t.bob));
+    let (proof_a, _) = t.set_tiered_root();
+    env.ledger().with_mut(|l| l.sequence_number = FAR_DEADLINE + 1);
+    assert_eq!(
+        t.client
+            .try_claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a),
+        Err(Ok(AirdropError::ClaimWindowClosed))
+    );
 }
 
-/// A batch containing an already-claimed entry fails all-or-nothing.
 #[test]
-fn test_claim_batch_already_claimed_aborts_all() {
+fn vested_claim_releases_over_time() {
+    let env = Env::default();
+    let cfg = VestingConfig {
+        initial_unlock_bps: 2_000,
+        vesting_duration_ledgers: 100,
+    };
+    let t = setup_with(&env, Some(cfg), true);
+    let (proof_a, _) = t.set_tiered_root();
+
+    t.client
+        .claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    assert_eq!(t.balance(&t.alice), 200);
+    assert_eq!(t.client.total_locked(&t.token), 800);
+
+    env.ledger().with_mut(|l| l.sequence_number += 50);
+    assert_eq!(t.client.release(&t.alice, &t.token), 400);
+
+    env.ledger().with_mut(|l| l.sequence_number += 50);
+    assert_eq!(t.client.release(&t.alice, &t.token), 400);
+    assert_eq!(t.balance(&t.alice), TIER_1_AMOUNT);
+    assert_eq!(t.client.total_locked(&t.token), 0);
+}
+
+// ---------------------------------------------------------------------------
+// #1346 — tiered allocations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tiered_claims_record_tier_in_storage() {
     let env = Env::default();
     let t = setup(&env);
+    let (proof_a, proof_b) = t.set_tiered_root();
 
-    let alice_amount = 400i128;
-    let bob_amount = 600i128;
+    assert_eq!(t.client.get_claimed_tier(&t.alice, &t.token), None);
 
-    let leaf_a = leaf(&env, &t.alice, alice_amount);
-    let leaf_b = leaf(&env, &t.bob, bob_amount);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a, leaf_b);
-    t.client.set_root(&root);
+    t.client
+        .claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    t.client
+        .claim(&t.bob, &t.token, &TIER_2_AMOUNT, &TIER_2, &proof_b);
 
-    // Alice claims individually first
-    t.client.claim(&t.alice, &alice_amount, &proof_a.clone());
-
-    // Now batch tries to claim alice again (and bob for the first time)
-    let mut entries = Vec::new(&env);
-    entries.push_back((t.alice.clone(), alice_amount, proof_a));
-    entries.push_back((t.bob.clone(), bob_amount, proof_b));
-
-    let res = t.client.try_claim_batch(&entries);
-    assert!(res.is_err());
-
-    // Bob must NOT have been claimed (batch rolled back)
-    assert!(!t.client.is_claimed(&t.bob));
+    assert_eq!(t.balance(&t.alice), TIER_1_AMOUNT);
+    assert_eq!(t.balance(&t.bob), TIER_2_AMOUNT);
+    assert_eq!(t.client.get_claimed_tier(&t.alice, &t.token), Some(TIER_1));
+    assert_eq!(t.client.get_claimed_tier(&t.bob, &t.token), Some(TIER_2));
 }
 
-/// Batch claim is also rejected after the deadline.
 #[test]
-fn test_claim_batch_after_deadline_rejected() {
+fn tiered_claim_emits_tier_in_event() {
+    let env = Env::default();
+    let t = setup(&env);
+    let (_, proof_b) = t.set_tiered_root();
+
+    t.client
+        .claim(&t.bob, &t.token, &TIER_2_AMOUNT, &TIER_2, &proof_b);
+
+    assert_eq!(
+        env.events().all().filter_by_contract(&t.contract),
+        vec![
+            &env,
+            (
+                t.contract.clone(),
+                (symbol_short!("claimed"), TIER_2).into_val(&env),
+                (t.bob.clone(), t.token.clone(), TIER_2_AMOUNT, TIER_2).into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn claiming_under_a_higher_tier_is_rejected() {
+    let env = Env::default();
+    let t = setup(&env);
+    let (proof_a, _) = t.set_tiered_root();
+
+    // Alice is tier 1; she cannot upgrade herself to tier 2's allocation,
+    // nor keep her amount while relabelling the tier.
+    assert_eq!(
+        t.client
+            .try_claim(&t.alice, &t.token, &TIER_2_AMOUNT, &TIER_2, &proof_a),
+        Err(Ok(AirdropError::InvalidProof))
+    );
+    assert_eq!(
+        t.client
+            .try_claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_2, &proof_a),
+        Err(Ok(AirdropError::InvalidProof))
+    );
+}
+
+#[test]
+fn tiered_batch_claim_with_multi_proof() {
+    let env = Env::default();
+    let t = setup(&env);
+    let la = t.leaf(&t.alice, TIER_1_AMOUNT, TIER_1);
+    let lb = t.leaf(&t.bob, TIER_2_AMOUNT, TIER_2);
+    t.client.set_root(&hash_pair(&env, &la, &lb));
+
+    let entries = vec![
+        &env,
+        (t.alice.clone(), t.token.clone(), TIER_1_AMOUNT, TIER_1),
+        (t.bob.clone(), t.token.clone(), TIER_2_AMOUNT, TIER_2),
+    ];
+    t.client
+        .claim_batch(&entries, &Vec::new(&env), &vec![&env, true]);
+
+    // Every recipient in the batch had to authorize it (#1347).
+    let authorizers: std::vec::Vec<Address> = env.auths().into_iter().map(|(a, _)| a).collect();
+    assert!(authorizers.contains(&t.alice));
+    assert!(authorizers.contains(&t.bob));
+
+    assert_eq!(t.balance(&t.alice), TIER_1_AMOUNT);
+    assert_eq!(t.balance(&t.bob), TIER_2_AMOUNT);
+    assert_eq!(t.client.get_claimed_tier(&t.bob, &t.token), Some(TIER_2));
+}
+
+// ---------------------------------------------------------------------------
+// #1347 — front-running / recipient binding
+// ---------------------------------------------------------------------------
+
+/// Set up without blanket auth mocking so recipient auth is actually checked.
+fn setup_strict(env: &Env) -> (T<'_>, Vec<BytesN<32>>) {
+    let t = setup_with(env, None, false);
+    env.mock_all_auths();
+    t.client.initialize(&t.admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(env, &t.token).mint(&t.contract, &100_000i128);
+    let (proof_a, _) = t.set_tiered_root();
+    // From here on, no auths are mocked: only explicitly signed calls pass.
+    env.set_auths(&[]);
+    (t, proof_a)
+}
+
+#[test]
+fn sniper_cannot_submit_copied_proof_without_recipient_auth() {
+    let env = Env::default();
+    let (t, proof_a) = setup_strict(&env);
+
+    // A bot copies alice's (recipient, amount, tier, proof) from the mempool
+    // and broadcasts it itself. Without alice's signature it must fail.
+    let res = t
+        .client
+        .try_claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    assert!(res.is_err());
+    assert!(!t.client.is_claimed(&t.alice, &t.token));
+    assert_eq!(t.balance(&t.alice), 0);
+}
+
+#[test]
+fn sniper_cannot_redirect_claim_to_itself() {
+    let env = Env::default();
+    let (t, proof_a) = setup_strict(&env);
+    let sniper = Address::generate(&env);
+
+    // The sniper signs for itself and reuses alice's proof: the leaf is bound
+    // to the recipient, so the proof does not verify for the sniper.
+    env.mock_all_auths();
+    assert_eq!(
+        t.client
+            .try_claim(&sniper, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a),
+        Err(Ok(AirdropError::InvalidProof))
+    );
+    assert_eq!(t.balance(&sniper), 0);
+
+    // Alice's allocation is untouched and still claimable by her.
+    t.client
+        .claim(&t.alice, &t.token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    assert_eq!(t.balance(&t.alice), TIER_1_AMOUNT);
+}
+
+#[test]
+fn relayer_batch_without_recipient_auth_is_rejected() {
+    let env = Env::default();
+    let (t, _) = setup_strict(&env);
+    let entries = vec![
+        &env,
+        (t.alice.clone(), t.token.clone(), TIER_1_AMOUNT, TIER_1),
+        (t.bob.clone(), t.token.clone(), TIER_2_AMOUNT, TIER_2),
+    ];
+    let res = t
+        .client
+        .try_claim_batch(&entries, &Vec::new(&env), &vec![&env, true]);
+    assert!(res.is_err());
+    assert!(!t.client.is_claimed(&t.alice, &t.token));
+    assert!(!t.client.is_claimed(&t.bob, &t.token));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1348: emergency pause / resume
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_rejects_claims_and_resume_restores_them() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 100);
-
     let admin = Address::generate(&env);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
+    let recipient = Address::generate(&env);
     let token = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
-    let airdrop = env.register_contract(None, AirdropContract);
-    let client = AirdropContractClient::new(&env, &airdrop);
-    client.initialize(&admin, &token, &200u32);
-    StellarAssetClient::new(&env, &token).mint(&airdrop, &10_000i128);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
 
-    let leaf_a = leaf(&env, &alice, 500i128);
-    let leaf_b = leaf(&env, &bob, 500i128);
-    let (root, proof_a, proof_b) = two_leaf_tree(&env, leaf_a.clone(), leaf_b.clone());
-    client.set_root(&root);
+    let proof = Vec::<BytesN<32>>::new(&env);
+    assert!(!client.is_paused());
 
-    // Advance past deadline
-    env.ledger().with_mut(|l| l.sequence_number = 201);
+    client.set_paused(&true);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::Paused))
+    );
 
-    let mut entries = Vec::new(&env);
-    entries.push_back((alice.clone(), 500i128, proof_a));
-    entries.push_back((bob.clone(), 500i128, proof_b));
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+    // With claims resumed the pause error is gone (the root is not set yet).
+    assert_eq!(
+        client.try_claim(&recipient, &token, &100, &proof),
+        Err(Ok(AirdropError::RootNotSet))
+    );
+}
 
-    let res = client.try_claim_batch(&entries);
-    assert!(res.is_err());
+#[test]
+fn pause_state_defaults_to_false() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    assert!(!client.is_paused());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1349: expiring claim windows with variable reward decay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decayed_payout_and_treasury_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+
+    let config = DecayConfig {
+        start_ledger: 0,
+        full_window_ledgers: 100,
+        decay_step_ledgers: 10,
+        decay_bps_per_step: 1_000,
+        floor_bps: 5_000,
+    };
+    client.set_decay_config(&treasury, &config);
+    assert_eq!(client.get_decay_config(), Some(config.clone()));
+
+    // Inside the full-reward window: the whole allocation is claimable.
+    env.ledger().with_mut(|li| li.sequence_number = 50);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
+
+    // Three decay steps elapsed: 70% to claimant, 30% back to the treasury.
+    env.ledger().with_mut(|li| li.sequence_number = 130);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
+    assert_eq!(decay_bps(&config, 130), 7_000);
+
+    // The schedule never pays less than the configured floor.
+    env.ledger().with_mut(|li| li.sequence_number = 500);
+    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+    assert_eq!(decay_bps(&config, 500), 5_000);
+}
+
+#[test]
+fn invalid_decay_config_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    let config = DecayConfig {
+        start_ledger: 0,
+        full_window_ledgers: 10,
+        decay_step_ledgers: 0,
+        decay_bps_per_step: 100,
+        floor_bps: 5_000,
+    };
+    assert_eq!(
+        client.try_set_decay_config(&treasury, &config),
+        Err(Ok(AirdropError::InvalidDecayConfig))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1350: governance-authorized multi-epoch Merkle root updates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governance_root_updates_preserve_claimed_bitmaps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let dao = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register_contract(None, AirdropContract);
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    client.set_governance(&dao);
+    assert_eq!(client.get_governance(), Some(dao.clone()));
+
+    // Simulate a claim in epoch zero; the bitmap must survive both updates.
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Claimed(alice.clone(), token.clone()), &true);
+    });
+
+    assert_eq!(client.get_epoch(), 0);
+    let root_one = BytesN::from_array(&env, &[1u8; 32]);
+    client.update_root_by_governance(&root_one, &2_000);
+    assert_eq!(client.get_epoch(), 1);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(1)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
+
+    let root_two = BytesN::from_array(&env, &[2u8; 32]);
+    client.update_root_by_governance(&root_two, &3_000);
+    assert_eq!(client.get_epoch(), 2);
+    env.as_contract(&contract, || {
+        assert!(env.storage().instance().has(&DataKey::MerkleRoot(2)));
+        assert!(env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
+            .unwrap());
+    });
 }

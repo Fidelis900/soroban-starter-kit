@@ -1,22 +1,61 @@
-# Mutation testing: token and escrow critical paths only.
-# Packages are selected via CLI: -p soroban-token-template -p soroban-escrow-template
+# Mutation testing configuration.
 #
-# Tracked as #972: this scope only measures whether token/escrow's unit tests
-# actually catch bugs, not whether they exist. staking, vesting, escrow's
-# dispute.rs, marketplace, and auction are the priority additions — each has
-# had a real fund-movement bug ship past a passing unit-test suite. See
-# docs/testing-strategy.md#gaps.
+# Tracked as #1213: expand from token+escrow to all workspace contracts.
+# Previous scope was documented as #972: see docs/testing-strategy.md#mutation-testing.
+#
+# cargo-mutants documentation: https://mutants.rs/
+#
+# Running locally:
+#   cargo mutants --workspace --timeout 120 --jobs 4
+#
+# The CI mutation job runs a subset of packages per matrix shard to keep
+# wall-clock time reasonable. See .github/workflows/ci.yml (mutation job).
 
 examine_globs = [
+    # Core payment / value contracts — highest risk
     "contracts/token/src/**/*.rs",
     "contracts/escrow/src/**/*.rs",
+    "contracts/bonding-curve/src/**/*.rs",
+    "contracts/subscription/src/**/*.rs",
+    "contracts/wrapped-token/src/**/*.rs",
+    "contracts/staking/src/**/*.rs",
+    "contracts/vesting/src/**/*.rs",
+
+    # Governance / multi-party contracts
+    "contracts/multisig/src/**/*.rs",
+    "contracts/dao/src/**/*.rs",
+    "contracts/ballot/src/**/*.rs",
+
+    # Trading / exchange contracts
+    "contracts/swap/src/**/*.rs",
+    "contracts/marketplace/src/**/*.rs",
+    "contracts/auction/src/**/*.rs",
+    "contracts/crowdfund/src/**/*.rs",
+
+    # Utility contracts
+    "contracts/timelock/src/**/*.rs",
+    "contracts/nft/src/**/*.rs",
+    "contracts/lottery/src/**/*.rs",
+    "contracts/oracle/src/**/*.rs",
+    "contracts/airdrop/src/**/*.rs",
 ]
 
 exclude_globs = [
+    # Build scripts, test helpers, and snapshot/binary targets are not
+    # meaningful mutation targets — mutating them would only produce spurious
+    # survivors with no security value.
     "contracts/*/src/bin/**",
     "contracts/*/build.rs",
     "contracts/*/src/test.rs",
     "contracts/*/src/prop_test.rs",
+
+    # The common crate is exercised indirectly by every contract's tests.
+    # Mutations here are caught if any dependent contract's test suite fails.
+    "contracts/common/src/**/*.rs",
 ]
 
 test_workspace = true
+
+# Per-mutant timeout (seconds). Set conservatively to avoid false survivors
+# caused by a test suite hanging rather than a mutant escaping.
+timeout_multiplier = 3.0

@@ -8,3 +8,6 @@ TokenError::Overflow = 7
 TokenError::InvalidNonce = 8
 TokenError::PermitExpired = 9
 TokenError::PermitSignerNotSet = 10
+TokenError::AccountLocked = 11
+TokenError::ZeroAmount = 12
+TokenError::MaxSupplyExceeded = 13

@@ -16,10 +16,13 @@ mod errors;
 mod events;
 mod lifecycle;
 mod queries;
+mod staged;
 mod storage;
 
 pub use errors::EscrowError;
-pub use storage::{DataKey, EscrowInfo, EscrowState, Milestone};
+pub use storage::{
+    DataKey, EscrowInfo, EscrowState, Milestone, MilestoneStage, MilestoneStatus, StagedMilestone,
+};
 
 #[cfg(feature = "pausable")]
 use admin::require_admin;
@@ -53,7 +56,9 @@ mod contract {
             amount: i128,
             deadline_ledger: u32,
             dispute_timeout_ledgers: u32,
+            grace_period_ledgers: Option<u32>,
             metadata_hash: Option<soroban_sdk::BytesN<32>>,
+            arbiter_fee_bps: Option<u32>,
         ) -> Result<(), EscrowError> {
             lifecycle::initialize(
                 env,
@@ -65,6 +70,38 @@ mod contract {
                 amount,
                 deadline_ledger,
                 dispute_timeout_ledgers,
+                grace_period_ledgers,
+                metadata_hash,
+                arbiter_fee_bps,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn initialize_with_abandonment_buffer(
+            env: Env,
+            admin: Address,
+            buyer: Address,
+            seller: Address,
+            arbiter: Address,
+            token_contract: Address,
+            amount: i128,
+            deadline_ledger: u32,
+            dispute_timeout_ledgers: u32,
+            abandonment_buffer: u32,
+            metadata_hash: Option<soroban_sdk::BytesN<32>>,
+        ) -> Result<(), EscrowError> {
+            lifecycle::initialize_with_abandonment_buffer(
+                env,
+                admin,
+                buyer,
+                seller,
+                arbiter,
+                token_contract,
+                amount,
+                deadline_ledger,
+                dispute_timeout_ledgers,
+                abandonment_buffer,
                 metadata_hash,
             )
         }
@@ -82,6 +119,7 @@ mod contract {
             required_signatures: u32,
             dispute_timeout_ledgers: u32,
             metadata_hash: Option<soroban_sdk::BytesN<32>>,
+            arbiter_fee_bps: Option<u32>,
         ) -> Result<(), EscrowError> {
             lifecycle::initialize_with_arbiters(
                 env,
@@ -95,6 +133,7 @@ mod contract {
                 required_signatures,
                 dispute_timeout_ledgers,
                 metadata_hash,
+                arbiter_fee_bps,
             )
         }
 
@@ -126,6 +165,10 @@ mod contract {
             lifecycle::request_partial_refund(env)
         }
 
+        pub fn claim_expired_refund(env: Env) -> Result<(), EscrowError> {
+            lifecycle::claim_expired_refund(env)
+        }
+
         pub fn raise_dispute(env: Env, caller: Address) -> Result<(), EscrowError> {
             dispute::raise_dispute(env, caller)
         }
@@ -138,12 +181,54 @@ mod contract {
             dispute::resolve_dispute(env, caller, release_to_seller)
         }
 
+        /// Record an arbiter's approval for the current dispute verdict.
+        ///
+        /// In a multi-arbiter (M-of-N) escrow, each arbiter must approve the
+        /// same verdict until `threshold` distinct approvals are collected,
+        /// at which point the dispute is resolved automatically.
+        pub fn approve_dispute(
+            env: Env,
+            arbiter: Address,
+            release_to_seller: bool,
+        ) -> Result<(), EscrowError> {
+            dispute::approve_dispute(env, arbiter, release_to_seller)
+        }
+
         pub fn claim_dispute_timeout(env: Env) -> Result<(), EscrowError> {
             dispute::claim_dispute_timeout(env)
         }
 
         pub fn cancel(env: Env) -> Result<(), EscrowError> {
             lifecycle::cancel(env)
+        }
+
+        /// Cancel a funded escrow by mutual agreement of both parties.
+        ///
+        /// Requires authentication from both the buyer (depositor) and the
+        /// seller (beneficiary).  All unreleased funds are refunded to the
+        /// depositor and the escrow transitions to `Cancelled`.
+        pub fn mutual_cancel(
+            env: Env,
+            buyer: Address,
+            seller: Address,
+        ) -> Result<(), EscrowError> {
+            lifecycle::mutual_cancel(env, buyer, seller)
+        }
+
+        /// Configure a minimum holding period for the escrowed funds.
+        ///
+        /// Must be called by the buyer before funding.  No release to the
+        /// seller (approval, partial, milestone, dispute or multi-token)
+        /// succeeds while `env.ledger().timestamp() < lockup_deadline`;
+        /// such attempts fail with [`EscrowError::LockupPeriodActive`].
+        pub fn set_lockup_deadline(env: Env, lockup_deadline: u64) -> Result<(), EscrowError> {
+            lifecycle::set_lockup_deadline(env, lockup_deadline)
+        }
+
+        /// Return the configured lockup timestamp, or `None` if unset.
+        #[must_use]
+        pub fn get_lockup_deadline(env: Env) -> Option<u64> {
+            lifecycle::get_lockup_deadline(env)
         }
 
         pub fn extend_deadline(env: Env, new_deadline: u32) -> Result<(), EscrowError> {
@@ -197,6 +282,19 @@ mod contract {
             lifecycle::release_milestone(env, caller, milestone_index)
         }
 
+        /// Approve a partial release of a single milestone.
+        ///
+        /// `release_amount` is paid to the seller and the remainder of the
+        /// milestone allocation is refunded to the buyer.  `release_amount`
+        /// must not exceed the milestone's allocated amount.
+        pub fn approve_milestone_partial(
+            env: Env,
+            milestone_id: u32,
+            release_amount: i128,
+        ) -> Result<(), EscrowError> {
+            lifecycle::approve_milestone_partial(env, milestone_id, release_amount)
+        }
+
         /// Configure the fee deducted from each release and the treasury address
         /// it is routed to.  Must be called by the buyer.
         ///
@@ -222,6 +320,154 @@ mod contract {
         #[must_use]
         pub fn get_milestones(env: Env) -> soroban_sdk::Vec<Milestone> {
             lifecycle::get_milestones(env)
+        }
+
+        // ── Staged percentage milestones with dispute windows (#1437) ─────
+
+        /// Initialize an escrow whose `total_amount` is released in fractional
+        /// stages instead of a single lump sum.
+        ///
+        /// Each [`MilestoneStage`] carries a basis-point share of the total and
+        /// its own dispute window in ledgers. Shares must be non-zero and sum to
+        /// exactly 10 000; the final stage absorbs any rounding remainder. The
+        /// buyer funds the full total with [`Self::fund`].
+        ///
+        /// # Errors
+        /// - [`EscrowError::AlreadyInitialized`] if already initialized.
+        /// - [`EscrowError::InvalidAmount`] if `total_amount <= 0`.
+        /// - [`EscrowError::InvalidMilestoneSchedule`] if the schedule is empty,
+        ///   a share or window is zero, shares do not sum to 10 000, or a stage
+        ///   would receive no funds.
+        /// - [`EscrowError::InvalidParties`] / [`EscrowError::DeadlinePassed`]
+        ///   as for [`Self::initialize`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn initialize_with_milestone_schedule(
+            env: Env,
+            admin: Address,
+            buyer: Address,
+            seller: Address,
+            arbiter: Address,
+            token_contract: Address,
+            total_amount: i128,
+            stages: soroban_sdk::Vec<MilestoneStage>,
+            deadline_ledger: u32,
+            metadata_hash: Option<soroban_sdk::BytesN<32>>,
+        ) -> Result<(), EscrowError> {
+            staged::initialize_with_milestone_schedule(
+                env,
+                admin,
+                buyer,
+                seller,
+                arbiter,
+                token_contract,
+                total_amount,
+                stages,
+                deadline_ledger,
+                metadata_hash,
+            )
+        }
+
+        /// Seller submits the deliverable for stage `index`, opening its
+        /// dispute window. Requires seller auth and a `Funded` escrow.
+        pub fn submit_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::submit_milestone(env, index)
+        }
+
+        /// Buyer approves stage `index` (pending or submitted), releasing its
+        /// allocation to the seller net of any configured fee.
+        pub fn approve_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::approve_milestone(env, index)
+        }
+
+        /// Buyer escalates submitted stage `index` to the arbiter.
+        ///
+        /// # Errors
+        /// - [`EscrowError::DisputeWindowClosed`] if the stage's dispute window
+        ///   has elapsed.
+        pub fn dispute_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::dispute_milestone(env, index)
+        }
+
+        /// Seller claims submitted stage `index` after its dispute window
+        /// elapsed without a dispute (automatic timeout release).
+        ///
+        /// # Errors
+        /// - [`EscrowError::DisputeWindowOpen`] if the window has not elapsed.
+        pub fn claim_milestone(env: Env, index: u32) -> Result<(), EscrowError> {
+            staged::claim_milestone(env, index)
+        }
+
+        /// Arbiter settles disputed stage `index`: `release_to_seller = true`
+        /// pays the seller, `false` refunds the buyer.
+        pub fn resolve_milestone_dispute(
+            env: Env,
+            caller: Address,
+            index: u32,
+            release_to_seller: bool,
+        ) -> Result<(), EscrowError> {
+            staged::resolve_milestone_dispute(env, caller, index, release_to_seller)
+        }
+
+        /// Return the staged milestone schedule, or an empty list if this
+        /// escrow was not initialized with one.
+        #[must_use]
+        pub fn get_staged_milestones(env: Env) -> soroban_sdk::Vec<StagedMilestone> {
+            staged::get_staged_milestones(env)
+        }
+
+        // ── Multi-token entry points (#1192) ──────────────────────────────
+
+        /// Initialize a multi-token escrow holding a basket of SEP-41 tokens.
+        ///
+        /// * `token_contracts` – ordered list of token contract addresses.
+        /// * `token_amounts`   – parallel list of amounts for each token.
+        ///
+        /// Both slices must be non-empty and of equal length.  The first entry
+        /// acts as the "lead" token for fee accounting and event emission.
+        #[allow(clippy::too_many_arguments)]
+        pub fn initialize_with_tokens(
+            env: Env,
+            admin: Address,
+            buyer: Address,
+            seller: Address,
+            arbiter: Address,
+            token_contracts: soroban_sdk::Vec<Address>,
+            token_amounts: soroban_sdk::Vec<i128>,
+            deadline_ledger: u32,
+            dispute_timeout_ledgers: u32,
+            metadata_hash: Option<soroban_sdk::BytesN<32>>,
+        ) -> Result<(), EscrowError> {
+            lifecycle::initialize_with_tokens(
+                env,
+                admin,
+                buyer,
+                seller,
+                arbiter,
+                token_contracts,
+                token_amounts,
+                deadline_ledger,
+                dispute_timeout_ledgers,
+                metadata_hash,
+            )
+        }
+
+        /// Fund a multi-token escrow by transferring all basket tokens from
+        /// the buyer to the contract.  Falls back to `fund` for single-token
+        /// escrows.
+        pub fn fund_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::fund_multi_token(env)
+        }
+
+        /// Release all basket tokens to the seller.
+        /// Falls back to `release_to_seller` for single-token escrows.
+        pub fn release_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::release_multi_token(env)
+        }
+
+        /// Refund all basket tokens to the buyer.
+        /// Falls back to `refund_to_buyer` for single-token escrows.
+        pub fn refund_multi_token(env: Env) -> Result<(), EscrowError> {
+            lifecycle::refund_multi_token(env)
         }
 
         #[must_use]

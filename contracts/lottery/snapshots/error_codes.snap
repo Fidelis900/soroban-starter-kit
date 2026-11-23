@@ -15,3 +15,4 @@ LotteryError::InvalidWinnerConfig = 14
 LotteryError::InsufficientParticipants = 15
 LotteryError::InvalidTicketCap = 16
 LotteryError::TicketCapExceeded = 17
+LotteryError::InvalidFeeConfig = 18

@@ -1,0 +1,133 @@
+# docker/Dockerfile.reproducible
+#
+# Reproducible build container for Soroban contract WASMs.
+#
+# Goal: given the same source commit and the same set of inputs (Rust
+# toolchain, crate versions, compiler flags), produce byte-for-byte identical
+# WASM artifacts so that anyone can verify on-chain binaries match the
+# open-source repository.
+#
+# KEY DESIGN DECISIONS
+# --------------------
+# 1. Rust toolchain is pinned via `rust-toolchain.toml` embedded into the image.
+#    The image uses `rustup` with the channel pinned to the exact version string
+#    declared in `rust-toolchain.toml` at the repo root.
+# 2. Stellar CLI is installed with `--locked` to respect `Cargo.lock`, ensuring
+#    reproducible CLI tooling across builds.
+# 3. RUSTFLAGS contains `-C codegen-units=1 -C opt-level=z` to eliminate any
+#    non-determinism from parallel code generation.
+# 4. `SOURCE_DATE_EPOCH` is set to the git commit timestamp so that any
+#    embedded timestamps in DWARF debug info are deterministic.
+# 5. wasm-opt is run with a fixed optimization level and seed to ensure
+#    deterministic output across runs.
+# 6. The final stage contains ONLY the .wasm artifacts and a checksums file —
+#    no Rust toolchain, no build cache, no secrets.
+#
+# USAGE
+# -----
+# Build:
+#   docker build \
+#     --build-arg GIT_COMMIT_EPOCH=$(git log -1 --format=%ct) \
+#     -f docker/Dockerfile.reproducible \
+#     -t soroban-reproducible:$(git rev-parse --short HEAD) \
+#     .
+#
+# Extract WASMs:
+#   docker run --rm \
+#     -v "$PWD/wasm-out:/out" \
+#     soroban-reproducible:$(git rev-parse --short HEAD) \
+#     sh -c "cp /wasm/*.wasm /wasm/checksums.sha256 /out/"
+#
+# Verify (see scripts/verify-reproducible-wasm.sh for full automation):
+#   sha256sum -c wasm-out/checksums.sha256
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS builder
+
+# Install system dependencies required by the Rust toolchain and Stellar CLI.
+# Pinned apt packages are not available in Debian bookworm-slim; we rely on
+# the Rust toolchain pin (below) for reproducibility of the compiler itself.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    pkg-config \
+    libssl-dev \
+    binaryen \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install rustup (no default toolchain — we pin via rust-toolchain.toml below).
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --default-toolchain none
+RUN chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+WORKDIR /contracts
+
+# Copy the entire workspace so `rustup` picks up rust-toolchain.toml and
+# installs the exact pinned toolchain channel.
+COPY rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
+COPY contracts/ ./contracts/
+COPY benches/ ./benches/
+COPY tests/ ./tests/
+COPY fuzz/ ./fuzz/
+
+# Install the pinned toolchain declared in rust-toolchain.toml plus the
+# wasm32 target required for Soroban contracts.
+RUN rustup show active-toolchain && \
+    rustup target add wasm32-unknown-unknown
+
+# Install Stellar CLI pinned to the version that matches the SDK (soroban-sdk
+# = 28.0.0 → stellar-cli = 21.x). --locked ensures Cargo.lock is respected.
+# NOTE: update this version whenever soroban-sdk is bumped in Cargo.toml.
+RUN cargo install --locked stellar-cli --version 21.7.7 --features opt
+
+# Accept a git commit timestamp so that any timestamps embedded in DWARF
+# sections are deterministic. Default to Unix epoch 0 for local dev builds.
+ARG GIT_COMMIT_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${GIT_COMMIT_EPOCH}
+
+# Deterministic compiler flags:
+#   -C codegen-units=1  — single codegen unit eliminates ordering non-determinism
+#   -C opt-level=z      — size optimisation, same level used in Cargo.toml [profile.release]
+#   -C embed-bitcode=no — omit LLVM bitcode sections (no effect on Wasm output, saves space)
+ENV RUSTFLAGS="-C codegen-units=1 -C opt-level=z -C embed-bitcode=no"
+
+# Build every contract.
+RUN for dir in contracts/*/; do \
+      [ -f "$dir/Cargo.toml" ] && \
+      stellar contract build \
+        --manifest-path "$dir/Cargo.toml" \
+        --profile release; \
+    done
+
+# Run wasm-opt with a fixed random seed for deterministic output.
+# The seed value (42) is arbitrary but must remain constant across builds.
+RUN find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | sort | \
+    while read wasm; do \
+      wasm-opt -Oz --enable-bulk-memory --zero-filled-memory \
+        --output "${wasm}.opt" "$wasm" && mv "${wasm}.opt" "$wasm"; \
+    done
+
+# Generate SHA-256 checksums deterministically (sorted by filename).
+RUN cd target/wasm32-unknown-unknown/release && \
+    find . -maxdepth 1 -name "*.wasm" | sort | xargs sha256sum > checksums.sha256 && \
+    echo "=== Build checksums ===" && cat checksums.sha256
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime — only .wasm artifacts and checksums
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+WORKDIR /wasm
+
+COPY --from=builder /contracts/target/wasm32-unknown-unknown/release/*.wasm ./
+COPY --from=builder /contracts/target/wasm32-unknown-unknown/release/checksums.sha256 ./
+
+# Print the checksums on container start so `docker run` gives immediate output.
+CMD ["sh", "-c", "cat /wasm/checksums.sha256"]

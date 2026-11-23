@@ -41,7 +41,19 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
   - Mainnet deployment
   - Monitoring and maintenance
 
+- **[Storage & TTL Runbook](storage-ttl-runbook.md)** — Operational guide for Soroban storage rent and state archival
+  - Instance vs. persistent TTL management
+  - Rent cost estimation and eviction risks
+  - Automated TTL bumping patterns
+  - Keeper-based archive restoration procedures
+
 ## Development Resources
+
+- **[Getting Started Tutorial](getting-started-tutorial.md)** — End-to-end walkthrough for your first custom contract
+  - Setting up Rust, Soroban CLI, and the Devcontainer
+  - Writing storage types, error enums, and contract logic
+  - Unit, property-based, and snapshot testing
+  - Deploying to a local testnet and invoking contract methods
 
 - **[Development Environment](dev-environment.md)** — Setting up your local development environment
   - Prerequisites
@@ -53,6 +65,16 @@ Welcome to the Soroban starter kit documentation. This directory contains guides
   - Operation costs
   - Storage costs
   - Optimization strategies
+
+## Fuzzing & Benchmark Specs
+
+- **[Fuzz: lottery_draw](fuzzing/lottery-draw.md)** — Commit-reveal fairness, winner uniqueness, pot conservation (#1364)
+- **[Fuzz: vesting_state_machine](fuzzing/vesting-state-machine.md)** — Create/claim/revoke interleavings, grant conservation (#1365)
+- **[Fuzz: nft_state_machine](fuzzing/nft-state-machine.md)** — Approvals, `transfer_from`, royalty bounds (#1366)
+- **[Bench: lottery_ops](benchmarks/lottery-ops.md)** — Ticket purchase scaling (10–500) and multi-winner draw costs (#1367)
+## Proposals
+
+- **[Proposals](proposals/README.md)**: Design notes for open issues (#1368–#1371: benchmarks, bench regression CI, cross-contract integration tests)
 
 ## Architecture Decision Records (ADRs)
 

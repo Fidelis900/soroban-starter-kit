@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, BytesN, Vec, contracttype};
+use soroban_sdk::{Address, BytesN, contracttype};
 
 #[contracttype]
 #[derive(Clone)]
@@ -9,6 +9,8 @@ pub enum DataKey {
     Admin,
     Token,
     TicketPrice,
+    /// Legacy key — no longer written; kept so existing deployed state can be
+    /// read during any future migration if needed.
     Participants,
     State,
     Commit,
@@ -18,7 +20,12 @@ pub enum DataKey {
     WinnerCount,
     PrizeSplits,
     MaxTicketsPerAddress,
+    /// Per-address ticket counter (persistent storage).
     TicketCount(Address),
+    /// Fee in basis points (0–9999) deducted from the prize pool before winner payouts.
+    FeeBps,
+    /// Recipient address for the fee amount.
+    FeeRecipient,
 }
 
 #[contracttype]
@@ -36,7 +43,8 @@ pub struct LotteryInfo {
     pub token: Address,
     pub ticket_price: i128,
     pub state: LotteryState,
-    pub participants: Vec<Address>,
+    /// Total number of tickets sold.
+    pub total_tickets: u32,
 }
 
 /// Commit stored on-chain: hash(secret || salt) where both are 32-byte values.

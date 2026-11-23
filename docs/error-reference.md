@@ -216,7 +216,7 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 **Common cause:** Invoking `wrap`, `unwrap`, or `get_reserve_balance` before `initialize` has been called.
 
-**Resolution:** Call `initialize` with the admin, wrapped token, underlying token, and optional per-address cap before any other interaction.
+**Resolution:** Call `initialize` with the admin, wrapped token, underlying token, optional per-address cap and optional minimum amount before any other interaction. Fees are configured afterwards with `set_fees`.
 
 ---
 
@@ -267,6 +267,70 @@ Comprehensive reference for all error codes returned by the contracts in this re
 **Common cause:** A single address attempting to wrap more than the configured concentration-risk limit, either in one call or across multiple calls.
 
 **Resolution:** Check `wrapped_by(address)` and `max_wrap_per_address()` before calling `wrap`, and keep cumulative wraps within the cap.
+
+---
+
+### `Overflow` (code 8)
+
+**Description:** An `i128` supply, cap or fee calculation in `wrap`, `unwrap` or a batch call overflowed.
+
+**Common cause:** Wrapping very large amounts of a high-decimal asset, or a batch whose summed amounts exceed `i128::MAX`.
+
+**Resolution:** Split the operation into smaller amounts.
+
+---
+
+### `InvalidFee` (code 9)
+
+**Description:** `set_fees` was given a `wrap_fee_bps` or `unwrap_fee_bps` above 10_000, or a non-zero fee without a `fee_recipient`.
+
+**Common cause:** Passing a percentage instead of basis points, or omitting the fee recipient.
+
+**Resolution:** Use basis points (`30` = 0.30%) and pass `Some(fee_recipient)` whenever a fee is non-zero.
+
+---
+
+### `EmptyBatch` (code 10)
+
+**Description:** `wrap_batch` or `unwrap_batch` was called with an empty recipient list.
+
+**Resolution:** Pass at least one `(recipient, amount)` pair.
+
+---
+
+### `RateLimitExceeded` (code 11)
+
+**Description:** The aggregate amount unwrapped in the current ledger window would exceed the cap set with `set_unwrap_rate_limit`.
+
+**Resolution:** Retry after the window rolls over, or split the unwrap across windows.
+
+---
+
+### `AmountTooLow` (code 12)
+
+**Description:** A `wrap`/`unwrap` amount is below the configured minimum (`min_amount()`).
+
+**Resolution:** Use an amount at or above `min_amount()`.
+
+---
+
+### `Reentrancy` (code 13)
+
+**Description:** `wrap`, `unwrap` or a batch variant was invoked while another wrap/unwrap was still executing on the same contract (for example from a malicious underlying token's `transfer` hook).
+
+**Common cause:** A token contract attempting a cross-contract re-entrancy attack.
+
+**Resolution:** None for honest callers — the nested call is rejected and the outer operation is unaffected.
+
+---
+
+### `UnderlyingTransferFailed` (code 14)
+
+**Description:** The underlying asset transfer during `unwrap` (or a fee payout) reverted, or completed without moving exactly the expected amount out of the reserve. The whole operation, including the wrapped-token burn, was rolled back — no balance was lost.
+
+**Common cause:** The underlying token is frozen/paused, the recipient is blocked by the asset issuer, or the underlying token is non-compliant.
+
+**Resolution:** Retry once the underlying asset accepts transfers again, or unwrap to a different recipient with `unwrap_batch`.
 
 ---
 
@@ -349,6 +413,58 @@ Comprehensive reference for all error codes returned by the contracts in this re
 **Common cause:** Submitting a claim after the airdrop's claim window has expired.
 
 **Resolution:** Claims must be submitted before the configured deadline ledger; there is no way to extend it post-deployment.
+
+---
+
+### `InsufficientBalance` (code 9)
+
+**Description:** The contract's balance of the claimed token, minus tokens already locked in vesting schedules, is smaller than the claim (or, for `claim_batch`, the batch total for that token).
+
+**Common cause:** The contract was not funded with every token in a multi-token tree, or was under-funded.
+
+**Resolution:** Transfer enough of each distributed token to the airdrop contract.
+
+---
+
+### `InvalidVestingConfig` (code 10)
+
+**Description:** `initial_unlock_bps` exceeds 10 000, or part of each claim would be locked while `vesting_duration_ledgers` is 0.
+
+**Resolution:** Use `initial_unlock_bps` in `0..=10_000` and a non-zero duration whenever `initial_unlock_bps < 10_000`.
+
+---
+
+### `NoVestingSchedule` (code 11)
+
+**Description:** `release` was called for a `(recipient, token)` pair that has no vesting schedule.
+
+**Common cause:** Vesting is disabled, the pair has not claimed yet, or the whole claim was liquid.
+
+---
+
+### `NothingToRelease` (code 12)
+
+**Description:** No additional tokens have vested since the last `release`.
+
+**Resolution:** Wait for more ledgers to pass; query `releasable` first.
+
+---
+
+### `DuplicateEntry` (code 13)
+
+**Description:** A `claim_batch` call listed the same `(recipient, token)` pair more than once.
+
+---
+
+### `ArithmeticOverflow` (code 14)
+
+**Description:** A checked arithmetic operation overflowed while computing a claim, batch total, or vesting amount.
+
+---
+
+### `EmptyBatch` (code 15)
+
+**Description:** `claim_batch` was called with no entries.
 
 ---
 
@@ -476,11 +592,51 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 ### `BidAlreadyPlaced` (code 13)
 
-**Description:** `cancel` was called after at least one bid has already been placed.
+**Description:** `cancel` was called after at least one bid has already been placed, and the cancellation grace window is disabled (`cancellation_grace_ledgers = 0`) or has elapsed.
 
-**Common cause:** The seller attempting to cancel an auction that already has bidding activity.
+**Common cause:** The seller attempting to cancel an auction that already has bidding activity after `start_ledger + cancellation_grace_ledgers`.
 
-**Resolution:** `cancel` is only valid before the first bid; once bidding starts the auction must run to `end()`.
+**Resolution:** Once bidding starts, `cancel` is only valid inside the grace window, and the seller must pay `cancellation_fee` to the top bidder. After the window closes, the auction must run to `end()`.
+
+---
+
+### `Overflow` (code 14)
+
+**Description:** A checked arithmetic operation on a bid, refund, credit, or Dutch price overflowed `i128` (or `start_ledger + duration_ledgers` overflowed `u32`).
+
+**Common cause:** Prices or increments configured near `i128::MAX`, so `highest_bid + min_increment` or a queued refund cannot be represented.
+
+**Resolution:** Use realistic token amounts; the contract returns this error instead of trapping so no state changes are applied.
+
+---
+
+### `WrongMode` (code 15)
+
+**Description:** The call does not apply to this auction's mode.
+
+**Common cause:** Calling `bid`, `bid_with_credit`, or `end` on an auction started with `start_dutch`, or `get_current_price` / `buy` on an English auction.
+
+**Resolution:** Check `get_dutch_config()`: `Some` means Dutch (use `buy`), `None` means English (use `bid` / `end`).
+
+---
+
+### `AuctionNotStarted` (code 16)
+
+**Description:** `buy` was called before the Dutch auction's `start_ledger`.
+
+**Common cause:** Submitting a purchase for a Dutch auction scheduled to open in the future.
+
+**Resolution:** Wait until the current ledger reaches `get_dutch_config().start_ledger`.
+
+---
+
+### `InvalidNftParams` (code 17)
+
+**Description:** Exactly one of `nft_contract` / `token_id` was supplied to `start` or `start_dutch`.
+
+**Common cause:** Passing an NFT contract without a token id, or vice versa.
+
+**Resolution:** Pass both for a custodial NFT auction, or `None` for both.
 
 ---
 
@@ -1253,6 +1409,66 @@ Comprehensive reference for all error codes returned by the contracts in this re
 
 ---
 
+### `PriceExceedsMax` (code 13)
+
+**Description:** The listing's price is higher than the `max_price` the buyer passed to `buy`.
+
+**Common cause:** The seller cancelled and re-listed at a higher price, or the price changed between the buyer signing and the transaction executing.
+
+**Resolution:** Re-read the listing with `get_listing` and retry with an updated `max_price` if the new price is acceptable.
+
+---
+
+### `CollectionOfferNotFound` (code 14)
+
+**Description:** No collection offer exists for the given `offer_id`.
+
+**Common cause:** Accepting or cancelling a collection offer that was never made, or was already accepted or cancelled.
+
+**Resolution:** Call `get_collection_offer(offer_id)` to confirm the offer exists first.
+
+---
+
+### `CollectionOfferExpired` (code 15)
+
+**Description:** The collection offer's `expires_at` ledger has passed, so it can no longer be accepted.
+
+**Common cause:** Calling `accept_collection_offer` after expiry.
+
+**Resolution:** The buyer can still recover the escrowed funds with `cancel_collection_offer`.
+
+---
+
+### `OfferExpired` (code 16)
+
+**Description:** The offer's `expiration_ledger` has passed, so it can no longer be accepted.
+
+**Common cause:** Calling `accept_offer` after the offer's `expiration_ledger` (set when the buyer called `make_offer`) has elapsed.
+
+**Resolution:** Offers must be accepted before `get_offer(listing_id, buyer).expiration_ledger`. Once expired, anyone may call `expire_offer` to refund the escrowed funds to the bidder, after which the buyer can submit a fresh `make_offer`.
+
+---
+
+### `CounterOfferTooLow` (code 17)
+
+**Description:** A counter-offer does not improve on the current highest offer for the listing by at least the configured minimum increment.
+
+**Common cause:** Submitting an offer that is only marginally above the existing highest offer (e.g. by 1 stroop) instead of meeting the `min_counter_offer_bps` threshold.
+
+**Resolution:** Compute the required minimum as `highest_offer + (highest_offer * min_counter_offer_bps / 10_000)` and offer at least that amount. Read the current highest offer and the configured increment before calling `make_offer`.
+
+---
+
+### `InvalidMinCounterOfferBps` (code 18)
+
+**Description:** The `min_counter_offer_bps` value supplied to `initialize` is outside the valid range.
+
+**Common cause:** Passing a basis-points value above `10_000` (100%) when configuring the marketplace.
+
+**Resolution:** Set `min_counter_offer_bps` within `0`–`10_000` (e.g. `500` for a required +5% increment over the current highest offer).
+
+---
+
 ## Multisig Contract — `MultisigError`
 
 ### `ProposalExpired` (code 11)
@@ -1272,6 +1488,146 @@ Comprehensive reference for all error codes returned by the contracts in this re
 **Common cause:** Adding or configuring a signer with weight `0` in a weighted-multisig setup.
 
 **Resolution:** Every signer must have a weight of at least `1`.
+
+---
+
+### `Reentrant` (code 14)
+
+**Description:** A state-changing entry point was called while the wallet was dispatching an external contract call.
+
+**Common cause:** A proposal target (or token) re-entering the multisig to execute other proposals, spend the allowance, or change signers/configuration.
+
+**Resolution:** Reentrancy is never permitted; perform the follow-up action in a separate transaction.
+
+---
+
+### `TimelockNotElapsed` (code 15)
+
+**Description:** The proposal is queued but `queued_ledger + timelock_delay` has not yet passed.
+
+**Common cause:** Calling `execute_transaction` too soon after the proposal reached threshold.
+
+**Resolution:** Wait until the ledger reported by the `queued` event, then execute.
+
+---
+
+### `NotQueued` (code 16)
+
+**Description:** A timelock is configured but the proposal was never queued.
+
+**Common cause:** The threshold was lowered after the proposal's last signature, so it met the threshold without being queued.
+
+**Resolution:** Call `queue_transaction(tx_id)` and wait out the delay.
+
+---
+
+### `TransactionCancelled` (code 17)
+
+**Description:** The proposal was cancelled by a signer.
+
+**Common cause:** Signing or executing a proposal after `cancel_transaction`.
+
+**Resolution:** Propose a new transaction if the action is still wanted.
+
+---
+
+### `SpendingNotConfigured` (code 18)
+
+**Description:** No daily spending allowance has been configured.
+
+**Common cause:** Calling `spend_allowance` before `set_spending_limit`.
+
+**Resolution:** Configure the allowance with full threshold approval via `set_spending_limit`.
+
+---
+
+### `NotSpendingOperator` (code 19)
+
+**Description:** The caller is not the configured spending operator.
+
+**Common cause:** A signer or third party calling `spend_allowance`.
+
+**Resolution:** Use the operator address set by `set_spending_limit`, or go through a normal proposal.
+
+---
+
+### `DailyLimitExceeded` (code 20)
+
+**Description:** The spend would push the current window's total above `daily_limit`.
+
+**Common cause:** Spending more than the remaining allowance (see `remaining_allowance`).
+
+**Resolution:** Wait for the window to reset, or submit a full-threshold proposal.
+
+---
+
+### `RateLimited` (code 21)
+
+**Description:** The operator made too many `spend_allowance` calls in the current window.
+
+**Common cause:** More than `MAX_SPENDS_PER_WINDOW` spends within `SPENDING_WINDOW_LEDGERS`.
+
+**Resolution:** Batch payments into fewer calls or wait for the window to reset.
+
+---
+
+### `InvalidAmount` (code 22)
+
+**Description:** A spend amount was not positive, or a daily limit was negative.
+
+**Common cause:** Passing `0` or a negative value to `spend_allowance`, or a negative `daily_limit`.
+
+**Resolution:** Use a positive amount and a non-negative limit.
+
+---
+
+### `DuplicateSignature` (code 23)
+
+**Description:** The signatures submitted to `execute` (or another threshold-gated entry point) are not from distinct signers — the same signer address appears more than once.
+
+**Common cause:** A single signer submitting the same signature twice (or two copies of it) in an attempt to satisfy the threshold alone, or an integration that concatenates signature lists without de-duplicating signer addresses.
+
+**Resolution:** Collect exactly one signature per signer. Signatures are verified in strictly ascending signer-address order, so sort the collected signatures by signer address before submitting and remove any duplicates.
+
+---
+
+### `SignerAlreadyExists` (code 24)
+
+**Description:** `replace_signer` was called with a `new_signer` that is already a member of the multisig.
+
+**Common cause:** Replacing a signer with an address that is already in the signer set, or re-submitting a replacement that already took effect.
+
+**Resolution:** Call `get_signers()` to list the current signer set and choose a `new_signer` that is not already present. To change a signer's weight, use the weight-configuration entry point instead.
+
+---
+
+### `SignerNotFound` (code 25)
+
+**Description:** `replace_signer` was called with an `old_signer` that is not a member of the multisig.
+
+**Common cause:** Replacing a signer that was already replaced or removed, or passing the wrong address as `old_signer`.
+
+**Resolution:** Call `get_signers()` to confirm the current signer set before calling `replace_signer`. Note that replacing a signer increments the configuration nonce, which invalidates pending proposals signed under the previous configuration.
+
+---
+
+### `EmptyBatch` (code 26)
+
+**Description:** `execute_batch` was called with an empty list of proposals.
+
+**Common cause:** Passing an empty `Vec` of proposal IDs to `execute_batch`.
+
+**Resolution:** Pass at least one approved proposal ID. Use `execute` for a single proposal.
+
+---
+
+### `BatchExecutionFailed` (code 27)
+
+**Description:** One of the proposals in an `execute_batch` call failed to execute, so the entire batch was rolled back atomically — no proposal in the batch was applied.
+
+**Common cause:** A batched proposal that had not reached threshold, had expired, was cancelled, or whose target call reverted.
+
+**Resolution:** Verify every proposal in the batch is approved, unexpired, and not cancelled before batching. Re-run the failing proposal individually with `execute` to surface the underlying error, then retry the batch.
 
 > See `contract-api.md` for the full `MultisigContract` public API and the
 > remaining `MultisigError` codes 1–10.
@@ -1641,14 +1997,6 @@ Comprehensive reference for all error codes returned by the contracts in this re
 ---
 
 ## Swap Contract — `SwapError`
-
-> **Note:** `contracts/swap/src/lib.rs` currently contains corrupted/duplicated
-> code (e.g. `set_fee_bps` and `get_fee_bps` are each defined twice, and some
-> branches reference states/errors like `SwapState::Pending`/`Accepted` and
-> `SwapError::SwapNotPending`/`SwapExpired` that don't exist in `storage.rs` /
-> `errors.rs`). This section is cross-checked against the authoritative
-> `errors.rs` enum below; see `contract-api.md` for how this affects the
-> documented public API.
 
 ### `NotAuthorized` (code 1)
 

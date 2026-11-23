@@ -21,8 +21,52 @@ pub enum DataKey {
     /// Anti-sniping: number of ledgers to extend the deadline when a bid
     /// arrives within this window of the current deadline.
     ExtensionWindow,
-    /// True once the seller has cancelled the auction (before any bids).
+    /// Hard upper bound on `Deadline`: anti-sniping extensions never push the
+    /// deadline past this ledger.
+    MaxDeadline,
+    /// True once the seller has cancelled the auction.
     Cancelled,
+    /// Ledger sequence at which `start` was called; anchors the cancellation
+    /// grace window.
+    StartLedger,
+    /// Number of ledgers after `StartLedger` during which the seller may
+    /// cancel even though bids exist (0 = disabled).
+    CancellationGraceLedgers,
+    /// Compensation the seller pays the top bidder when cancelling inside the
+    /// grace window after a bid has been placed.
+    CancellationFee,
+    /// Custodial escrow (issue #1069): NFT contract holding the auctioned item.
+    NftContract,
+    /// Custodial escrow (issue #1069): token id of the auctioned item.
+    NftTokenId,
+    /// Dutch (descending price) schedule (issue #1071). Present only when the
+    /// auction was started with `start_dutch`.
+    DutchConfig,
+    /// Seller proceeds awaiting withdrawal after a failed direct payout in
+    /// `end()` (issue #1067).
+    SellerPending(Address),
+    /// Optional buy-it-now price that immediately settles the auction (issue #1294).
+    BuyItNowPrice,
+    /// Per-auction state keyed by auction id, enabling batch operations such as
+    /// `cancel_auctions_batch` (issue #1296).
+    Auction(u32),
+    /// Per-auction cancelled flag keyed by auction id (issue #1296).
+    AuctionCancelled(u32),
+    /// Per-auction anti-sniping extension window in ledgers (issue #1297).
+    AntiSnipingExtensionLedgers(u32),
+}
+
+/// Linear price-decay schedule for a Dutch auction (issue #1071).
+///
+/// The price falls from `start_price` at `start_ledger` to `floor_price` at
+/// `start_ledger + duration_ledgers`, and stays at `floor_price` afterwards.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DutchConfig {
+    pub start_price: i128,
+    pub floor_price: i128,
+    pub start_ledger: u32,
+    pub duration_ledgers: u32,
 }
 
 #[contracttype]
@@ -41,4 +85,18 @@ pub struct AuctionInfo {
     /// Custom anti-sniping window/extension in ledgers (0 = default 10-ledger
     /// window with a 20-ledger extension).
     pub extension_window: u32,
+    /// Ledger past which anti-sniping extensions cannot push the deadline.
+    pub max_deadline: u32,
+    /// Ledger sequence at which the auction was started.
+    pub start_ledger: u32,
+    /// Seller cancellation grace window in ledgers (0 = disabled).
+    pub cancellation_grace_ledgers: u32,
+    /// Compensation paid to the top bidder on a grace-window cancellation.
+    pub cancellation_fee: i128,
+    /// NFT contract of the escrowed item, if the auction is custodial.
+    pub nft_contract: Option<Address>,
+    /// Token id of the escrowed item, if the auction is custodial.
+    pub nft_token_id: Option<u32>,
+    /// Optional buy-it-now price for instant settlement.
+    pub buy_it_now_price: Option<i128>,
 }
