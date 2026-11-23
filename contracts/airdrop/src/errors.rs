@@ -40,6 +40,10 @@ pub enum AirdropError {
     Paused = 16,
     /// Decay parameters are out of range.
     InvalidDecayConfig = 17,
+    /// The address has exceeded the per-ledger-window claim rate limit.
+    RateLimitExceeded = 18,
+    /// KYC attestation is required but has not been verified for this address.
+    KycNotVerified = 19,
 }
 
 #[cfg(test)]
@@ -75,9 +79,10 @@ AirdropError::ClaimWindowClosed = {}\n",
 
     #[test]
     fn airdrop_error_codes_match_snapshot() {
-        assert_eq!(
-            render_error_code_snapshot(),
-            include_str!("../snapshots/error_codes.snap")
-        );
+        // Normalize line endings so the test passes on both Windows (CRLF) and
+        // Unix (LF) without having to manage the .snap file's encoding.
+        let snap = include_str!("../snapshots/error_codes.snap")
+            .replace("\r\n", "\n");
+        assert_eq!(render_error_code_snapshot(), snap);
     }
 }

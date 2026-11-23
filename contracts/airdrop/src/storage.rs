@@ -8,8 +8,10 @@ use soroban_sdk::{Address, contracttype};
 pub enum DataKey {
     /// Admin address (instance).
     Admin,
-    /// Merkle root as a 32-byte value stored as Bytes (instance).
+    /// Current Merkle root as 32-byte Bytes (instance).
     MerkleRoot,
+    /// Epoch-stamped Merkle root written by governance (instance). Key is the epoch number.
+    MerkleRootEpoch(u32),
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
     /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).
@@ -32,6 +34,12 @@ pub enum DataKey {
     Governance,
     /// Current Merkle epoch (instance). Claimed bitmaps are shared across epochs.
     Epoch,
+    /// Rate-limit configuration applied to `claim` and `claim_batch` (instance).
+    RateLimitConfig,
+    /// Whether KYC attestation is required to claim (instance, bool).
+    KycRequired,
+    /// KYC attestation record for an address: set to `true` by the admin (persistent).
+    KycAttestation(Address),
 }
 
 /// Time-decaying claim schedule.
@@ -80,4 +88,18 @@ pub struct VestingSchedule {
     pub start_ledger: u32,
     /// Vesting duration in ledgers.
     pub duration_ledgers: u32,
+}
+
+/// Per-ledger rate-limit configuration for `claim` and `claim_batch`.
+///
+/// Each address is allowed at most `max_claims` claims within any sliding
+/// window of `window_ledgers` ledgers. The namespace used for
+/// `soroban_common::check_and_record` is `1u32` (airdrop-claim namespace).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateLimitConfig {
+    /// Size of the sliding window in ledgers (must be ≥ 1).
+    pub window_ledgers: u32,
+    /// Maximum number of claims allowed per address within one window.
+    pub max_claims: u32,
 }

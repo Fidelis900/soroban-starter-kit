@@ -9,11 +9,9 @@
 
 extern crate std;
 
-use std::format;
-
 use crate::{LotteryContract, LotteryContractClient};
 use proptest::prelude::*;
-use soroban_sdk::{Address, Env, Vec, testutils::Address as _};
+use soroban_sdk::{Address, Env, Vec, testutils::Address as _, token::StellarAssetClient};
 
 fn single_split(env: &Env) -> Vec<u32> {
     Vec::from_array(env, [10_000u32])
@@ -40,6 +38,7 @@ proptest! {
             &ticket_price,
             &1u32,
             &single_split(&env),
+            &None,
             &None,
             &None,
             &None,
@@ -70,6 +69,7 @@ proptest! {
             &None,
             &None,
             &None,
+            &None,
         );
         prop_assert!(result.is_err());
     }
@@ -97,6 +97,7 @@ proptest! {
             &None,
             &None,
             &None,
+            &None,
         );
         prop_assert!(result.is_err());
     }
@@ -114,7 +115,7 @@ proptest! {
         let sac = env.register_stellar_asset_contract_v2(sac_admin);
         let token_addr = sac.address();
 
-        let lottery_addr = env.register_contract(None, LotteryContract);
+        let lottery_addr = env.register(LotteryContract, ());
         let client = LotteryContractClient::new(&env, &lottery_addr);
 
         let splits: soroban_sdk::Vec<u32> = {
@@ -129,6 +130,8 @@ proptest! {
             &10i128,
             &1u32,
             &splits,
+            &None,
+            &None,
             &None,
             &None,
         );

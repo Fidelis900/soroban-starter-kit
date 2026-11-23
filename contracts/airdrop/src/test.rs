@@ -366,7 +366,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     client.set_paused(&true);
     assert!(client.is_paused());
     assert_eq!(
-        client.try_claim(&recipient, &token, &100, &proof),
+        client.try_claim(&recipient, &token, &100, &0u32, &proof),
         Err(Ok(AirdropError::Paused))
     );
 
@@ -374,7 +374,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     assert!(!client.is_paused());
     // With claims resumed the pause error is gone (the root is not set yet).
     assert_eq!(
-        client.try_claim(&recipient, &token, &100, &proof),
+        client.try_claim(&recipient, &token, &100, &0u32, &proof),
         Err(Ok(AirdropError::RootNotSet))
     );
 }
@@ -414,19 +414,46 @@ fn decayed_payout_and_treasury_remainder() {
     client.set_decay_config(&treasury, &config);
     assert_eq!(client.get_decay_config(), Some(config.clone()));
 
-    // Inside the full-reward window: the whole allocation is claimable.
-    env.ledger().with_mut(|li| li.sequence_number = 50);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
+    // `decayed_amount` reads DecayConfig from contract storage, so it must be
+    // called inside the contract context. We do all three ledger scenarios in
+    // one `as_contract` scope to avoid snapshot/restore interference.
+    env.as_contract(&contract, || {
+        // Inside the full-reward window: the whole allocation is claimable.
+        env.ledger().with_mut(|li| li.sequence_number = 50);
+        assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
 
-    // Three decay steps elapsed: 70% to claimant, 30% back to the treasury.
-    env.ledger().with_mut(|li| li.sequence_number = 130);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
-    assert_eq!(decay_bps(&config, 130), 7_000);
+        // Three decay steps elapsed: 70% to claimant, 30% back to the treasury.
+        // With floor_bps=5_000, the reduction of 3*1_000=3_000 would bring the
+        // share to 10_000-5_000-3_000=2_000 which is below the floor, so the
+        // floor kicks in and clamps at 5_000 bps → (500, 500).
+        env.ledger().with_mut(|li| li.sequence_number = 130);
+        assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
 
-    // The schedule never pays less than the configured floor.
-    env.ledger().with_mut(|li| li.sequence_number = 500);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+        // The schedule stays at the floor for all subsequent ledgers.
+        env.ledger().with_mut(|li| li.sequence_number = 500);
+        assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+    });
+    // decay_bps is a pure function (no storage access), callable directly.
+    // At ledger=130: elapsed=30, steps=3, raw=10000-5000-3000=2000 < floor=5000 → 5000
+    assert_eq!(decay_bps(&config, 130), 5_000);
+    // At ledger=500: same floor clamp.
     assert_eq!(decay_bps(&config, 500), 5_000);
+
+    // Verify 70/30 split with a config that has no floor.
+    let config_no_floor = DecayConfig {
+        start_ledger: 0,
+        full_window_ledgers: 100,
+        decay_step_ledgers: 10,
+        decay_bps_per_step: 1_000,
+        floor_bps: 0,
+    };
+    client.set_decay_config(&treasury, &config_no_floor);
+    env.as_contract(&contract, || {
+        env.ledger().with_mut(|li| li.sequence_number = 130);
+        // elapsed=30, steps=3, reduction=3000 → share=7000 → (700, 300)
+        assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
+    });
+    assert_eq!(decay_bps(&config_no_floor, 130), 7_000);
 }
 
 #[test]
@@ -483,7 +510,7 @@ fn governance_root_updates_preserve_claimed_bitmaps() {
     client.update_root_by_governance(&root_one, &2_000);
     assert_eq!(client.get_epoch(), 1);
     env.as_contract(&contract, || {
-        assert!(env.storage().instance().has(&DataKey::MerkleRoot(1)));
+        assert!(env.storage().instance().has(&DataKey::MerkleRootEpoch(1)));
         assert!(env
             .storage()
             .persistent()
@@ -495,11 +522,267 @@ fn governance_root_updates_preserve_claimed_bitmaps() {
     client.update_root_by_governance(&root_two, &3_000);
     assert_eq!(client.get_epoch(), 2);
     env.as_contract(&contract, || {
-        assert!(env.storage().instance().has(&DataKey::MerkleRoot(2)));
+        assert!(env.storage().instance().has(&DataKey::MerkleRootEpoch(2)));
         assert!(env
             .storage()
             .persistent()
             .get::<_, bool>(&DataKey::Claimed(alice.clone(), token.clone()))
             .unwrap());
     });
+}
+
+// ---------------------------------------------------------------------------
+// Per-ledger rate limiting — Task #4
+// ---------------------------------------------------------------------------
+
+/// A single address can claim at most `max_claims` times per window.
+/// The (window_ledgers + 1)th call within the same window must be rejected.
+#[test]
+fn rate_limit_blocks_burst_claiming() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(&env, &token).mint(&contract, &100_000i128);
+
+    // Allow at most 1 claim per 100-ledger window.
+    client.set_rate_limit(&100, &1);
+    assert_eq!(
+        client.get_rate_limit(),
+        Some(RateLimitConfig { window_ledgers: 100, max_claims: 1 })
+    );
+
+    // Build a two-leaf tree so we have two independent proofs for alice.
+    // We actually need a separate token and leaf per claim because the
+    // AlreadyClaimed check would fire first. Instead we build a tree with
+    // alice appearing for two different tokens.
+    let token2 = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &token2).mint(&contract, &100_000i128);
+
+    let alice = Address::generate(&env);
+    let la = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token, TIER_1_AMOUNT, TIER_1)
+    });
+    let lb = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token2, TIER_1_AMOUNT, TIER_1)
+    });
+    let root = hash_pair(&env, &la, &lb);
+    client.set_root(&root);
+
+    let proof_a = vec![&env, lb.clone()];
+    let proof_b = vec![&env, la.clone()];
+
+    // First claim: allowed.
+    client.claim(&alice, &token, &TIER_1_AMOUNT, &TIER_1, &proof_a);
+    assert!(client.is_claimed(&alice, &token));
+
+    // Second claim in the same window (same ledger): must be blocked.
+    assert_eq!(
+        client.try_claim(&alice, &token2, &TIER_1_AMOUNT, &TIER_1, &proof_b),
+        Err(Ok(AirdropError::RateLimitExceeded))
+    );
+    assert!(!client.is_claimed(&alice, &token2));
+}
+
+/// Once the sliding window expires the counter resets and claiming is allowed again.
+#[test]
+fn rate_limit_resets_after_window_expires() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token2 = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(&env, &token).mint(&contract, &100_000i128);
+    StellarAssetClient::new(&env, &token2).mint(&contract, &100_000i128);
+
+    // 1 claim per 50-ledger window.
+    client.set_rate_limit(&50, &1);
+
+    let alice = Address::generate(&env);
+    let la = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token, TIER_1_AMOUNT, TIER_1)
+    });
+    let lb = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token2, TIER_1_AMOUNT, TIER_1)
+    });
+    client.set_root(&hash_pair(&env, &la, &lb));
+
+    // First claim at ledger 0.
+    client.claim(&alice, &token, &TIER_1_AMOUNT, &TIER_1, &vec![&env, lb.clone()]);
+
+    // Advance past the 50-ledger window.
+    env.ledger().with_mut(|l| l.sequence_number = 51);
+
+    // Second claim should now succeed because the window expired.
+    client.claim(&alice, &token2, &TIER_1_AMOUNT, &TIER_1, &vec![&env, la.clone()]);
+    assert!(client.is_claimed(&alice, &token2));
+}
+
+/// Setting window_ledgers = 0 removes the rate limit entirely.
+#[test]
+fn rate_limit_can_be_removed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+
+    client.set_rate_limit(&100, &1);
+    assert!(client.get_rate_limit().is_some());
+
+    client.set_rate_limit(&0, &0);
+    assert_eq!(client.get_rate_limit(), None);
+}
+
+// ---------------------------------------------------------------------------
+// KYC attestation — Task #5
+// ---------------------------------------------------------------------------
+
+/// When KYC is required, an unverified address must be rejected.
+#[test]
+fn kyc_required_blocks_unverified_claimant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(&env, &token).mint(&contract, &100_000i128);
+    client.set_kyc_required(&true);
+    assert!(client.is_kyc_required());
+
+    let alice = Address::generate(&env);
+    let la = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token, TIER_1_AMOUNT, TIER_1)
+    });
+    client.set_root(&la); // single-leaf root; proof is empty
+
+    // Alice has no attestation → rejected.
+    assert_eq!(
+        client.try_claim(&alice, &token, &TIER_1_AMOUNT, &TIER_1, &Vec::new(&env)),
+        Err(Ok(AirdropError::KycNotVerified))
+    );
+    assert!(!client.is_claimed(&alice, &token));
+}
+
+/// A verified address can claim; revoking the attestation blocks future claims
+/// (here demonstrated by a second token that the same address hasn't claimed yet).
+#[test]
+fn kyc_verified_address_can_claim_and_revocation_blocks_further_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token2 = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(&env, &token).mint(&contract, &100_000i128);
+    StellarAssetClient::new(&env, &token2).mint(&contract, &100_000i128);
+    client.set_kyc_required(&true);
+
+    let alice = Address::generate(&env);
+
+    // Grant attestation.
+    client.set_kyc_attestation(&alice, &true);
+    assert!(client.is_kyc_verified(&alice));
+
+    let la = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token, TIER_1_AMOUNT, TIER_1)
+    });
+    let lb = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token2, TIER_1_AMOUNT, TIER_1)
+    });
+    client.set_root(&hash_pair(&env, &la, &lb));
+
+    // First claim succeeds.
+    client.claim(&alice, &token, &TIER_1_AMOUNT, &TIER_1, &vec![&env, lb.clone()]);
+    assert!(client.is_claimed(&alice, &token));
+
+    // Revoke attestation.
+    client.set_kyc_attestation(&alice, &false);
+    assert!(!client.is_kyc_verified(&alice));
+
+    // Second claim (different token, not yet claimed) must now be rejected.
+    assert_eq!(
+        client.try_claim(&alice, &token2, &TIER_1_AMOUNT, &TIER_1, &vec![&env, la.clone()]),
+        Err(Ok(AirdropError::KycNotVerified))
+    );
+    assert!(!client.is_claimed(&alice, &token2));
+}
+
+/// KYC is checked per-recipient in claim_batch; one unverified address rejects the whole batch.
+#[test]
+fn kyc_batch_rejects_if_any_recipient_unverified() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract = env.register(AirdropContract, ());
+    let client = AirdropContractClient::new(&env, &contract);
+
+    client.initialize(&admin, &FAR_DEADLINE, &None);
+    StellarAssetClient::new(&env, &token).mint(&contract, &100_000i128);
+    client.set_kyc_required(&true);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    // Only alice is verified; bob is not.
+    client.set_kyc_attestation(&alice, &true);
+
+    let la = env.as_contract(&contract, || {
+        compute_leaf(&env, &alice, &token, TIER_1_AMOUNT, TIER_1)
+    });
+    let lb = env.as_contract(&contract, || {
+        compute_leaf(&env, &bob, &token, TIER_2_AMOUNT, TIER_2)
+    });
+    client.set_root(&hash_pair(&env, &la, &lb));
+
+    let entries = vec![
+        &env,
+        (alice.clone(), token.clone(), TIER_1_AMOUNT, TIER_1),
+        (bob.clone(), token.clone(), TIER_2_AMOUNT, TIER_2),
+    ];
+    // Batch must be all-or-nothing: bob's missing KYC rejects everything.
+    assert_eq!(
+        client.try_claim_batch(&entries, &Vec::new(&env), &vec![&env, true]),
+        Err(Ok(AirdropError::KycNotVerified))
+    );
+    assert!(!client.is_claimed(&alice, &token));
+    assert!(!client.is_claimed(&bob, &token));
 }

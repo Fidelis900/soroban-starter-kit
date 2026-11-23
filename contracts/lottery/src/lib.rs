@@ -4,6 +4,26 @@
 //!
 //! Players buy tickets while the lottery is open; the admin commits to a hashed
 //! secret then reveals it to draw verifiable random winners.
+//!
+//! # Revenue split
+//!
+//! When a `treasury_address` is provided at initialization the prize pool is
+//! split **before** winner payouts:
+//!
+//! - 85 % → winner(s), distributed according to `prize_splits`
+//! - 10 % → community treasury (`treasury_address`)
+//! -  5 % → operator (`fee_recipient`, when `fee_bps` is also set)
+//!
+//! If no treasury is configured the full distributable pool goes to winners
+//! (after any operator fee).
+//!
+//! # Jackpot rollover
+//!
+//! When participation falls below `min_participants` after a commit the admin
+//! (or any keeper once the reveal deadline passes) may call `rollover`.  The
+//! accumulated ticket revenue is preserved in `RolloverBalance` so it seeds the
+//! next round's jackpot, and a `jackpot_rollover` event is emitted with the
+//! carried balance.
 
 #[cfg(test)]
 #[macro_use]
@@ -20,6 +40,13 @@ pub use storage::{Commit, DataKey, LotteryInfo, LotteryState};
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee, commit_hash,
                      entropy_hash, entropy_index, BPS_DENOMINATOR};
+
+/// Basis points reserved for the community treasury (10 %).
+const TREASURY_BPS: u32 = 1_000;
+/// Basis points reserved for the operator / fee-recipient (5 %).
+const OPERATOR_BPS: u32 = 500;
+/// Basis points that flow to winner(s) when both treasury and operator are set (85 %).
+const WINNER_BPS: u32 = 8_500;
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -47,7 +74,7 @@ fn get_required<T: soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val>>(
 ///
 /// If fewer than `min_participants` unique addresses hold tickets at draw time, admin (or any
 /// permissionless keeper) may call `rollover` instead of `draw` to carry the prize pool into a
-/// new Open round.
+/// new Open round. A `jackpot_rollover` event is emitted with the carried balance.
 ///
 /// If the admin never calls `draw` before the reveal deadline, ticket buyers can call
 /// `claim_refund` to recover their ticket price.
@@ -72,18 +99,18 @@ mod contract {
         /// Initialise the lottery.
         ///
         /// `winner_count` sets how many distinct winners `draw` selects, and `prize_splits`
-        /// gives each winner's share of the prize pool in basis points (must sum to 10 000).
-        /// `max_tickets_per_address`, if set, caps how many tickets a single address may buy.
-        /// `min_participants`, if set, is the minimum number of distinct participant addresses
-        /// required before `draw` may succeed; if the threshold is not met the admin may call
-        /// `rollover` to start a new round and carry the prize pool forward.
-        /// `fee_bps` is an optional operator rake in basis points (1–9 999). When set,
-        /// `fee_recipient` must also be provided; the fee is transferred to that address
-        /// at `draw` time before the winner prize pool is calculated.
+        /// gives each winner's share of the **winner portion** of the prize pool in basis points
+        /// (must sum to 10 000). `max_tickets_per_address`, if set, caps how many tickets a
+        /// single address may buy. `min_participants`, if set, is the minimum number of distinct
+        /// participant addresses required before `draw` may succeed.
         ///
         /// `fee_bps` is an optional operator rake in basis points (1–9 999). When set,
-        /// `fee_recipient` must also be provided; the fee is transferred to that address
-        /// at `draw` time before the winner prize pool is calculated.
+        /// `fee_recipient` must also be provided. If `treasury_address` is **also** provided the
+        /// fixed 85 / 10 / 5 revenue split applies (winner / treasury / operator); otherwise the
+        /// operator fee is deducted first and winners share the remainder.
+        ///
+        /// `treasury_address` configures the community treasury that receives 10 % of every
+        /// prize pool. It may be set independently of `fee_bps` / `fee_recipient`.
         ///
         /// # Errors
         /// - [`LotteryError::AlreadyInitialized`]
@@ -93,6 +120,8 @@ mod contract {
         /// - [`LotteryError::InvalidTicketCap`] if `max_tickets_per_address` is `Some(0)`
         /// - [`LotteryError::InvalidFeeConfig`] if `fee_bps >= 10_000`, or exactly one of
         ///   `fee_bps`/`fee_recipient` is set without the other
+        /// - [`LotteryError::InvalidSplitConfig`] if the 85/10/5 split cannot be satisfied
+        ///   (e.g. treasury + operator would exceed 100 %)
         pub fn initialize(
             env: Env,
             admin: Address,
@@ -103,6 +132,7 @@ mod contract {
             max_tickets_per_address: Option<u32>,
             fee_bps: Option<u32>,
             fee_recipient: Option<Address>,
+            treasury_address: Option<Address>,
         ) -> Result<(), LotteryError> {
             if env.storage().instance().has(&State) {
                 return Err(LotteryError::AlreadyInitialized);
@@ -138,6 +168,17 @@ mod contract {
                 _ => return Err(LotteryError::InvalidFeeConfig),
             }
 
+            // When all three parties are present, enforce that TREASURY_BPS + OPERATOR_BPS
+            // leaves a positive winner share (i.e. their sum < 10 000).
+            if treasury_address.is_some() && fee_recipient.is_some() {
+                let combined = TREASURY_BPS
+                    .checked_add(OPERATOR_BPS)
+                    .ok_or(LotteryError::InvalidSplitConfig)?;
+                if combined >= BPS_DENOMINATOR as u32 {
+                    return Err(LotteryError::InvalidSplitConfig);
+                }
+            }
+
             admin.require_auth();
 
             env.storage().instance().set(&Admin, &admin);
@@ -153,6 +194,9 @@ mod contract {
             if let (Some(bps), Some(recipient)) = (fee_bps, fee_recipient) {
                 env.storage().instance().set(&FeeBps, &bps);
                 env.storage().instance().set(&FeeRecipient, &recipient);
+            }
+            if let Some(treasury) = treasury_address {
+                env.storage().instance().set(&TreasuryAddress, &treasury);
             }
 
             bump_instance(&env);
@@ -175,8 +219,8 @@ mod contract {
         ///
         /// Validates that `count > 0` and that the buyer's total after this call does not exceed
         /// `max_tickets_per_address`. Transfers `ticket_price * count` tokens from the buyer to
-        /// the contract in a single `transfer` call, then appends `count` indexed participant
-        /// entries to persistent storage.
+        /// the contract in a single `transfer` call, then stores `count` indexed participant
+        /// entries in persistent storage.
         ///
         /// # Errors
         /// - [`LotteryError::NotInitialized`]
@@ -222,16 +266,33 @@ mod contract {
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             let token_addr: Address = get_required(&env, &Token)?;
 
-            let mut participants: Vec<Address> = get_required(&env, &Participants)?;
-            participants.push_back(buyer.clone());
-            env.storage().instance().set(&Participants, &participants);
+            // Record each ticket as an indexed persistent entry.
+            let start_idx: u32 = get_required(&env, &TotalTickets)?;
+            for i in 0..count {
+                #[allow(clippy::arithmetic_side_effects)]
+                let idx = start_idx + i;
+                let p_key = Participant(idx);
+                env.storage().persistent().set(&p_key, &buyer);
+                env.storage().persistent().extend_ttl(
+                    &p_key,
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
+            }
+
+            // Update the global ticket counter.
+            #[allow(clippy::arithmetic_side_effects)]
+            let new_total_tickets = start_idx + count;
+            env.storage()
+                .instance()
+                .set(&TotalTickets, &new_total_tickets);
 
             // Update per-address ticket counter.
             #[allow(clippy::arithmetic_side_effects)]
             let new_count = ticket_count + count;
             env.storage()
                 .persistent()
-                .set(&TicketCount(buyer.clone()), &(ticket_count + 1));
+                .set(&TicketCount(buyer.clone()), &new_count);
             env.storage().persistent().extend_ttl(
                 &TicketCount(buyer.clone()),
                 LEDGER_LIFETIME_THRESHOLD,
@@ -239,7 +300,11 @@ mod contract {
             );
 
             // Single token transfer for the whole batch.
-            #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::cast_possible_truncation,
+                clippy::as_conversions
+            )]
             let total_cost = ticket_price * count as i128;
             token::Client::new(&env, &token_addr).transfer(
                 &buyer,
@@ -308,11 +373,20 @@ mod contract {
 
         /// Admin reveals secret and salt. The contract verifies the preimage matches
         /// the stored commitment, then uses hash(secret ++ salt ++ ledger ++ round) to pick
-        /// `winner_count` distinct winners and splits the prize pool between them according to
-        /// the configured `prize_splits`.
+        /// `winner_count` distinct winners.
         ///
-        /// If a fee was configured at initialization, the fee amount is deducted from the total
-        /// prize pool and transferred to the fee recipient before winners are paid.
+        /// # Revenue split
+        ///
+        /// The total ticket revenue is split in this order:
+        ///
+        /// 1. If `treasury_address` **and** `fee_recipient` are both set, the fixed
+        ///    85 / 10 / 5 split applies: 10 % to treasury, 5 % to operator, 85 % to winners.
+        /// 2. If only `treasury_address` is set, 10 % goes to treasury and 90 % to winners.
+        /// 3. If only `fee_recipient` / `fee_bps` is set, the configured fee is deducted and
+        ///    the remainder goes to winners.
+        /// 4. Otherwise the full pool goes to winners.
+        ///
+        /// Any carried-over `RolloverBalance` is added to the prize pool before distribution.
         ///
         /// # Errors
         /// - [`LotteryError::NotInitialized`]
@@ -339,7 +413,6 @@ mod contract {
 
             // Verify commitment: SHA-256(secret ++ salt) must match stored hash.
             let computed: BytesN<32> = commit_hash(&env, &secret, &salt).into();
-
             let stored_commit: Commit = get_required(&env, &Commit)?;
             if computed != stored_commit.hash {
                 return Err(LotteryError::RevealMismatch);
@@ -349,10 +422,10 @@ mod contract {
             let winner_count: u32 = get_required(&env, &WinnerCount)?;
             let prize_splits: Vec<u32> = get_required(&env, &PrizeSplits)?;
 
-            // Rebuild the participant list from indexed persistent storage.
+            // Rebuild the participant pool from indexed persistent storage.
             let mut pool: Vec<Address> = Vec::new(&env);
             for idx in 0..total_tickets {
-                #[allow(clippy::unwrap_used)] // Every idx in 0..total_tickets was written at buy time
+                #[allow(clippy::unwrap_used)]
                 let addr: Address = env
                     .storage()
                     .persistent()
@@ -376,8 +449,6 @@ mod contract {
             let mut winners: Vec<Address> = Vec::new(&env);
 
             for round in 0..winner_count {
-                // FIX #1252: include both ledger bytes AND round bytes in entropy so each
-                // round produces a distinct hash rather than the same hash every iteration.
                 let round_bytes = round.to_be_bytes();
                 let mut extra = [0u8; 8];
                 extra[..4].copy_from_slice(&ledger_bytes);
@@ -385,43 +456,114 @@ mod contract {
                 let entropy = entropy_hash(&env, &secret, &salt, &extra);
                 let idx = entropy_index(&entropy, pool.len());
 
-                #[allow(clippy::unwrap_used)] // idx is derived from modulo of len, always in bounds
+                #[allow(clippy::unwrap_used)]
                 let winner = pool.get(idx).unwrap();
                 winners.push_back(winner.clone());
 
                 // Remove every ticket held by this winner so they can't be drawn again.
-                let mut remaining = Vec::new(&env);
+                let mut remaining_pool = Vec::new(&env);
                 for p in pool.iter() {
                     if p != winner {
-                        remaining.push_back(p);
+                        remaining_pool.push_back(p);
                     }
                 }
-                pool = remaining;
+                pool = remaining_pool;
             }
 
-            // Mark the draw complete before distributing the prize pool. If any transfer fails,
-            // the transaction reverts this state transition together with the failed call.
+            // Mark the draw complete before distributing the prize pool.
             env.storage().instance().set(&State, &LotteryState::Drawn);
             env.storage().instance().set(&Winners, &winners);
-            #[allow(clippy::unwrap_used)] // winner_count >= 1, validated at initialize
+            #[allow(clippy::unwrap_used)]
             let first_winner = winners.get(0).unwrap();
             env.storage().instance().set(&Winner, &first_winner);
 
-            // Distribute the prize pool according to the configured splits.
+            // Total prize = ticket revenue + any carried-over rollover balance.
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
-            #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
-            let total_prize = ticket_price * total_tickets as i128;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::cast_possible_truncation,
+                clippy::as_conversions
+            )]
+            let ticket_revenue = ticket_price * total_tickets as i128;
+            let rollover_balance: i128 = env
+                .storage()
+                .instance()
+                .get(&RolloverBalance)
+                .unwrap_or(0i128);
+            #[allow(clippy::arithmetic_side_effects)]
+            let total_prize = ticket_revenue + rollover_balance;
+
+            // Clear the rollover balance now that it's been folded in.
+            if rollover_balance > 0 {
+                env.storage().instance().remove(&RolloverBalance);
+            }
+
             let token_addr: Address = get_required(&env, &Token)?;
             let token_client = token::Client::new(&env, &token_addr);
 
-            // Deduct the operator rake if configured, then distribute the remainder.
-            let distributable_prize = if let Some(fee_bps) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&FeeBps)
-            {
-                #[allow(clippy::unwrap_used)] // fee_bps and fee_recipient are validated as a pair at initialize
-                let fee_recipient: Address = env.storage().instance().get(&FeeRecipient).unwrap();
+            let has_treasury = env.storage().instance().has(&TreasuryAddress);
+            let has_fee = env.storage().instance().has(&FeeBps);
+
+            // ── Revenue split ────────────────────────────────────────────────
+            //
+            // Three-way split (85 / 10 / 5) when both treasury and operator are
+            // configured; two-way treasury split (90 / 10) when only the treasury
+            // is configured; legacy operator fee otherwise.
+            let distributable_prize: i128 = if has_treasury && has_fee {
+                // Fixed 85/10/5 split.
+                #[allow(clippy::unwrap_used)]
+                let treasury: Address = env.storage().instance().get(&TreasuryAddress).unwrap();
+                #[allow(clippy::unwrap_used)]
+                let fee_recipient: Address =
+                    env.storage().instance().get(&FeeRecipient).unwrap();
+
+                let treasury_amount =
+                    apply_bps_fee(total_prize, TREASURY_BPS).unwrap_or(0);
+                let operator_amount =
+                    apply_bps_fee(total_prize, OPERATOR_BPS).unwrap_or(0);
+
+                if treasury_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &treasury,
+                        &treasury_amount,
+                    );
+                    events::treasury_paid(&env, &treasury, treasury_amount);
+                }
+                if operator_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &fee_recipient,
+                        &operator_amount,
+                    );
+                    events::fee_transferred(&env, &fee_recipient, operator_amount);
+                }
+
+                // Winners get the remaining WINNER_BPS share.
+                apply_bps_fee(total_prize, WINNER_BPS).unwrap_or(0)
+            } else if has_treasury {
+                // Treasury-only: 10% to treasury, 90% to winners.
+                #[allow(clippy::unwrap_used)]
+                let treasury: Address = env.storage().instance().get(&TreasuryAddress).unwrap();
+                let treasury_amount =
+                    apply_bps_fee(total_prize, TREASURY_BPS).unwrap_or(0);
+                if treasury_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &treasury,
+                        &treasury_amount,
+                    );
+                    events::treasury_paid(&env, &treasury, treasury_amount);
+                }
+                #[allow(clippy::arithmetic_side_effects)]
+                { total_prize - treasury_amount }
+            } else if has_fee {
+                // Legacy operator-only fee.
+                #[allow(clippy::unwrap_used)]
+                let fee_bps: u32 = env.storage().instance().get(&FeeBps).unwrap();
+                #[allow(clippy::unwrap_used)]
+                let fee_recipient: Address =
+                    env.storage().instance().get(&FeeRecipient).unwrap();
                 let fee_amount = apply_bps_fee(total_prize, fee_bps).unwrap_or(0);
                 if fee_amount > 0 {
                     token_client.transfer(
@@ -437,12 +579,12 @@ mod contract {
                 total_prize
             };
 
+            // Distribute the winner portion according to `prize_splits`.
             for i in 0..winner_count {
-                #[allow(clippy::unwrap_used)] // i < winner_count == winners.len() == prize_splits.len()
+                #[allow(clippy::unwrap_used)]
                 let winner = winners.get(i).unwrap();
                 #[allow(clippy::unwrap_used)]
                 let split = prize_splits.get(i).unwrap();
-                #[allow(clippy::arithmetic_side_effects, clippy::integer_division)]
                 let amount = apply_bps_fee(distributable_prize, split).unwrap_or(0);
                 token_client.transfer(&env.current_contract_address(), &winner, &amount);
                 events::winner_drawn(&env, &winner, amount);
@@ -455,16 +597,10 @@ mod contract {
         /// If participation fell below `min_participants` (or below `winner_count`) after a
         /// commit, the admin (or any permissionless keeper once the reveal deadline has passed)
         /// may call `rollover` to reset the lottery to the Open state without distributing the
-        /// prize pool.  Ticket sales and balances are preserved so the accumulated prize carries
-        /// forward into the new round.
+        /// prize pool. The accumulated ticket revenue is preserved as `RolloverBalance` to seed
+        /// the next round's jackpot, and a `jackpot_rollover` event is emitted with that balance.
         ///
-        /// Rollover is available when:
-        /// - The lottery is in the Committed state, AND
-        /// - The reveal deadline has passed (keeper path) OR caller is the admin, AND
-        /// - The number of distinct participants is below `min_participants` (if set) OR
-        ///   below `winner_count` (fallback guard).
-        ///
-        /// After a rollover the lottery returns to the Open state.  The admin must call
+        /// After a rollover the lottery returns to the Open state. The admin must call
         /// `commit` again (with a new hash and deadline) to proceed to draw.
         ///
         /// # Errors
@@ -479,17 +615,13 @@ mod contract {
             let reveal_deadline: u32 = get_required(&env, &RevealDeadline)?;
             let admin: Address = get_required(&env, &Admin)?;
 
-            // Permissioned check: once the reveal deadline passes the call is permissionless
-            // (anyone can trigger rollover as a keeper). Before the deadline only the admin may
-            // call, which we enforce with require_auth.
+            // Permissioned check: once the reveal deadline passes the call is permissionless.
             let deadline_passed = env.ledger().sequence() > reveal_deadline;
             if !deadline_passed {
                 admin.require_auth();
             }
 
-            // Determine the effective minimum: use configured min_participants if present,
-            // otherwise fall back to winner_count (you must have at least winner_count unique
-            // addresses to run a draw).
+            // Determine effective minimum.
             let winner_count: u32 = get_required(&env, &WinnerCount)?;
             let effective_min: u32 = env
                 .storage()
@@ -513,17 +645,38 @@ mod contract {
             }
 
             if seen.len() >= effective_min {
-                // Enough participants — rollover would be an abuse; force admin to draw instead.
                 return Err(LotteryError::RolloverNotAvailable);
             }
 
-            // Reset to Open: clear commit and deadline, keep tickets and prize pool intact.
+            // Accumulate the current ticket revenue into the rollover balance.
+            let ticket_price: i128 = get_required(&env, &TicketPrice)?;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::cast_possible_truncation,
+                clippy::as_conversions
+            )]
+            let round_revenue = ticket_price * total_tickets as i128;
+
+            let prev_rollover: i128 = env
+                .storage()
+                .instance()
+                .get(&RolloverBalance)
+                .unwrap_or(0i128);
+            #[allow(clippy::arithmetic_side_effects)]
+            let new_rollover = prev_rollover + round_revenue;
+            env.storage()
+                .instance()
+                .set(&RolloverBalance, &new_rollover);
+
+            // Reset to Open: clear commit, deadline, and ticket state.
             env.storage().instance().remove(&Commit);
             env.storage().instance().remove(&RevealDeadline);
+            env.storage().instance().set(&TotalTickets, &0u32);
             env.storage().instance().set(&State, &LotteryState::Open);
 
             bump_instance(&env);
             events::rolled_over(&env, &admin);
+            events::jackpot_rollover(&env, new_rollover);
             Ok(())
         }
 
@@ -551,8 +704,8 @@ mod contract {
                 return Err(LotteryError::RefundNotAvailable);
             }
 
-            // Count tickets belonging to this buyer and mark them as refunded by setting
-            // the persistent entry to the contract address (a sentinel that won't win).
+            // Count tickets belonging to this buyer and overwrite their persistent slots
+            // with the contract address (sentinel — will never win future draws).
             let total_tickets: u32 = get_required(&env, &TotalTickets)?;
             let mut ticket_count: i128 = 0;
             let contract_addr = env.current_contract_address();
@@ -566,17 +719,19 @@ mod contract {
                     {
                         ticket_count += 1;
                     }
-                } else {
-                    remaining.push_back(p);
+                    // Mark as refunded so this slot won't match the buyer again.
+                    env.storage().persistent().set(&key, &contract_addr);
                 }
             }
 
             if ticket_count == 0 {
                 return Err(LotteryError::NothingToRefund);
             }
-            env.storage().instance().set(&Participants, &remaining);
+
             // Clear the persistent TicketCount so this address can participate in future rounds.
-            env.storage().persistent().remove(&TicketCount(buyer.clone()));
+            env.storage()
+                .persistent()
+                .remove(&TicketCount(buyer.clone()));
 
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             #[allow(clippy::arithmetic_side_effects)]
@@ -640,6 +795,15 @@ mod contract {
                 .persistent()
                 .get(&TicketCount(buyer))
                 .unwrap_or(0)
+        }
+
+        /// Return the carried-over rollover balance that will be added to the next draw's jackpot.
+        #[must_use]
+        pub fn get_rollover_balance(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&RolloverBalance)
+                .unwrap_or(0i128)
         }
     }
 }
