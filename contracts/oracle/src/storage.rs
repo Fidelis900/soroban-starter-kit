@@ -47,6 +47,13 @@ pub enum DataKey {
     /// Minimum number of fresh publisher submissions required for
     /// `get_median_price` to return a result (issue #1195).
     MinQuorum,
+    /// Maximum number of ledgers between the current ledger and the ledger at
+    /// which a publisher's price data was originated; submissions older than
+    /// this delta are rejected (issue #1501).
+    MaxSubmissionAge,
+    /// Tolerance in basis points around the consensus median within which a
+    /// publisher's submission must fall to avoid slashing (issue #1503).
+    ConsensusToleranceBps,
 }
 
 /// Snapshot of the oracle state returned by read entry points.

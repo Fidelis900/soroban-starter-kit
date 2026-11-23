@@ -20,22 +20,25 @@ pub enum OracleError {
     /// The publisher already submitted a price in the current ledger.
     SubmissionTooFrequent = 9,
     /// Price submitted is zero or negative.
-    InvalidPrice = 8,
+    InvalidPrice = 10,
     /// Requested asset symbol has no price feed.
-    AssetNotFound = 9,
+    AssetNotFound = 11,
     /// The update exceeded the configured maximum deviation.
-    PriceDeviationTooHigh = 10,
+    PriceDeviationTooHigh = 12,
     /// The feed is paused pending administrator verification.
-    FeedPaused = 11,
+    FeedPaused = 13,
     /// The circuit-breaker threshold is invalid.
-    InvalidDeviationThreshold = 12,
+    InvalidDeviationThreshold = 14,
     /// The publisher has no registered bond or the penalty exceeds it.
-    InsufficientBond = 13,
+    InsufficientBond = 15,
     /// Publisher bonding has not been configured.
-    BondingNotConfigured = 14,
+    BondingNotConfigured = 16,
     /// Fewer than the configured minimum quorum of fresh publishers
     /// submitted prices for `get_median_price` (issue #1195).
-    InsufficientQuorum = 10,
+    InsufficientQuorum = 17,
+    /// The price submission timestamp is older than the allowed maximum ledger
+    /// delta, indicating the price data is too stale to accept (issue #1501).
+    SubmissionTooOld = 18,
 }
 
 impl_display_error!(
@@ -47,6 +50,8 @@ impl_display_error!(
     InvalidStalenessThreshold   => "invalid staleness threshold",
     NoPublisherData             => "no publisher data",
     InsufficientHistory         => "insufficient history",
+    InvalidSmoothingFactor      => "invalid smoothing factor",
+    SubmissionTooFrequent       => "submission too frequent",
     InvalidPrice                => "price must be greater than zero",
     AssetNotFound               => "asset not found",
     PriceDeviationTooHigh       => "price deviation too high",
@@ -55,6 +60,7 @@ impl_display_error!(
     InsufficientBond            => "insufficient publisher bond",
     BondingNotConfigured        => "publisher bonding not configured",
     InsufficientQuorum          => "insufficient publisher quorum",
+    SubmissionTooOld            => "submission too old: price data exceeds maximum ledger delta",
 );
 
 #[cfg(test)]
@@ -77,15 +83,16 @@ OracleError::InvalidStalenessThreshold = {}\n\
 OracleError::NoPublisherData = {}\n\
 OracleError::InsufficientHistory = {}\n\
 OracleError::InvalidSmoothingFactor = {}\n\
-OracleError::SubmissionTooFrequent = {}\n",
+OracleError::SubmissionTooFrequent = {}\n\
 OracleError::InvalidPrice = {}\n\
 OracleError::AssetNotFound = {}\n\
 OracleError::PriceDeviationTooHigh = {}\n\
 OracleError::FeedPaused = {}\n\
 OracleError::InvalidDeviationThreshold = {}\n\
 OracleError::InsufficientBond = {}\n\
-OracleError::BondingNotConfigured = {}\n",
-OracleError::InsufficientQuorum = {}\n",
+OracleError::BondingNotConfigured = {}\n\
+OracleError::InsufficientQuorum = {}\n\
+OracleError::SubmissionTooOld = {}\n",
             OracleError::AlreadyInitialized as u32,
             OracleError::NotInitialized as u32,
             OracleError::Unauthorized as u32,
@@ -103,6 +110,7 @@ OracleError::InsufficientQuorum = {}\n",
             OracleError::InsufficientBond as u32,
             OracleError::BondingNotConfigured as u32,
             OracleError::InsufficientQuorum as u32,
+            OracleError::SubmissionTooOld as u32,
         )
     }
 
