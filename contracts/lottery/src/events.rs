@@ -41,9 +41,7 @@ pub fn refund_claimed(env: &Env, buyer: &Address, amount: i128) {
         .publish((Symbol::new(env, "refund_claimed"), buyer.clone()), amount);
 }
 
-pub fn fee_transferred(env: &Env, recipient: &Address, amount: i128) {
-    env.events().publish(
-        (Symbol::new(env, "fee_transferred"), recipient.clone()),
-        amount,
-    );
+pub fn rolled_over(env: &Env, admin: &Address) {
+    env.events()
+        .publish((Symbol::new(env, "rolled_over"), admin.clone()), ());
 }

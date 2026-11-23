@@ -26,6 +26,12 @@ pub enum DataKey {
     FeeBps,
     /// Recipient address for the fee amount.
     FeeRecipient,
+    /// Total number of tickets sold across all participants (instance storage).
+    TotalTickets,
+    /// Per-index participant address entry (persistent storage).
+    Participant(u32),
+    /// Minimum number of distinct participants required for a draw (instance storage).
+    MinParticipants,
 }
 
 #[contracttype]
