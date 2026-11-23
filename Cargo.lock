@@ -1736,11 +1736,13 @@ name = "soroban-integration-tests"
 version = "0.1.0"
 dependencies = [
  "soroban-auction-template",
+ "soroban-crowdfund-template",
  "soroban-escrow-template",
  "soroban-lottery-template",
  "soroban-marketplace-template",
  "soroban-nft-template",
  "soroban-sdk",
+ "soroban-timelock-template",
  "soroban-token-template",
 ]
 
