@@ -23,6 +23,11 @@ pub enum AuctionError {
     /// `cancel` was called after at least one bid has been placed and the
     /// cancellation grace window is disabled or has elapsed.
     BidAlreadyPlaced = 13,
+    /// The bid does not exceed the current highest bid by at least
+    /// [`crate::MIN_BID_INCREMENT_BPS`].
+    BidIncrementTooLow = 14,
+    /// A checked arithmetic operation overflowed.
+    ArithmeticOverflow = 15,
     /// A checked arithmetic operation on bid, refund, or price values overflowed.
     Overflow = 14,
     /// The call does not apply to this auction's mode (English vs. Dutch).
@@ -49,6 +54,9 @@ impl_display_error!(
     InvalidDeadline    => "invalid deadline",
     NothingToWithdraw  => "nothing to withdraw",
     ReserveNotMet      => "reserve price not met",
+    BidAlreadyPlaced   => "cannot cancel after a bid has been placed",
+    BidIncrementTooLow => "bid below minimum percentage increment",
+    ArithmeticOverflow => "arithmetic overflow",
     BidAlreadyPlaced   => "cannot cancel after a bid outside the grace window",
     Overflow           => "arithmetic overflow",
     WrongMode          => "operation not supported in this auction mode",
@@ -82,6 +90,8 @@ AuctionError::InvalidDeadline = {}\n\
 AuctionError::NothingToWithdraw = {}\n\
 AuctionError::ReserveNotMet = {}\n\
 AuctionError::BidAlreadyPlaced = {}\n\
+AuctionError::BidIncrementTooLow = {}\n\
+AuctionError::ArithmeticOverflow = {}\n",
 AuctionError::Overflow = {}\n\
 AuctionError::WrongMode = {}\n\
 AuctionError::AuctionNotStarted = {}\n\
@@ -100,6 +110,8 @@ AuctionError::BatchCancelFailed = {}\n",
             AuctionError::NothingToWithdraw as u32,
             AuctionError::ReserveNotMet as u32,
             AuctionError::BidAlreadyPlaced as u32,
+            AuctionError::BidIncrementTooLow as u32,
+            AuctionError::ArithmeticOverflow as u32,
             AuctionError::Overflow as u32,
             AuctionError::WrongMode as u32,
             AuctionError::AuctionNotStarted as u32,

@@ -152,7 +152,7 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Ended (no bids) | `ended_no_bids` | `(Symbol,)` → event name | `()` | `end()` called with no bids |
 | Ended (reserve not met) | `ended_reserve_not_met` | `(Symbol, Address)` → event name, highest bidder | `(i128, i128)` → highest bid, reserve price | `end()` called, bid < reserve |
 | Bid Withdrawn | `withdrawn` | `(Symbol, Address)` → event name, bidder | `i128` → amount returned | `withdraw()` called by losing bidder |
-| Deadline Extended | `deadline_extended` | `(Symbol,)` → event name | `u32` → new deadline ledger | Anti-snipe window triggered during `bid()` |
+| Auction Extended | `AuctionExtended` | `(Symbol, Address)` → event name, auction ID (contract address) | `u32` → new deadline ledger | `bid()` lands within the anti-snipe window (default: final 10 ledgers, +20 ledgers) |
 | Cancelled | `cancelled` | `(Symbol, Address)` → event name, seller | `()` | `cancel()` called by seller (no bids placed) |
 | Credit Applied | `credit_applied` | `(Symbol, Address)` → event name, bidder | `(i128, i128)` → credit used, amount transferred | `bid_with_credit()` called |
 | Dutch Started | `dutch_started` | `(Symbol, Address)` → event name, seller | `(i128, i128, u32, u32)` → start price, floor price, start ledger, duration ledgers | `start_dutch()` called |
@@ -222,6 +222,9 @@ env.events().publish((topic_1, topic_2, ...), data);
 | Offers Batch Made | `offers_batch_made` | `(Symbol, Address)` → event name, buyer | `(Vec<u32>, i128, u32)` → token IDs, total escrow transferred, expiration ledger | `make_offers_batch()` called |
 | Offer Accepted | `offracc` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, accepted amount | `accept_offer()` called by seller |
 | Offer Cancelled | `offrcncl` | `(Symbol, u64)` → event name, listing ID | `Address` → buyer | `cancel_offer()` called by buyer |
+| Dutch Listed | `dutch_listed` | `(Symbol, u64)` → event name, listing ID | `(Address, i128, i128, u64)` → seller, starting price, reserve price, duration (s) | `list_dutch()` called |
+| Sale Split | `sale_split` | `(Symbol, u64)` → event name, listing ID | `(i128, i128, i128)` → seller amount, creator royalty, platform fee | `buy()` or `accept_offer()` settles |
+| Platform Fee Set | `platform_fee_set` | `(Symbol,)` → event name | `(u32, Address)` → fee bps, recipient | `set_platform_fee()` called by admin |
 | Offer Expired | `offrexp` | `(Symbol, u64)` → event name, listing ID | `(Address, i128)` → buyer, refunded amount | `expire_offer()` called by anyone after the offer's expiration ledger |
 | Staking Contract Set | `stakecfg` | `(Symbol, Address)` → event name, admin | `Option<Address>` → staking contract (`None` to disable) | `set_staking_contract()` called |
 | Min Counter Offer BPS Set | `mincferbps` | `(Symbol, Address)` → event name, admin | `u32` → minimum counter-offer increment in basis points | `set_min_counter_offer_bps()` called |

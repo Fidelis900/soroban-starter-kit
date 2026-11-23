@@ -10,6 +10,8 @@
 use super::*;
 use soroban_nft_template::{NftContract, NftContractClient};
 use soroban_sdk::{
+    Address, Env, FromVal, IntoVal, Symbol, Val, Vec,
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Env,
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String,
@@ -262,6 +264,9 @@ fn test_double_settle_fails() {
     env.mock_all_auths();
     let (client, seller, b1, _, token) = setup(&env);
 
+    // Deadline sits outside the default anti-sniping window so the bid does not extend it.
+    let deadline = env.ledger().sequence() + 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
     let deadline = env.ledger().sequence() + 10;
     client.start(&seller, &token, &1_000, &100, &deadline, &None, &0, &0, &0);
     client.start(
@@ -701,6 +706,12 @@ fn test_cancel_fails_for_non_seller() {
 }
 
 // ---------------------------------------------------------------------------
+// Minimum bid increment percentage
+// ---------------------------------------------------------------------------
+
+/// A bid that clears the absolute `min_increment` but not the 5 % increment is rejected.
+#[test]
+fn test_bid_below_min_percentage_increment_rejected() {
 // Issue #1072 — Seller cancellation grace window & bidder compensation
 // ---------------------------------------------------------------------------
 
@@ -1000,6 +1011,22 @@ fn test_bid_with_credit_partial_credit() {
     let (client, seller, b1, b2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
+    // Absolute increment of 1 so only the percentage rule can reject.
+    client.start(&seller, &token, &1_000, &1, &deadline, &None, &0);
+    client.bid(&b1, &1_000);
+
+    // 5 % of 1_000 = 50, so anything below 1_050 must fail.
+    let result = client.try_bid(&b2, &1_049);
+    assert!(matches!(result, Err(Ok(AuctionError::BidIncrementTooLow))));
+
+    let info = client.get_info();
+    assert_eq!(info.highest_bid, 1_000);
+    assert_eq!(info.highest_bidder, Some(b1));
+}
+
+/// A bid exactly at the 5 % threshold, and one above it, are accepted.
+#[test]
+fn test_bid_at_min_percentage_increment_accepted() {
     client.start(
         &seller,
         &token,
@@ -1037,6 +1064,25 @@ fn test_bid_with_credit_full_credit_keeps_excess() {
     let (client, seller, b1, b2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
+    client.start(&seller, &token, &1_000, &1, &deadline, &None, &0);
+    client.bid(&b1, &1_000);
+
+    client.bid(&b2, &1_050);
+    assert_eq!(client.get_info().highest_bid, 1_050);
+
+    // Next threshold: 1_050 + ceil(52.5) = 1_103.
+    assert!(matches!(
+        client.try_bid(&b1, &1_102),
+        Err(Ok(AuctionError::BidIncrementTooLow))
+    ));
+    client.bid(&b1, &1_103);
+    assert_eq!(client.get_info().highest_bid, 1_103);
+    assert_eq!(client.get_pending(&b2), 1_050);
+}
+
+/// The percentage increment is rounded up so small bids cannot truncate it away.
+#[test]
+fn test_min_percentage_increment_rounds_up() {
     client.start(
         &seller,
         &token,
@@ -1078,6 +1124,21 @@ fn test_bid_with_credit_exact_credit_clears_pending() {
     let (client, seller, b1, b2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
+    client.start(&seller, &token, &30, &1, &deadline, &None, &0);
+    client.bid(&b1, &30);
+
+    // 5 % of 30 = 1.5, rounded up to 2: 31 fails and 32 succeeds.
+    assert!(matches!(
+        client.try_bid(&b2, &31),
+        Err(Ok(AuctionError::BidIncrementTooLow))
+    ));
+    client.bid(&b2, &32);
+    assert_eq!(client.get_info().highest_bid, 32);
+}
+
+/// The opening bid only needs to meet the start price; no percentage increment applies.
+#[test]
+fn test_opening_bid_not_subject_to_percentage_increment() {
     client.start(
         &seller,
         &token,
@@ -1114,6 +1175,15 @@ fn test_bid_with_credit_self_raise_pays_delta() {
     let (client, seller, b1, _, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
+    client.start(&seller, &token, &1_000, &1, &deadline, &None, &0);
+
+    client.bid(&b1, &1_000);
+    assert_eq!(client.get_info().highest_bid, 1_000);
+}
+
+/// The absolute increment still applies when it is larger than the percentage one.
+#[test]
+fn test_absolute_increment_still_enforced() {
     client.start(
         &seller,
         &token,
@@ -1167,6 +1237,97 @@ fn test_bid_with_credit_too_low_keeps_credit() {
     let (client, seller, b1, b2, token) = setup(&env);
 
     let deadline = env.ledger().sequence() + 100;
+    // Absolute 200 > 5 % of 1_000 (50).
+    client.start(&seller, &token, &1_000, &200, &deadline, &None, &0);
+    client.bid(&b1, &1_000);
+
+    assert!(matches!(
+        client.try_bid(&b2, &1_100),
+        Err(Ok(AuctionError::BidTooLow))
+    ));
+    client.bid(&b2, &1_200);
+    assert_eq!(client.get_info().highest_bid, 1_200);
+}
+
+// ---------------------------------------------------------------------------
+// Default anti-sniping: 10-ledger window, 20-ledger extension
+// ---------------------------------------------------------------------------
+
+/// Returns the new deadline carried by the most recent `AuctionExtended` event
+/// emitted by `auction`, if any.
+fn auction_extended_deadline(env: &Env, auction: &Address) -> Option<u32> {
+    let expected: Vec<Val> = (Symbol::new(env, "AuctionExtended"), auction.clone()).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| contract == auction && *topics == expected)
+        .last()
+        .map(|(_, _, data)| u32::from_val(env, &data))
+}
+
+/// A bid inside the final 10 ledgers extends the deadline by 20 ledgers.
+#[test]
+fn test_default_anti_snipe_extends_deadline_in_final_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 95);
+    client.bid(&b1, &1_000);
+
+    let expected = deadline + ANTI_SNIPE_EXTENSION_LEDGERS;
+    assert_eq!(client.get_info().deadline, expected);
+    assert_eq!(
+        auction_extended_deadline(&env, &client.address),
+        Some(expected)
+    );
+}
+
+/// A bid exactly 10 ledgers before the deadline is inside the window.
+#[test]
+fn test_default_anti_snipe_window_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number = deadline - ANTI_SNIPE_WINDOW_LEDGERS);
+    client.bid(&b1, &1_000);
+
+    assert_eq!(client.get_info().deadline, 120);
+}
+
+/// A bid placed on the deadline ledger itself still extends the auction.
+#[test]
+fn test_default_anti_snipe_bid_on_deadline_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
+
+    env.ledger().with_mut(|l| l.sequence_number = deadline);
+    client.bid(&b1, &1_000);
+    assert_eq!(client.get_info().deadline, 120);
+
+    // The auction can no longer be settled at the original deadline + 1.
+    env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
+    assert!(matches!(
+        client.try_end(),
+        Err(Ok(AuctionError::AuctionNotEnded))
+    ));
+}
+
+/// A bid outside the final 10 ledgers leaves the deadline untouched and emits no event.
+#[test]
+fn test_default_anti_snipe_no_extension_outside_window() {
     client.start(
         &seller,
         &token,
@@ -1858,6 +2019,51 @@ fn test_late_bid_extends_and_emits_event() {
     let (client, seller, b1, _, token) = setup(&env);
 
     let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number = deadline - ANTI_SNIPE_WINDOW_LEDGERS - 1);
+    client.bid(&b1, &1_000);
+
+    assert_eq!(client.get_info().deadline, deadline);
+    assert_eq!(auction_extended_deadline(&env, &client.address), None);
+}
+
+/// Consecutive late bids keep pushing the deadline back by 20 ledgers each.
+#[test]
+fn test_default_anti_snipe_repeated_extensions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, b2, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &0);
+
+    env.ledger().with_mut(|l| l.sequence_number = 98);
+    client.bid(&b1, &1_000);
+    assert_eq!(client.get_info().deadline, 120);
+
+    env.ledger().with_mut(|l| l.sequence_number = 115);
+    client.bid(&b2, &1_100);
+    assert_eq!(client.get_info().deadline, 140);
+    assert_eq!(auction_extended_deadline(&env, &client.address), Some(140));
+}
+
+/// A custom `extension_window` also emits `AuctionExtended`.
+#[test]
+fn test_custom_window_emits_auction_extended() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, seller, b1, _, token) = setup(&env);
+
+    let deadline: u32 = 100;
+    client.start(&seller, &token, &1_000, &100, &deadline, &None, &5);
+
+    env.ledger().with_mut(|l| l.sequence_number = 97);
+    client.bid(&b1, &1_000);
+
+    assert_eq!(client.get_info().deadline, 105);
+    assert_eq!(auction_extended_deadline(&env, &client.address), Some(105));
     let window: u32 = 20;
     client.start(
         &seller,

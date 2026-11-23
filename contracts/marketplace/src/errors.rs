@@ -20,6 +20,15 @@ pub enum MarketplaceError {
     ListingNotExpired = 10,
     InvalidOfferAmount = 11,
     OfferNotFound = 12,
+    /// Platform fee above 10 000 bps.
+    InvalidPlatformFee = 13,
+    /// Dutch auction parameters are invalid (non-positive reserve, starting
+    /// price not above reserve, or zero duration).
+    InvalidDutchAuction = 14,
+    /// A checked arithmetic operation overflowed.
+    ArithmeticOverflow = 15,
+    /// Creator royalty plus platform fee exceed the sale price.
+    PayoutExceedsPrice = 16,
     PaymentTokenNotAllowed = 13,
     SellerNotOwner = 14,
     BatchTooLarge = 15,
@@ -60,6 +69,10 @@ impl_display_error!(
     ListingNotExpired   => "listing not expired",
     InvalidOfferAmount  => "invalid offer amount",
     OfferNotFound       => "offer not found",
+    InvalidPlatformFee  => "invalid platform fee",
+    InvalidDutchAuction => "invalid dutch auction parameters",
+    ArithmeticOverflow  => "arithmetic overflow",
+    PayoutExceedsPrice  => "royalty and fee exceed sale price",
     PaymentTokenNotAllowed => "payment token not allowed",
     SellerNotOwner      => "seller no longer owns the NFT",
     BatchTooLarge       => "batch too large",
@@ -105,6 +118,10 @@ MarketplaceError::ListingExpired = {}\n\
 MarketplaceError::ListingNotExpired = {}\n\
 MarketplaceError::InvalidOfferAmount = {}\n\
 MarketplaceError::OfferNotFound = {}\n\
+MarketplaceError::InvalidPlatformFee = {}\n\
+MarketplaceError::InvalidDutchAuction = {}\n\
+MarketplaceError::ArithmeticOverflow = {}\n\
+MarketplaceError::PayoutExceedsPrice = {}\n",
 MarketplaceError::PaymentTokenNotAllowed = {}\n\
 MarketplaceError::SellerNotOwner = {}\n\
 MarketplaceError::BatchTooLarge = {}\n\
@@ -136,6 +153,10 @@ MarketplaceError::OfferNotExpired = {}\n",
             MarketplaceError::ListingNotExpired as u32,
             MarketplaceError::InvalidOfferAmount as u32,
             MarketplaceError::OfferNotFound as u32,
+            MarketplaceError::InvalidPlatformFee as u32,
+            MarketplaceError::InvalidDutchAuction as u32,
+            MarketplaceError::ArithmeticOverflow as u32,
+            MarketplaceError::PayoutExceedsPrice as u32,
             MarketplaceError::PaymentTokenNotAllowed as u32,
             MarketplaceError::SellerNotOwner as u32,
             MarketplaceError::BatchTooLarge as u32,

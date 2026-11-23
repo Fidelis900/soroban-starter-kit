@@ -6,11 +6,18 @@
 //! outbid bidders reclaim their funds, and anyone can settle the auction once
 //! the deadline passes.
 //!
+//! # Minimum bid increment
+//! Once a bid exists, each new bid must clear both the absolute
+//! `min_increment` configured at `start` and a percentage increment of
+//! [`MIN_BID_INCREMENT_BPS`] (5 %) over the current highest bid. Bids that
+//! miss the percentage threshold fail with [`AuctionError::BidIncrementTooLow`].
+//!
 //! # Anti-sniping (issue #784)
-//! An optional `extension_window` can be configured at `start`. When a bid
-//! arrives within `extension_window` ledgers of the current `deadline`, the
-//! deadline is extended by `extension_window` ledgers (preventing last-second
-//! snipe bids that leave no time to counter-bid).
+//! By default, a bid that lands within [`ANTI_SNIPE_WINDOW_LEDGERS`] (10)
+//! ledgers of the current `deadline` extends the deadline by
+//! [`ANTI_SNIPE_EXTENSION_LEDGERS`] (20) ledgers and emits `AuctionExtended`.
+//! A non-zero `extension_window` passed to `start` overrides both values: the
+//! window and the extension then each equal `extension_window`.
 //!
 //! # Seller cancellation (issues #785, #1072)
 //! The seller may call `cancel` at any time before a bid has been placed.
@@ -94,6 +101,38 @@ pub use events::AuctionCancelledWithCompensation;
 pub use storage::{AuctionInfo, DataKey, DutchConfig};
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
+
+/// Minimum amount, in basis points of the current highest bid, by which a new
+/// bid must exceed it (500 bps = 5 %).
+pub const MIN_BID_INCREMENT_BPS: i128 = 500;
+
+/// Basis-point denominator (10 000 bps = 100 %).
+const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Added before dividing by [`BPS_DENOMINATOR`] to round the quotient up.
+const BPS_ROUND_UP: i128 = BPS_DENOMINATOR - 1;
+
+/// A bid this many ledgers (or fewer) before the deadline triggers the default
+/// anti-sniping extension.
+pub const ANTI_SNIPE_WINDOW_LEDGERS: u32 = 10;
+
+/// Ledgers added to the deadline by the default anti-sniping extension.
+pub const ANTI_SNIPE_EXTENSION_LEDGERS: u32 = 20;
+
+/// Smallest bid that exceeds `highest_bid` by [`MIN_BID_INCREMENT_BPS`].
+///
+/// The increment is rounded up, so small bids can never slip under the
+/// percentage threshold through integer truncation.
+fn min_percentage_bid(highest_bid: i128) -> Result<i128, AuctionError> {
+    let increment = highest_bid
+        .checked_mul(MIN_BID_INCREMENT_BPS)
+        .and_then(|v| v.checked_add(BPS_ROUND_UP))
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .ok_or(AuctionError::ArithmeticOverflow)?;
+    highest_bid
+        .checked_add(increment)
+        .ok_or(AuctionError::ArithmeticOverflow)
+}
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -426,6 +465,10 @@ mod contract {
         /// `end()` will only transfer to the seller if `highest_bid >= reserve_price`;
         /// otherwise the highest bidder's funds are returned.
         ///
+        /// `extension_window` customises anti-sniping: when non-zero, a bid within that
+        /// many ledgers of the deadline extends it by that many ledgers. Pass `0` to use
+        /// the default policy ([`ANTI_SNIPE_WINDOW_LEDGERS`] window,
+        /// [`ANTI_SNIPE_EXTENSION_LEDGERS`] extension).
         /// `extension_window` (a.k.a. `anti_sniping_extension_ledgers`) is the number
         /// of ledgers added to the deadline when a bid arrives within that many ledgers
         /// of the current deadline (anti-sniping). Pass `0` to disable anti-sniping.
@@ -538,6 +581,27 @@ mod contract {
             Ok(())
         }
 
+        /// Place a bid. The opening bid must be at least `start_price`; later bids must
+        /// be at least `highest_bid + min_increment` and at least
+        /// [`MIN_BID_INCREMENT_BPS`] above `highest_bid`.
+        /// The previous highest bidder's funds are queued as a pending refund.
+        ///
+        /// If the bid arrives within the anti-sniping window of the deadline, the
+        /// deadline is extended and `AuctionExtended` is emitted (see the crate docs).
+        ///
+        /// # Errors
+        ///
+        /// - [`AuctionError::NotInitialized`] if not started.
+        /// - [`AuctionError::AuctionEnded`] if the deadline has passed or auction is cancelled.
+        /// - [`AuctionError::BidTooLow`] if `amount` < start price (opening bid) or
+        ///   current highest bid + min_increment.
+        /// - [`AuctionError::BidIncrementTooLow`] if `amount` is less than
+        ///   [`MIN_BID_INCREMENT_BPS`] above the current highest bid.
+        /// - [`AuctionError::ArithmeticOverflow`] on overflow computing thresholds or the
+        ///   extended deadline.
+        pub fn bid(env: Env, bidder: Address, amount: i128) -> Result<(), AuctionError> {
+            if amount <= 0 {
+                return Err(AuctionError::InvalidAmount);
         /// Start a Dutch (descending price) auction (issue #1071).
         ///
         /// The price falls linearly from `start_price` at `start_ledger` to
@@ -583,6 +647,25 @@ mod contract {
 
             seller.require_auth();
 
+            // First bid must be >= start_price; subsequent bids must clear both the
+            // absolute min_increment and the percentage increment over highest_bid.
+            if highest_bid < start_price {
+                if amount < start_price {
+                    return Err(AuctionError::BidTooLow);
+                }
+            } else {
+                let min_absolute = highest_bid
+                    .checked_add(min_increment)
+                    .ok_or(AuctionError::ArithmeticOverflow)?;
+                if amount < min_absolute {
+                    return Err(AuctionError::BidTooLow);
+                }
+                if amount < min_percentage_bid(highest_bid)? {
+                    return Err(AuctionError::BidIncrementTooLow);
+                }
+            }
+
+            bidder.require_auth();
             let cfg = DutchConfig {
                 start_price,
                 floor_price,
@@ -620,6 +703,26 @@ mod contract {
             Ok(())
         }
 
+            // Queue previous highest bidder's refund
+            let prev_bidder: Option<Address> =
+                env.storage().instance().get(&DataKey::HighestBidder);
+            if let Some(prev) = prev_bidder {
+                let pending: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Pending(prev.clone()))
+                    .unwrap_or(0);
+                let new_pending = pending
+                    .checked_add(highest_bid)
+                    .ok_or(AuctionError::ArithmeticOverflow)?;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Pending(prev.clone()), &new_pending);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::Pending(prev),
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
         /// Return the current Dutch auction price (issue #1071).
         ///
         /// `start_price - (start_price - floor_price) * (now - start_ledger) / duration_ledgers`,
@@ -675,6 +778,25 @@ mod contract {
             env.storage().instance().set(&DataKey::HighestBid, &price);
             bump_instance(&env);
 
+            // Anti-sniping: extend deadline if bid arrives within the extension window.
+            let custom_window: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ExtensionWindow)
+                .unwrap_or(0u32);
+            let (window, extension) = if custom_window > 0 {
+                (custom_window, custom_window)
+            } else {
+                (ANTI_SNIPE_WINDOW_LEDGERS, ANTI_SNIPE_EXTENSION_LEDGERS)
+            };
+            // The deadline check above guarantees current_ledger <= deadline.
+            let remaining = deadline.saturating_sub(env.ledger().sequence());
+            if remaining <= window {
+                deadline = deadline
+                    .checked_add(extension)
+                    .ok_or(AuctionError::ArithmeticOverflow)?;
+                env.storage().instance().set(&DataKey::Deadline, &deadline);
+                events::auction_extended(&env, &env.current_contract_address(), deadline);
             if price > 0 {
                 let token: Address = get_instance(&env, &DataKey::Token)?;
                 token::Client::new(&env, &token).transfer(&buyer, &seller, &price);
