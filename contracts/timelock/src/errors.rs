@@ -5,7 +5,7 @@ use soroban_common::impl_display_error;
 use soroban_sdk::contracterror;
 
 #[contracterror]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelockError {
     NotAuthorized = 1,
     AlreadyInitialized = 2,
@@ -24,7 +24,19 @@ pub enum TimelockError {
     NoPendingBeneficiary = 15,
     EarlyReleaseNotConfigured = 16,
     InvalidPenaltyBps = 17,
-    AmountExceedsClaimable = 14,
+    AmountExceedsClaimable = 18,
+    /// The execution window has passed: `current_ledger > release_ledger + grace_period`.
+    TransactionExpired = 19,
+    /// No transaction with the given hash has been queued.
+    TransactionNotQueued = 20,
+    /// An identical transaction (same call and ETA) is already queued.
+    TransactionAlreadyQueued = 21,
+    /// The transaction has already been executed.
+    TransactionAlreadyExecuted = 22,
+    /// The queue delay must be greater than zero.
+    InvalidDelay = 23,
+    /// The grace period must be greater than zero.
+    InvalidGracePeriod = 24,
 }
 
 impl_display_error!(
@@ -47,6 +59,12 @@ impl_display_error!(
     EarlyReleaseNotConfigured => "early release not configured",
     InvalidPenaltyBps   => "invalid penalty bps",
     AmountExceedsClaimable => "amount exceeds claimable",
+    TransactionExpired  => "transaction expired: grace period has passed",
+    TransactionNotQueued => "transaction not queued",
+    TransactionAlreadyQueued => "transaction already queued",
+    TransactionAlreadyExecuted => "transaction already executed",
+    InvalidDelay        => "invalid delay",
+    InvalidGracePeriod  => "invalid grace period",
 );
 
 #[cfg(test)]
@@ -77,8 +95,14 @@ TimelockError::TrancheAlreadyReleased = {}\n\
 TimelockError::BeneficiaryProposalNotFound = {}\n\
 TimelockError::NoPendingBeneficiary = {}\n\
 TimelockError::EarlyReleaseNotConfigured = {}\n\
-TimelockError::InvalidPenaltyBps = {}\n",
-TimelockError::AmountExceedsClaimable = {}\n",
+TimelockError::InvalidPenaltyBps = {}\n\
+TimelockError::AmountExceedsClaimable = {}\n\
+TimelockError::TransactionExpired = {}\n\
+TimelockError::TransactionNotQueued = {}\n\
+TimelockError::TransactionAlreadyQueued = {}\n\
+TimelockError::TransactionAlreadyExecuted = {}\n\
+TimelockError::InvalidDelay = {}\n\
+TimelockError::InvalidGracePeriod = {}\n",
             TimelockError::NotAuthorized as u32,
             TimelockError::AlreadyInitialized as u32,
             TimelockError::NotInitialized as u32,
@@ -97,6 +121,12 @@ TimelockError::AmountExceedsClaimable = {}\n",
             TimelockError::EarlyReleaseNotConfigured as u32,
             TimelockError::InvalidPenaltyBps as u32,
             TimelockError::AmountExceedsClaimable as u32,
+            TimelockError::TransactionExpired as u32,
+            TimelockError::TransactionNotQueued as u32,
+            TimelockError::TransactionAlreadyQueued as u32,
+            TimelockError::TransactionAlreadyExecuted as u32,
+            TimelockError::InvalidDelay as u32,
+            TimelockError::InvalidGracePeriod as u32,
         )
     }
 

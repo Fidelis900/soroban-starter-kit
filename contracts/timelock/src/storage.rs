@@ -1,7 +1,7 @@
 // `#[contracttype]` generates undocumented public associated items.
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, contracttype, Vec};
+use soroban_sdk::{Address, BytesN, Symbol, Val, Vec, contracttype};
 
 /// Represents a single tranche in a multi-tranche release schedule.
 #[contracttype]
@@ -61,6 +61,47 @@ pub enum DataKey {
     /// Release flag for an individual tranche of a specific token
     /// (token address, index -> true/false).
     TokenTrancheReleased(Address, u32),
+    /// Release ledger for a specific token (token address -> ledger).
+    TokenReleaseLedger(Address),
+    /// Number of distinct tokens tracked by this instance.
+    TokenCount,
+    /// Token address at a registry index (index -> token address).
+    TokenAt(u32),
+    /// Grace period (in ledgers) after a queued transaction's ETA during which
+    /// it may still be executed.
+    GracePeriod,
+    /// Queued governance transaction (tx hash -> [`QueuedTransaction`]).
+    QueuedTx(BytesN<32>),
+}
+
+/// Lifecycle state of a queued governance transaction.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxState {
+    /// Waiting for its ETA; may be executed or cancelled.
+    Queued = 0,
+    /// Executed successfully; terminal.
+    Executed = 1,
+    /// Cancelled by the governance admin; terminal.
+    Cancelled = 2,
+}
+
+/// A governance transaction queued behind the timelock delay.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct QueuedTransaction {
+    /// Contract to invoke on execution.
+    pub target: Address,
+    /// Function to invoke on `target`.
+    pub function: Symbol,
+    /// Arguments passed to `function`.
+    pub args: Vec<Val>,
+    /// Ledger at which the transaction was queued.
+    pub queued_at: u32,
+    /// Earliest ledger at which the transaction may execute (`queued_at + delay`).
+    pub eta: u32,
+    /// Current lifecycle state.
+    pub state: TxState,
 }
 
 #[contracttype]
@@ -100,8 +141,6 @@ pub struct TimelockInfo {
     pub yield_recipient: Option<Address>,
     /// Whether the locked balance has been deposited into staking.
     pub deposited: bool,
-    /// Per-token locked balances keyed by token address.
-    pub locked_balances: Vec<(Address, i128)>,
-    /// Per-token release schedules keyed by token address.
-    pub token_tranches: Vec<(Address, Vec<ReleaseTranche>)>,
+    /// Principal currently deposited in the staking contract.
+    pub staked_amount: i128,
 }

@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol};
 
 pub fn initialized(
     env: &Env,
@@ -125,9 +125,40 @@ pub fn yield_distributed(
             yield_recipient.clone(),
         ),
         (principal, yield_amount),
+    );
+}
+
 pub fn tranche_rescheduled(env: &Env, tranche_id: u32, old_ledger: u32, new_ledger: u32) {
     env.events().publish(
         (Symbol::new(env, "tranche_rescheduled"), tranche_id),
         (old_ledger, new_ledger),
+    );
+}
+
+pub fn tx_queued(env: &Env, tx_hash: &BytesN<32>, target: &Address, eta: u32) {
+    env.events().publish(
+        (Symbol::new(env, "tx_queued"), tx_hash.clone()),
+        (target.clone(), eta),
+    );
+}
+
+pub fn tx_executed(env: &Env, tx_hash: &BytesN<32>, target: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "tx_executed"), tx_hash.clone()),
+        target.clone(),
+    );
+}
+
+pub fn tx_cancelled(env: &Env, tx_hash: &BytesN<32>, admin: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "tx_cancelled"), tx_hash.clone()),
+        admin.clone(),
+    );
+}
+
+pub fn grace_period_set(env: &Env, admin: &Address, grace_period: u32) {
+    env.events().publish(
+        (Symbol::new(env, "grace_period_set"), admin.clone()),
+        grace_period,
     );
 }
