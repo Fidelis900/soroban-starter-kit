@@ -27,6 +27,12 @@ pub enum LotteryError {
     /// `fee_bps` ≥ 10 000, or `fee_bps` > 0 without a `fee_recipient`, or
     /// `fee_recipient` provided without a non-zero `fee_bps`.
     InvalidFeeConfig = 18,
+    /// Revenue-split percentages are invalid (must sum to 100).
+    InvalidSplitConfig = 19,
+    /// `rollover` called when conditions are not met (wrong state, enough participants, etc.).
+    RolloverNotAvailable = 20,
+    /// `buy_tickets_batch` called with `count == 0`.
+    InvalidBatchCount = 21,
     /// `buy_tickets_batch` called with `count == 0`.
     InvalidBatchCount = 19,
     /// `rollover` called when conditions for a rollover are not met.
@@ -53,6 +59,9 @@ impl_display_error!(
     InvalidTicketCap        => "invalid ticket cap",
     TicketCapExceeded       => "ticket cap exceeded",
     InvalidFeeConfig        => "invalid fee config",
+    InvalidSplitConfig      => "invalid split config",
+    RolloverNotAvailable    => "rollover not available",
+    InvalidBatchCount       => "invalid batch count",
     InvalidBatchCount       => "invalid batch count",
     RolloverNotAvailable    => "rollover not available",
 );
@@ -87,6 +96,9 @@ LotteryError::InsufficientParticipants = {}\n\
 LotteryError::InvalidTicketCap = {}\n\
 LotteryError::TicketCapExceeded = {}\n\
 LotteryError::InvalidFeeConfig = {}\n\
+LotteryError::InvalidSplitConfig = {}\n\
+LotteryError::RolloverNotAvailable = {}\n\
+LotteryError::InvalidBatchCount = {}\n",
 LotteryError::InvalidBatchCount = {}\n\
 LotteryError::RolloverNotAvailable = {}\n",
             LotteryError::AlreadyInitialized as u32,
@@ -107,6 +119,9 @@ LotteryError::RolloverNotAvailable = {}\n",
             LotteryError::InvalidTicketCap as u32,
             LotteryError::TicketCapExceeded as u32,
             LotteryError::InvalidFeeConfig as u32,
+            LotteryError::InvalidSplitConfig as u32,
+            LotteryError::RolloverNotAvailable as u32,
+            LotteryError::InvalidBatchCount as u32,
             LotteryError::InvalidBatchCount as u32,
             LotteryError::RolloverNotAvailable as u32,
         )
@@ -114,9 +129,8 @@ LotteryError::RolloverNotAvailable = {}\n",
 
     #[test]
     fn lottery_error_codes_match_snapshot() {
-        assert_eq!(
-            render_error_code_snapshot(),
-            include_str!("../snapshots/error_codes.snap")
-        );
+        let snap = include_str!("../snapshots/error_codes.snap")
+            .replace("\r\n", "\n");
+        assert_eq!(render_error_code_snapshot(), snap);
     }
 }

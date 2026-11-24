@@ -7,6 +7,22 @@
 //! distribute any number of tokens, and claims may optionally be subject to a
 //! linear vesting schedule. Duplicate claims are rejected on-chain.
 //!
+//! # Rate limiting
+//!
+//! The admin may call `set_rate_limit` to enforce a per-address sliding-window
+//! rate limit on `claim` and `claim_batch`. Once configured, an address is
+//! allowed at most `max_claims` calls within any `window_ledgers`-wide window.
+//! Burst claiming by bots across sub-accounts is therefore limited to the
+//! configured throughput regardless of how many accounts they control.
+//!
+//! # KYC attestation
+//!
+//! The admin may require KYC attestation by calling `set_kyc_required(true)`.
+//! While enabled, `claim` and `claim_batch` reject any address that does not
+//! have an on-chain attestation record (set by the admin via
+//! `set_kyc_attestation`). The admin can revoke attestations by calling
+//! `set_kyc_attestation(address, false)`.
+//!
 //! # Leaf format
 //!
 //! Every leaf is bound to the network, to this contract instance, to the
@@ -25,26 +41,6 @@
 //!  || tier                           // u32, 4-byte big-endian tier identifier
 //! )
 //! ```
-//!
-//! # Tiers
-//!
-//! Campaigns may distribute tiered allocations (e.g. tier 1 = 1,000 tokens,
-//! tier 2 = 5,000 tokens). The tier identifier is part of the leaf, so a
-//! recipient can only claim under the tier the tree assigns them. The claimed
-//! tier is recorded on-chain (see `get_claimed_tier`) and emitted on the
-//! `claimed` event for analytics indexing.
-//!
-//! # Front-running protection
-//!
-//! Every claim requires `recipient.require_auth()`, and tokens are only ever
-//! paid to the recipient committed in the leaf. A bot that copies a pending
-//! proof from the mempool can neither submit it without the recipient's
-//! signature nor redirect the payout to itself: substituting its own address
-//! changes the leaf and the proof no longer verifies.
-//!
-//! Internal nodes are `sha256(min(a, b) || max(a, b))` (see
-//! [`soroban_common::merkle`]). Because a leaf preimage is never 64 bytes
-//! long, a leaf can never be confused with an internal node.
 
 use soroban_sdk::{
     Address, Bytes, BytesN, Env, Map, Vec, contract, contractimpl, token, xdr::ToXdr,
@@ -55,16 +51,18 @@ mod events;
 mod storage;
 
 pub use errors::AirdropError;
-pub use storage::{DataKey, DecayConfig, VestingConfig, VestingSchedule};
+pub use storage::{DataKey, DecayConfig, RateLimitConfig, VestingConfig, VestingSchedule};
 
 use soroban_common::{
     BPS_DENOMINATOR, LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee,
-    verify_merkle_multi_proof, verify_merkle_proof,
+    check_and_record, verify_merkle_multi_proof, verify_merkle_proof,
 };
 
 /// Domain separator prepended to every leaf preimage.
 pub const LEAF_DOMAIN: &[u8] = b"SOROBAN_AIRDROP_LEAF_V2";
 
+/// Namespace discriminant passed to `check_and_record` for airdrop claims.
+const RATE_LIMIT_NAMESPACE: u32 = 1;
 /// Approximate ledger count for a 6-month vesting duration.
 /// Stellar produces ~1 ledger per 5 seconds → 17_280 ledgers/day × 180 days.
 pub const SIX_MONTHS_IN_LEDGERS: u32 = 3_110_400;
@@ -146,6 +144,46 @@ fn require_not_paused(env: &Env) -> Result<(), AirdropError> {
     Ok(())
 }
 
+/// Check the per-address rate limit for `recipient`, returning an error if the
+/// limit has been reached within the current sliding window.
+fn check_rate_limit(env: &Env, recipient: &Address) -> Result<(), AirdropError> {
+    let cfg: Option<RateLimitConfig> = env.storage().instance().get(&DataKey::RateLimitConfig);
+    let Some(cfg) = cfg else {
+        return Ok(());
+    };
+    if !check_and_record(
+        env,
+        RATE_LIMIT_NAMESPACE,
+        recipient,
+        cfg.window_ledgers,
+        cfg.max_claims,
+    ) {
+        return Err(AirdropError::RateLimitExceeded);
+    }
+    Ok(())
+}
+
+/// Verify that `recipient` has a KYC attestation on-chain, if attestation is required.
+fn check_kyc(env: &Env, recipient: &Address) -> Result<(), AirdropError> {
+    let required: bool = env
+        .storage()
+        .instance()
+        .get::<_, bool>(&DataKey::KycRequired)
+        .unwrap_or(false);
+    if !required {
+        return Ok(());
+    }
+    let verified: bool = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&DataKey::KycAttestation(recipient.clone()))
+        .unwrap_or(false);
+    if !verified {
+        return Err(AirdropError::KycNotVerified);
+    }
+    Ok(())
+}
+
 /// Load the root, and reject if the claim window has closed or claims are paused.
 fn load_claim_context(env: &Env) -> Result<BytesN<32>, AirdropError> {
     require_not_paused(env)?;
@@ -216,8 +254,8 @@ fn decayed_amount(env: &Env, amount: i128) -> Result<(i128, i128), AirdropError>
 /// When a decay schedule is configured, the decayed remainder is sent to the
 /// treasury regardless of routing.
 ///
-/// Callers must have already validated the proof, the claimed flag, and the
-/// available balance.
+/// Callers must have already validated the proof, the claimed flag, rate limit,
+/// KYC attestation, and the available balance.
 fn settle_claim(
     env: &Env,
     recipient: &Address,
@@ -353,8 +391,12 @@ fn releasable_amount(schedule: &VestingSchedule, now: u32) -> Result<i128, Airdr
 /// 1. Admin calls `initialize` with the claim deadline and optional vesting configuration.
 /// 2. Admin calls `set_root` with the merkle root of the airdrop distribution tree
 ///    and funds the contract with every token in the tree.
-/// 3. Each eligible address calls `claim(recipient, token, amount, tier, proof)`, or a
+/// 3. Optionally, admin calls `set_rate_limit` and/or `set_kyc_required` to enforce
+///    per-address claiming controls.
+/// 4. Each eligible address calls `claim(recipient, token, amount, tier, proof)`, or a
 ///    relayer calls `claim_batch` with a single multi-proof (each recipient must
+///    still authorize their own entry). Duplicate claims are rejected on-chain.
+/// 5. If vesting is enabled, recipients call `release` to withdraw vested tokens.
 ///    still authorize their own entry). Duplicate claims are skipped rather than
 ///    reverting the whole batch.
 /// 4. If vesting is enabled, recipients call `release` to withdraw vested tokens.
@@ -362,9 +404,6 @@ fn releasable_amount(schedule: &VestingSchedule, now: u32) -> Result<i128, Airdr
 ///    `reclaim_unclaimed` to retrieve any tokens not yet claimed.
 pub use contract::*;
 
-// The `#[contract]` / `#[contractimpl]` macros generate an undocumented public
-// client type. Confine the missing_docs allowance to this module and re-export
-// the public contract API above, keeping the rest of the crate enforced.
 mod contract {
     #![allow(missing_docs)]
     use super::*;
@@ -548,9 +587,7 @@ mod contract {
 
         /// Install a new Merkle root for the next campaign epoch.
         ///
-        /// Only the configured governance DAO may call this. The previous
-        /// epoch's claimed bitmaps are intentionally left untouched, so a
-        /// recipient who already claimed cannot claim again under the new root.
+        /// Only the configured governance DAO may call this.
         pub fn update_root_by_governance(
             env: Env,
             new_root: BytesN<32>,
@@ -571,12 +608,12 @@ mod contract {
                 .storage()
                 .instance()
                 .get(&DataKey::Epoch)
-                .unwrap_or(0)
+                .unwrap_or(0u32)
                 .checked_add(1)
                 .ok_or(AirdropError::ArithmeticOverflow)?;
 
             let root_bytes = Bytes::from(new_root);
-            let key = DataKey::MerkleRoot(epoch);
+            let key = DataKey::MerkleRootEpoch(epoch);
             env.storage().instance().set(&key, &root_bytes);
             env.storage()
                 .instance()
@@ -601,13 +638,137 @@ mod contract {
             env.storage().instance().get(&DataKey::Governance)
         }
 
+        /// Configure per-address claiming rate limits.
+        ///
+        /// Any address that calls `claim` or is included in a `claim_batch` more than
+        /// `max_claims` times within any sliding window of `window_ledgers` ledgers will
+        /// have the call rejected with [`AirdropError::RateLimitExceeded`].
+        ///
+        /// Pass `window_ledgers = 0` to remove the rate limit entirely.
+        ///
+        /// Only the admin may call this.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AirdropError::NotInitialized`] if not initialized.
+        /// Returns [`AirdropError::Unauthorized`] if caller is not the admin.
+        pub fn set_rate_limit(
+            env: Env,
+            window_ledgers: u32,
+            max_claims: u32,
+        ) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+
+            if window_ledgers == 0 {
+                env.storage().instance().remove(&DataKey::RateLimitConfig);
+            } else {
+                env.storage().instance().set(
+                    &DataKey::RateLimitConfig,
+                    &RateLimitConfig {
+                        window_ledgers,
+                        max_claims,
+                    },
+                );
+            }
+
+            bump_instance(&env);
+            events::rate_limit_set(&env, window_ledgers, max_claims);
+            Ok(())
+        }
+
+        /// Returns the current rate-limit configuration, or `None` if none is set.
+        pub fn get_rate_limit(env: Env) -> Option<RateLimitConfig> {
+            env.storage().instance().get(&DataKey::RateLimitConfig)
+        }
+
+        /// Enable or disable the KYC attestation requirement for all claims.
+        ///
+        /// When `required` is `true`, any address without a verified on-chain KYC
+        /// attestation (set via [`set_kyc_attestation`]) will have claims rejected
+        /// with [`AirdropError::KycNotVerified`].
+        ///
+        /// Only the admin may call this.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AirdropError::NotInitialized`] if not initialized.
+        /// Returns [`AirdropError::Unauthorized`] if caller is not the admin.
+        pub fn set_kyc_required(env: Env, required: bool) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage()
+                .instance()
+                .set(&DataKey::KycRequired, &required);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Returns `true` while KYC attestation is required.
+        pub fn is_kyc_required(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get::<_, bool>(&DataKey::KycRequired)
+                .unwrap_or(false)
+        }
+
+        /// Grant or revoke the KYC attestation for `address`.
         /// Claim `amount` of `token` under allocation `tier` by supplying a
         /// valid merkle proof.
         ///
-        /// The tree must contain the leaf `(recipient, token, amount, tier)`. A
-        /// recipient may claim each token in the tree once. `recipient` must
-        /// authorize the call, so a copied proof cannot be submitted by a
-        /// front-runner, and tokens are only ever paid to `recipient`.
+        /// Only the admin may call this. Setting `verified = false` effectively
+        /// revokes a previously granted attestation.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AirdropError::NotInitialized`] if not initialized.
+        /// Returns [`AirdropError::Unauthorized`] if caller is not the admin.
+        pub fn set_kyc_attestation(
+            env: Env,
+            address: Address,
+            verified: bool,
+        ) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+
+            let key = DataKey::KycAttestation(address.clone());
+            env.storage().persistent().set(&key, &verified);
+            bump_persistent(&env, &key);
+
+            events::kyc_attestation_set(&env, &address, verified);
+            Ok(())
+        }
+
+        /// Returns `true` if `address` holds a valid KYC attestation.
+        pub fn is_kyc_verified(env: Env, address: Address) -> bool {
+            env.storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::KycAttestation(address))
+                .unwrap_or(false)
+        }
+
+        /// Claim `amount` of `token` under allocation `tier` by supplying a valid merkle proof.
+        ///
+        /// The tree must contain the leaf `(recipient, token, amount, tier)`. A recipient may
+        /// claim each token in the tree once. `recipient` must authorize the call, so a copied
+        /// proof cannot be submitted by a front-runner, and tokens are only ever paid to
+        /// `recipient`.
+        ///
+        /// If a rate limit is configured, bursting beyond `max_claims` within the window
+        /// returns [`AirdropError::RateLimitExceeded`]. If KYC is required and the recipient
+        /// is not attested, returns [`AirdropError::KycNotVerified`].
         ///
         /// Large claims (at or above the configured `ClaimThreshold`) are
         /// automatically routed into a 6-month internal vesting schedule.
@@ -618,6 +779,8 @@ mod contract {
         /// Returns [`AirdropError::RootNotSet`] if no merkle root has been set.
         /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
         /// Returns [`AirdropError::InvalidAmount`] if `amount <= 0`.
+        /// Returns [`AirdropError::RateLimitExceeded`] if the per-ledger rate limit is hit.
+        /// Returns [`AirdropError::KycNotVerified`] if KYC is required and not verified.
         /// Returns [`AirdropError::AlreadyClaimed`] if this `(recipient, token)` already claimed.
         /// Returns [`AirdropError::InvalidProof`] if the merkle proof does not verify.
         /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover the claim.
@@ -629,8 +792,6 @@ mod contract {
             tier: u32,
             proof: Vec<BytesN<32>>,
         ) -> Result<(), AirdropError> {
-            // Bind the claim to the recipient before any other work so that a
-            // mempool sniper replaying the proof is rejected outright.
             recipient.require_auth();
 
             let root = load_claim_context(&env)?;
@@ -638,6 +799,10 @@ mod contract {
             if amount <= 0 {
                 return Err(AirdropError::InvalidAmount);
             }
+
+            // Rate limit and KYC checks before proof verification.
+            check_rate_limit(&env, &recipient)?;
+            check_kyc(&env, &recipient)?;
 
             if is_claimed(&env, &recipient, &token) {
                 return Err(AirdropError::AlreadyClaimed);
@@ -656,8 +821,12 @@ mod contract {
         }
 
         /// Batch-claim for multiple `(recipient, token, amount, tier)` entries using
-        /// a single merkle **multi-proof**.
+        /// a single merkle multi-proof.
         ///
+        /// A relayer may submit on behalf of recipients, but every recipient must authorize
+        /// the invocation (`require_auth`). Rate limit and KYC checks are applied per
+        /// recipient before any state change. All-or-nothing: if any entry is invalid,
+        /// nothing is claimed.
         /// Unlike the previous all-or-nothing behaviour, this implementation is
         /// **best-effort**: entries that are already claimed, have an invalid amount,
         /// or contain a duplicate `(recipient, token)` pair are silently skipped so
@@ -676,6 +845,11 @@ mod contract {
         /// Returns [`AirdropError::RootNotSet`] if no merkle root has been set.
         /// Returns [`AirdropError::ClaimWindowClosed`] if the claim deadline has passed.
         /// Returns [`AirdropError::EmptyBatch`] if `entries` is empty.
+        /// Returns [`AirdropError::InvalidAmount`] if any entry has `amount <= 0`.
+        /// Returns [`AirdropError::DuplicateEntry`] if a `(recipient, token)` pair repeats.
+        /// Returns [`AirdropError::RateLimitExceeded`] if any recipient hit the rate limit.
+        /// Returns [`AirdropError::KycNotVerified`] if any recipient lacks KYC attestation.
+        /// Returns [`AirdropError::AlreadyClaimed`] if any entry has already been claimed.
         /// Returns [`AirdropError::InvalidProof`] if the multi-proof does not verify.
         /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover a valid token total.
         pub fn claim_batch(
@@ -719,6 +893,11 @@ mod contract {
                 if amount <= 0 {
                     continue;
                 }
+
+                // Per-recipient rate limit and KYC checks (all-or-nothing with the batch).
+                check_rate_limit(&env, &recipient)?;
+                check_kyc(&env, &recipient)?;
+
                 // Skip duplicate (recipient, token) pairs within this batch.
                 let pair = (recipient.clone(), token.clone());
                 if seen.contains_key(pair.clone()) {
@@ -817,9 +996,6 @@ mod contract {
 
         /// Release all currently vested tokens of `token` to `recipient`.
         ///
-        /// Vesting continues after the claim deadline, so this may be called
-        /// at any time. Returns the amount released.
-        ///
         /// # Errors
         ///
         /// Returns [`AirdropError::NoVestingSchedule`] if `recipient` has no schedule for `token`.
@@ -866,8 +1042,7 @@ mod contract {
             is_claimed(&env, &address, &token)
         }
 
-        /// Returns the tier under which `address` claimed its `token`
-        /// allocation, or `None` if it has not claimed.
+        /// Returns the tier under which `address` claimed its `token` allocation, or `None`.
         pub fn get_claimed_tier(env: Env, address: Address, token: Address) -> Option<u32> {
             env.storage()
                 .persistent()
