@@ -44,6 +44,8 @@ pub enum AirdropError {
     RateLimitExceeded = 18,
     /// KYC attestation is required but has not been verified for this address.
     KycNotVerified = 19,
+    /// `reclaim_unclaimed` called before the claim deadline has passed.
+    ClaimNotExpired = 18,
 }
 
 #[cfg(test)]

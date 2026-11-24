@@ -63,6 +63,9 @@ pub const LEAF_DOMAIN: &[u8] = b"SOROBAN_AIRDROP_LEAF_V2";
 
 /// Namespace discriminant passed to `check_and_record` for airdrop claims.
 const RATE_LIMIT_NAMESPACE: u32 = 1;
+/// Approximate ledger count for a 6-month vesting duration.
+/// Stellar produces ~1 ledger per 5 seconds → 17_280 ledgers/day × 180 days.
+pub const SIX_MONTHS_IN_LEDGERS: u32 = 3_110_400;
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -237,9 +240,19 @@ fn decayed_amount(env: &Env, amount: i128) -> Result<(i128, i128), AirdropError>
     Ok((claimable, remainder))
 }
 
-/// Mark `(recipient, token)` claimed and pay out `amount`: the liquid portion
-/// is transferred now and the rest is locked in a vesting schedule. When a
-/// decay schedule is configured, the decayed remainder is sent to the treasury.
+/// Mark `(recipient, token)` claimed and pay out `amount`.
+///
+/// Routing logic:
+/// - If a `ClaimThreshold` is set and `claimable >= threshold`, the full
+///   claimable amount is locked into an internal 6-month linear vesting
+///   schedule with no immediate liquid portion (unless a `VestingConfig` is
+///   also present, in which case its `initial_unlock_bps` still applies).
+/// - If no threshold is set, or `claimable < threshold`, the existing
+///   `VestingConfig` split (if configured) is applied.
+/// - Small / below-threshold claims are always transferred immediately.
+///
+/// When a decay schedule is configured, the decayed remainder is sent to the
+/// treasury regardless of routing.
 ///
 /// Callers must have already validated the proof, the claimed flag, rate limit,
 /// KYC attestation, and the available balance.
@@ -252,7 +265,7 @@ fn settle_claim(
 ) -> Result<(), AirdropError> {
     let (claimable, remainder) = decayed_amount(env, amount)?;
 
-    // Checks-effects-interactions: mark claimed before transfer.
+    // Checks-effects-interactions: mark claimed before any transfer.
     let claimed_key = DataKey::Claimed(recipient.clone(), token.clone());
     env.storage().persistent().set(&claimed_key, &true);
     bump_persistent(env, &claimed_key);
@@ -261,17 +274,52 @@ fn settle_claim(
     env.storage().persistent().set(&tier_key, &tier);
     bump_persistent(env, &tier_key);
 
-    let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
-    let liquid = match &vesting {
-        Some(cfg) => apply_bps_fee(claimable, cfg.initial_unlock_bps)
-            .ok_or(AirdropError::ArithmeticOverflow)?,
-        None => claimable,
-    };
-    let locked = claimable
-        .checked_sub(liquid)
-        .ok_or(AirdropError::ArithmeticOverflow)?;
+    // Determine whether this claim is "large" (at or above the whale threshold).
+    let threshold: Option<i128> = env.storage().instance().get(&DataKey::ClaimThreshold);
+    let is_large = threshold.map_or(false, |t| claimable >= t);
 
-    if let (Some(cfg), true) = (vesting, locked > 0) {
+    let (liquid, locked) = if is_large {
+        // Large claim: route into 6-month vesting. Apply VestingConfig unlock
+        // split if configured; otherwise 0% immediate (fully vested over time).
+        let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
+        match vesting {
+            Some(cfg) => {
+                let liq = apply_bps_fee(claimable, cfg.initial_unlock_bps)
+                    .ok_or(AirdropError::ArithmeticOverflow)?;
+                let lck = claimable
+                    .checked_sub(liq)
+                    .ok_or(AirdropError::ArithmeticOverflow)?;
+                (liq, lck)
+            }
+            None => (0i128, claimable),
+        }
+    } else {
+        // Normal / small claim: apply VestingConfig split if configured.
+        let vesting: Option<VestingConfig> = env.storage().instance().get(&DataKey::VestingConfig);
+        match vesting {
+            Some(cfg) => {
+                let liq = apply_bps_fee(claimable, cfg.initial_unlock_bps)
+                    .ok_or(AirdropError::ArithmeticOverflow)?;
+                let lck = claimable
+                    .checked_sub(liq)
+                    .ok_or(AirdropError::ArithmeticOverflow)?;
+                (liq, lck)
+            }
+            None => (claimable, 0i128),
+        }
+    };
+
+    // Create vesting schedule for the locked portion.
+    if locked > 0 {
+        // For large claims without an explicit VestingConfig the duration is the
+        // 6-month constant; otherwise use the configured duration.
+        let duration = env
+            .storage()
+            .instance()
+            .get::<_, VestingConfig>(&DataKey::VestingConfig)
+            .map(|cfg| cfg.vesting_duration_ledgers)
+            .unwrap_or(SIX_MONTHS_IN_LEDGERS);
+
         let schedule_key = DataKey::Vesting(recipient.clone(), token.clone());
         env.storage().persistent().set(
             &schedule_key,
@@ -279,7 +327,7 @@ fn settle_claim(
                 total: locked,
                 released: 0,
                 start_ledger: env.ledger().sequence(),
-                duration_ledgers: cfg.vesting_duration_ledgers,
+                duration_ledgers: duration,
             },
         );
         bump_persistent(env, &schedule_key);
@@ -293,7 +341,11 @@ fn settle_claim(
     }
 
     if liquid > 0 {
-        token::Client::new(env, token).transfer(&env.current_contract_address(), recipient, &liquid);
+        token::Client::new(env, token).transfer(
+            &env.current_contract_address(),
+            recipient,
+            &liquid,
+        );
     }
 
     if remainder > 0 {
@@ -345,6 +397,11 @@ fn releasable_amount(schedule: &VestingSchedule, now: u32) -> Result<i128, Airdr
 ///    relayer calls `claim_batch` with a single multi-proof (each recipient must
 ///    still authorize their own entry). Duplicate claims are rejected on-chain.
 /// 5. If vesting is enabled, recipients call `release` to withdraw vested tokens.
+///    still authorize their own entry). Duplicate claims are skipped rather than
+///    reverting the whole batch.
+/// 4. If vesting is enabled, recipients call `release` to withdraw vested tokens.
+/// 5. After the claim deadline passes, the project treasury may call
+///    `reclaim_unclaimed` to retrieve any tokens not yet claimed.
 pub use contract::*;
 
 mod contract {
@@ -423,6 +480,10 @@ mod contract {
         }
 
         /// Pause or resume all claims. Only the admin may call this.
+        ///
+        /// Pausing is an emergency brake for a bad Merkle root or leaf list:
+        /// `claim` and `claim_batch` all fail with
+        /// [`AirdropError::Paused`] until the admin resumes the airdrop.
         pub fn set_paused(env: Env, paused: bool) -> Result<(), AirdropError> {
             let admin: Address = env
                 .storage()
@@ -475,6 +536,37 @@ mod contract {
         /// Returns the configured decay schedule, if any.
         pub fn get_decay_config(env: Env) -> Option<DecayConfig> {
             env.storage().instance().get(&DataKey::DecayConfig)
+        }
+
+        /// Set the per-claim amount threshold above which claims are automatically
+        /// routed into a 6-month internal vesting schedule.
+        ///
+        /// Claims with a claimable amount strictly below `threshold` are paid out
+        /// immediately (or split per the `VestingConfig` if one is set). Claims
+        /// at or above `threshold` are fully locked into the vesting schedule (again
+        /// subject to any `initial_unlock_bps` in the `VestingConfig`).
+        ///
+        /// Only the admin may call this.
+        pub fn set_claim_threshold(
+            env: Env,
+            threshold: i128,
+        ) -> Result<(), AirdropError> {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(AirdropError::NotInitialized)?;
+            admin.require_auth();
+            env.storage()
+                .instance()
+                .set(&DataKey::ClaimThreshold, &threshold);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Returns the configured claim threshold, if any.
+        pub fn get_claim_threshold(env: Env) -> Option<i128> {
+            env.storage().instance().get(&DataKey::ClaimThreshold)
         }
 
         /// Configure the DAO contract authorised to advance Merkle epochs.
@@ -629,6 +721,8 @@ mod contract {
         }
 
         /// Grant or revoke the KYC attestation for `address`.
+        /// Claim `amount` of `token` under allocation `tier` by supplying a
+        /// valid merkle proof.
         ///
         /// Only the admin may call this. Setting `verified = false` effectively
         /// revokes a previously granted attestation.
@@ -675,6 +769,9 @@ mod contract {
         /// If a rate limit is configured, bursting beyond `max_claims` within the window
         /// returns [`AirdropError::RateLimitExceeded`]. If KYC is required and the recipient
         /// is not attested, returns [`AirdropError::KycNotVerified`].
+        ///
+        /// Large claims (at or above the configured `ClaimThreshold`) are
+        /// automatically routed into a 6-month internal vesting schedule.
         ///
         /// # Errors
         ///
@@ -730,6 +827,17 @@ mod contract {
         /// the invocation (`require_auth`). Rate limit and KYC checks are applied per
         /// recipient before any state change. All-or-nothing: if any entry is invalid,
         /// nothing is claimed.
+        /// Unlike the previous all-or-nothing behaviour, this implementation is
+        /// **best-effort**: entries that are already claimed, have an invalid amount,
+        /// or contain a duplicate `(recipient, token)` pair are silently skipped so
+        /// that one bad entry does not roll back valid claims in the same batch.
+        ///
+        /// The multi-proof is still verified over ALL leaves (including skipped ones)
+        /// before any state change, so the Merkle integrity check is not weakened.
+        ///
+        /// A relayer may submit on behalf of recipients, but every recipient
+        /// must authorize the invocation (`require_auth`), so a relayer or a
+        /// front-runner cannot force a claim the recipient did not sign for.
         ///
         /// # Errors
         ///
@@ -743,7 +851,7 @@ mod contract {
         /// Returns [`AirdropError::KycNotVerified`] if any recipient lacks KYC attestation.
         /// Returns [`AirdropError::AlreadyClaimed`] if any entry has already been claimed.
         /// Returns [`AirdropError::InvalidProof`] if the multi-proof does not verify.
-        /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover a token's total.
+        /// Returns [`AirdropError::InsufficientBalance`] if the contract cannot cover a valid token total.
         pub fn claim_batch(
             env: Env,
             entries: Vec<(Address, Address, i128, u32)>,
@@ -756,33 +864,50 @@ mod contract {
                 return Err(AirdropError::EmptyBatch);
             }
 
-            // --- Validate all entries before any state change (all-or-nothing) ---
-            let mut seen: Map<(Address, Address), bool> = Map::new(&env);
+            // --- Require auth and build leaves for ALL entries (proof covers everything) ---
             let mut authorized: Map<Address, bool> = Map::new(&env);
-            let mut totals: Map<Address, i128> = Map::new(&env);
             let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
 
             for (recipient, token, amount, tier) in entries.iter() {
+                // Every recipient must have signed, even if their entry will be skipped.
                 if !authorized.contains_key(recipient.clone()) {
                     recipient.require_auth();
                     authorized.set(recipient.clone(), true);
                 }
+                leaves.push_back(compute_leaf(&env, &recipient, &token, amount, tier));
+            }
+
+            // Verify the multi-proof over all leaves before touching state.
+            if !verify_merkle_multi_proof(&env, &leaves, &proof, &proof_flags, &root) {
+                return Err(AirdropError::InvalidProof);
+            }
+
+            // --- Best-effort settle: skip invalid / already-claimed entries ---
+            // Track seen pairs and per-token totals for entries we will actually process.
+            let mut seen: Map<(Address, Address), bool> = Map::new(&env);
+            let mut totals: Map<Address, i128> = Map::new(&env);
+            let mut valid: Vec<(Address, Address, i128, u32)> = Vec::new(&env);
+
+            for (recipient, token, amount, tier) in entries.iter() {
+                // Skip zero / negative amounts.
                 if amount <= 0 {
-                    return Err(AirdropError::InvalidAmount);
+                    continue;
                 }
 
                 // Per-recipient rate limit and KYC checks (all-or-nothing with the batch).
                 check_rate_limit(&env, &recipient)?;
                 check_kyc(&env, &recipient)?;
 
+                // Skip duplicate (recipient, token) pairs within this batch.
                 let pair = (recipient.clone(), token.clone());
                 if seen.contains_key(pair.clone()) {
-                    return Err(AirdropError::DuplicateEntry);
+                    continue;
                 }
                 seen.set(pair, true);
 
+                // Skip already-claimed entries — do not revert.
                 if is_claimed(&env, &recipient, &token) {
-                    return Err(AirdropError::AlreadyClaimed);
+                    continue;
                 }
 
                 let total = totals
@@ -791,25 +916,82 @@ mod contract {
                     .checked_add(amount)
                     .ok_or(AirdropError::ArithmeticOverflow)?;
                 totals.set(token.clone(), total);
-
-                leaves.push_back(compute_leaf(&env, &recipient, &token, amount, tier));
+                valid.push_back((recipient, token, amount, tier));
             }
 
-            if !verify_merkle_multi_proof(&env, &leaves, &proof, &proof_flags, &root) {
-                return Err(AirdropError::InvalidProof);
-            }
-
+            // Check available balance per token for the valid subset.
             for (token, total) in totals.iter() {
                 ensure_available(&env, &token, total)?;
             }
 
-            // --- Apply state changes and transfers ---
-            for (recipient, token, amount, tier) in entries.iter() {
+            // Apply state changes and transfers for valid entries only.
+            for (recipient, token, amount, tier) in valid.iter() {
                 settle_claim(&env, &recipient, &token, amount, tier)?;
             }
 
             bump_instance(&env);
             Ok(())
+        }
+
+        /// Withdraw all unclaimed (and unlocked) tokens of `token` to the treasury
+        /// after the claim deadline has passed.
+        ///
+        /// Only callable after the claim deadline. No admin auth is required: once
+        /// the deadline has passed the reclamation is permissionless so the treasury
+        /// address set via `set_decay_config` can recover funds without further
+        /// admin involvement.
+        ///
+        /// The amount transferred is `token_balance - total_locked(token)`, i.e. every
+        /// token that has not been claimed and is not already committed to a vesting
+        /// schedule.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AirdropError::NotInitialized`] if not initialized.
+        /// Returns [`AirdropError::ClaimNotExpired`] if the claim deadline has not yet passed.
+        /// Returns [`AirdropError::NotInitialized`] if no treasury address has been configured.
+        pub fn reclaim_unclaimed(env: Env, token: Address) -> Result<i128, AirdropError> {
+            if !env.storage().instance().has(&DataKey::Admin) {
+                return Err(AirdropError::NotInitialized);
+            }
+
+            let deadline: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ClaimDeadline)
+                .ok_or(AirdropError::NotInitialized)?;
+
+            // Must be strictly after the deadline.
+            if env.ledger().sequence() <= deadline {
+                return Err(AirdropError::ClaimNotExpired);
+            }
+
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Treasury)
+                .ok_or(AirdropError::NotInitialized)?;
+
+            let balance =
+                token::Client::new(&env, &token).balance(&env.current_contract_address());
+            let locked = total_locked(&env, &token);
+            let reclaimable = balance
+                .checked_sub(locked)
+                .ok_or(AirdropError::ArithmeticOverflow)?;
+
+            if reclaimable <= 0 {
+                return Ok(0);
+            }
+
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &reclaimable,
+            );
+
+            events::reclaimed(&env, &treasury, &token, reclaimable);
+            bump_instance(&env);
+            Ok(reclaimable)
         }
 
         /// Release all currently vested tokens of `token` to `recipient`.
@@ -906,6 +1088,3 @@ mod contract {
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod prop_test;

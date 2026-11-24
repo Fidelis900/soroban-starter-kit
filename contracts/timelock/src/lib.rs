@@ -5,13 +5,18 @@
 //! Locks tokens until a target ledger, after which the beneficiary can release
 //! them; the depositor may cancel while still active.
 
-use soroban_sdk::{Address, Env, Vec, contract, contractclient, contractimpl, token};
+use soroban_sdk::{
+    Address, BytesN, Env, Symbol, Val, Vec, contract, contractimpl, token,
+    xdr::ToXdr,
+};
 
 /// Number of tranches stored in persistent storage.
 const TRANCHE_COUNT: u32 = 0;
 
-/// Number of tokens tracked by a multi-token timelock instance.
-const TOKEN_COUNT: u32 = 1;
+/// Default grace period for queued governance transactions: ~14 days of
+/// 5-second ledgers. A transaction whose ETA is older than this can no longer
+/// be executed and must be re-queued.
+pub const DEFAULT_GRACE_PERIOD: u32 = 14 * 17_280;
 
 mod errors;
 mod events;
@@ -19,9 +24,20 @@ mod storage;
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod queue_test;
 
 pub use errors::TimelockError;
-pub use storage::{DataKey, ReleaseTranche, TimelockInfo, TimelockState};
+pub use storage::{
+    DataKey, QueuedTransaction, ReleaseTranche, TimelockInfo, TimelockState, TxState,
+};
+
+pub use staking_client::*;
+
+mod staking_client {
+    // `#[contractclient]` generates undocumented public items.
+    #![allow(missing_docs)]
+    use soroban_sdk::{Address, Env, contractclient};
 
 /// Minimal cross-contract interface for the staking contract used to generate
 /// yield on locked balances.
@@ -33,6 +49,7 @@ pub trait StakingContract {
     fn unstake(env: Env, staker: Address, amount: i128);
     /// Withdraw tokens that have finished unbonding for `staker`.
     fn withdraw(env: Env, staker: Address);
+}
 }
 
 use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD};
@@ -93,7 +110,7 @@ mod contract {
             if amount <= 0 {
                 return Err(TimelockError::InvalidAmount);
             }
-            soroban_common::validate_deadline(&env, release_ledger)
+            soroban_common::validate_deadline::<()>(&env, release_ledger)
                 .map_err(|_| TimelockError::InvalidReleaseLedger)?;
 
             admin.require_auth();
@@ -495,7 +512,7 @@ mod contract {
             }
 
             bump_instance(&env);
-            events::deposited_token(&env, &token, amount, release_ledger);
+            events::token_deposited(&env, &token, amount, release_ledger);
 
             Ok(())
         }
@@ -619,7 +636,7 @@ mod contract {
 
                 // Distribute principal to the beneficiary and any accrued yield
                 // to the designated yield recipient when staking is configured.
-                if let Some(staking) = staking_contract {
+                if staking_contract.is_some() {
                     let yield_recipient: Address = env
                         .storage()
                         .instance()
@@ -646,9 +663,9 @@ mod contract {
 
                     events::yield_distributed(
                         &env,
-                        &staking,
-                        &yield_recipient,
+                        &beneficiary,
                         amount,
+                        &yield_recipient,
                         yield_amount,
                     );
                 } else {
@@ -903,7 +920,7 @@ mod contract {
                 return Err(TimelockError::TrancheAlreadyReleased);
             }
 
-            soroban_common::validate_deadline(&env, new_release_ledger)
+            soroban_common::validate_deadline::<()>(&env, new_release_ledger)
                 .map_err(|_| TimelockError::InvalidReleaseLedger)?;
 
             let old_ledger = tranches.get(tranche_id).unwrap().release_ledger;
@@ -948,6 +965,193 @@ mod contract {
             events::beneficiary_reassigned(&env, &admin, &old_beneficiary, &new_beneficiary);
 
             Ok(())
+        }
+
+        // ── Governance transaction queue (#1504, #1505) ─────────────────────
+
+        /// Set the grace period (in ledgers) during which a queued transaction
+        /// may still execute after its ETA. Governance admin only.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TimelockError::NotInitialized`] if not yet set up.
+        /// Returns [`TimelockError::InvalidGracePeriod`] if `grace_period` is zero.
+        pub fn set_grace_period(env: Env, grace_period: u32) -> Result<(), TimelockError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+
+            if grace_period == 0 {
+                return Err(TimelockError::InvalidGracePeriod);
+            }
+
+            env.storage().instance().set(&GracePeriod, &grace_period);
+            bump_instance(&env);
+            events::grace_period_set(&env, &admin, grace_period);
+
+            Ok(())
+        }
+
+        /// Return the grace period in ledgers ([`DEFAULT_GRACE_PERIOD`] unless overridden).
+        #[must_use]
+        pub fn grace_period(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&GracePeriod)
+                .unwrap_or(DEFAULT_GRACE_PERIOD)
+        }
+
+        /// Queue a call to `function` on `target` with `args`, executable no
+        /// earlier than `delay` ledgers from now. Governance admin only.
+        ///
+        /// Returns the transaction hash: `sha256(xdr(target, function, args, eta))`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TimelockError::NotInitialized`] if not yet set up.
+        /// Returns [`TimelockError::InvalidDelay`] if `delay` is zero or overflows the ledger.
+        /// Returns [`TimelockError::TransactionAlreadyQueued`] if an identical
+        /// transaction with the same ETA already exists.
+        pub fn queue_transaction(
+            env: Env,
+            target: Address,
+            function: Symbol,
+            args: Vec<Val>,
+            delay: u32,
+        ) -> Result<BytesN<32>, TimelockError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+
+            if delay == 0 {
+                return Err(TimelockError::InvalidDelay);
+            }
+            let queued_at = env.ledger().sequence();
+            let eta = queued_at
+                .checked_add(delay)
+                .ok_or(TimelockError::InvalidDelay)?;
+
+            let tx_hash: BytesN<32> = env
+                .crypto()
+                .sha256(&(target.clone(), function.clone(), args.clone(), eta).to_xdr(&env))
+                .into();
+
+            let key = QueuedTx(tx_hash.clone());
+            if env.storage().persistent().has(&key) {
+                return Err(TimelockError::TransactionAlreadyQueued);
+            }
+
+            let tx = QueuedTransaction {
+                target: target.clone(),
+                function,
+                args,
+                queued_at,
+                eta,
+                state: TxState::Queued,
+            };
+            env.storage().persistent().set(&key, &tx);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            bump_instance(&env);
+
+            events::tx_queued(&env, &tx_hash, &target, eta);
+
+            Ok(tx_hash)
+        }
+
+        /// Execute a queued transaction. Governance admin only.
+        ///
+        /// Execution is only allowed inside the window
+        /// `queued_at + delay <= current_ledger <= queued_at + delay + grace_period`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TimelockError::NotInitialized`] if not yet set up.
+        /// Returns [`TimelockError::TransactionNotQueued`] if `tx_hash` is unknown.
+        /// Returns [`TimelockError::AlreadyCancelled`] if the transaction was cancelled.
+        /// Returns [`TimelockError::TransactionAlreadyExecuted`] if already executed.
+        /// Returns [`TimelockError::NotYetReleasable`] if the ETA has not been reached.
+        /// Returns [`TimelockError::TransactionExpired`] if the grace period has passed.
+        pub fn execute_transaction(env: Env, tx_hash: BytesN<32>) -> Result<Val, TimelockError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+
+            let key = QueuedTx(tx_hash.clone());
+            let mut tx: QueuedTransaction = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(TimelockError::TransactionNotQueued)?;
+            match tx.state {
+                TxState::Cancelled => return Err(TimelockError::AlreadyCancelled),
+                TxState::Executed => return Err(TimelockError::TransactionAlreadyExecuted),
+                TxState::Queued => {}
+            }
+
+            let now = env.ledger().sequence();
+            if now < tx.eta {
+                return Err(TimelockError::NotYetReleasable);
+            }
+            let grace = Self::grace_period(env.clone());
+            if now > tx.eta.saturating_add(grace) {
+                return Err(TimelockError::TransactionExpired);
+            }
+
+            // Mark executed before the external call so it cannot be re-entered.
+            tx.state = TxState::Executed;
+            env.storage().persistent().set(&key, &tx);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            bump_instance(&env);
+
+            let result: Val = env.invoke_contract(&tx.target, &tx.function, tx.args.clone());
+
+            events::tx_executed(&env, &tx_hash, &tx.target);
+
+            Ok(result)
+        }
+
+        /// Cancel a queued transaction so it can never be executed.
+        /// Governance admin only.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TimelockError::NotInitialized`] if not yet set up.
+        /// Returns [`TimelockError::TransactionNotQueued`] if `tx_hash` is unknown.
+        /// Returns [`TimelockError::AlreadyCancelled`] if already cancelled.
+        /// Returns [`TimelockError::TransactionAlreadyExecuted`] if already executed.
+        pub fn cancel_transaction(env: Env, tx_hash: BytesN<32>) -> Result<(), TimelockError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+
+            let key = QueuedTx(tx_hash.clone());
+            let mut tx: QueuedTransaction = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(TimelockError::TransactionNotQueued)?;
+            match tx.state {
+                TxState::Cancelled => return Err(TimelockError::AlreadyCancelled),
+                TxState::Executed => return Err(TimelockError::TransactionAlreadyExecuted),
+                TxState::Queued => {}
+            }
+
+            tx.state = TxState::Cancelled;
+            env.storage().persistent().set(&key, &tx);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_LIFETIME_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            bump_instance(&env);
+
+            events::tx_cancelled(&env, &tx_hash, &admin);
+
+            Ok(())
+        }
+
+        /// Return the queued transaction for `tx_hash`, if any.
+        #[must_use]
+        pub fn get_transaction(env: Env, tx_hash: BytesN<32>) -> Option<QueuedTransaction> {
+            env.storage().persistent().get(&QueuedTx(tx_hash))
         }
 
         /// Return full timelock details.

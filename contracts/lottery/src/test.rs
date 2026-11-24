@@ -80,6 +80,24 @@ fn setup(env: &Env) -> (LotteryContractClient, Address, Address) {
         &None,
         &None,
         &None,
+    );
+    (client, admin, token)
+}
+
+/// Set up with an explicit per-address ticket cap.
+fn setup_with_cap(env: &Env, cap: u32) -> (LotteryContractClient, Address, Address) {
+    let admin = Address::generate(env);
+    let token = env.register_contract(None, MockToken);
+    let addr = env.register_contract(None, LotteryContract);
+    let client = LotteryContractClient::new(env, &addr);
+    client.initialize(
+        &admin,
+        &token,
+        &100,
+        &1u32,
+        &single_winner_splits(env),
+        &Some(cap),
+        &None,
         &None,
     );
     (client, admin, token)
@@ -152,6 +170,18 @@ fn test_buy_ticket() {
     client.buy_ticket(&buyer);
     assert_eq!(client.get_info().total_tickets, 1);
     assert_eq!(client.get_ticket_count(&buyer), 1);
+}
+
+#[test]
+fn test_buy_tickets_batch_updates_count_correctly() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    client.buy_tickets_batch(&buyer, &5);
+    // The fix: stored count must be 5, not 1.
+    assert_eq!(client.get_ticket_count(&buyer), 5);
+    assert_eq!(client.get_info().total_tickets, 5);
 }
 
 #[test]
@@ -290,8 +320,8 @@ fn test_fee_bps_without_recipient_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let token = env.register(super::test::MockToken, ());
-    let addr = env.register(LotteryContract, ());
+    let token = env.register_contract(None, MockToken);
+    let addr = env.register_contract(None, LotteryContract);
     let client = LotteryContractClient::new(&env, &addr);
     client.initialize(
         &admin,
@@ -312,8 +342,8 @@ fn test_fee_config_accepted_and_draw_succeeds() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let fee_recipient = Address::generate(&env);
-    let token = env.register(super::test::MockToken, ());
-    let addr = env.register(LotteryContract, ());
+    let token = env.register_contract(None, MockToken);
+    let addr = env.register_contract(None, LotteryContract);
     let client = LotteryContractClient::new(&env, &addr);
 
     client.initialize(
@@ -324,6 +354,7 @@ fn test_fee_config_accepted_and_draw_succeeds() {
         &single_winner_splits(&env),
         &None,
         &Some(500u32),
+        &Some(500u32), // 5% rake
         &Some(fee_recipient),
         &None,
     );
@@ -588,4 +619,95 @@ fn test_rollover_accumulates_across_rounds() {
     // After draw the rollover balance is cleared.
     assert_eq!(client.get_rollover_balance(), 0);
     assert_eq!(client.get_info().state, LotteryState::Drawn);
+// Whale protection — per-account ticket purchase cap
+// ---------------------------------------------------------------------------
+
+/// A single address cannot buy more than the configured cap (50) in one round.
+/// Attempting to exceed it must return TicketCapExceeded (error #17).
+#[test]
+fn test_ticket_cap_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_with_cap(&env, 50);
+
+    let whale = Address::generate(&env);
+
+    // Buying exactly 50 tickets must succeed.
+    client.buy_tickets_batch(&whale, &50);
+    assert_eq!(client.get_ticket_count(&whale), 50);
+
+    // The 51st ticket must be rejected.
+    assert_eq!(
+        client.try_buy_ticket(&whale),
+        Err(Ok(LotteryError::TicketCapExceeded))
+    );
+    // Count remains at 50.
+    assert_eq!(client.get_ticket_count(&whale), 50);
+}
+
+/// Cap is enforced across multiple purchase calls, not just per single call.
+#[test]
+fn test_ticket_cap_accumulates_across_calls() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_with_cap(&env, 50);
+
+    let whale = Address::generate(&env);
+
+    client.buy_tickets_batch(&whale, &30);
+    assert_eq!(client.get_ticket_count(&whale), 30);
+
+    client.buy_tickets_batch(&whale, &20);
+    assert_eq!(client.get_ticket_count(&whale), 50);
+
+    // One more should be rejected.
+    assert_eq!(
+        client.try_buy_tickets_batch(&whale, &1),
+        Err(Ok(LotteryError::TicketCapExceeded))
+    );
+}
+
+/// A batch that would push the total over the cap is rejected in full.
+#[test]
+fn test_ticket_cap_batch_exceeding_cap_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_with_cap(&env, 50);
+
+    let whale = Address::generate(&env);
+    client.buy_tickets_batch(&whale, &40);
+
+    // Trying to buy 15 more (40 + 15 = 55 > 50) must fail.
+    assert_eq!(
+        client.try_buy_tickets_batch(&whale, &15),
+        Err(Ok(LotteryError::TicketCapExceeded))
+    );
+    // Count must not have changed.
+    assert_eq!(client.get_ticket_count(&whale), 40);
+}
+
+/// Other participants are unaffected by one address hitting the cap.
+#[test]
+fn test_ticket_cap_does_not_affect_other_buyers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_with_cap(&env, 50);
+
+    let whale = Address::generate(&env);
+    let retail = Address::generate(&env);
+
+    client.buy_tickets_batch(&whale, &50);
+    // Whale is capped, but retail can still buy.
+    client.buy_tickets_batch(&retail, &50);
+    assert_eq!(client.get_ticket_count(&retail), 50);
+    assert_eq!(client.get_info().total_tickets, 100);
+}
+
+/// Setting cap to 0 at initialize must be rejected (error #16).
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_zero_ticket_cap_rejected_at_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let _ = setup_with_cap(&env, 0);
 }

@@ -19,3 +19,5 @@ LotteryError::InvalidFeeConfig = 18
 LotteryError::InvalidSplitConfig = 19
 LotteryError::RolloverNotAvailable = 20
 LotteryError::InvalidBatchCount = 21
+LotteryError::InvalidBatchCount = 19
+LotteryError::RolloverNotAvailable = 20

@@ -33,6 +33,10 @@ pub enum LotteryError {
     RolloverNotAvailable = 20,
     /// `buy_tickets_batch` called with `count == 0`.
     InvalidBatchCount = 21,
+    /// `buy_tickets_batch` called with `count == 0`.
+    InvalidBatchCount = 19,
+    /// `rollover` called when conditions for a rollover are not met.
+    RolloverNotAvailable = 20,
 }
 
 impl_display_error!(
@@ -58,6 +62,8 @@ impl_display_error!(
     InvalidSplitConfig      => "invalid split config",
     RolloverNotAvailable    => "rollover not available",
     InvalidBatchCount       => "invalid batch count",
+    InvalidBatchCount       => "invalid batch count",
+    RolloverNotAvailable    => "rollover not available",
 );
 
 #[cfg(test)]
@@ -93,6 +99,8 @@ LotteryError::InvalidFeeConfig = {}\n\
 LotteryError::InvalidSplitConfig = {}\n\
 LotteryError::RolloverNotAvailable = {}\n\
 LotteryError::InvalidBatchCount = {}\n",
+LotteryError::InvalidBatchCount = {}\n\
+LotteryError::RolloverNotAvailable = {}\n",
             LotteryError::AlreadyInitialized as u32,
             LotteryError::NotInitialized as u32,
             LotteryError::Unauthorized as u32,
@@ -114,6 +122,8 @@ LotteryError::InvalidBatchCount = {}\n",
             LotteryError::InvalidSplitConfig as u32,
             LotteryError::RolloverNotAvailable as u32,
             LotteryError::InvalidBatchCount as u32,
+            LotteryError::InvalidBatchCount as u32,
+            LotteryError::RolloverNotAvailable as u32,
         )
     }
 

@@ -2,7 +2,6 @@
 #![allow(missing_docs)]
 
 use soroban_sdk::{contracttype, Address, BytesN};
-use soroban_sdk::{contracttype, Address};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -10,8 +9,6 @@ pub enum DataKey {
     Admin,
     VotingActive,
     RegisteredVoter(Address),
-    /// Voting weight assigned to a registered voter (#1329).
-    VoterWeight(Address),
     Voter(Address),
     /// Binary yes-vote counter (choice index 1).  Kept for backward compat.
     YesVotes,
@@ -49,40 +46,6 @@ pub enum DataKey {
     RankedVote(Address),
     /// Number of ranked-choice ballots cast.
     RankedVoteCount,
-    // ── result certification / tie-breaking (#1332, #1333) ─────────────────
-    /// Configured tie-breaker policy ([`crate::TieBreaker`]).
-    TieBreaker,
-    /// Choice index selected by the admin to break a tie, if any (`u32`).
-    TieResolution,
-    /// Immutable snapshot hash of the certified result (`BytesN<32>`).
-    CertifiedHash,
-    /// Winning choice index captured at certification (`u32`).
-    CertifiedWinner,
-    /// Ledger sequence at which the result was certified (`u32`).
-    CertifiedAt,
-}
-
-/// A single instant-runoff elimination round result.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct RoundResult {
-    /// Per-choice tallies for this round, indexed by choice index.
-    pub tallies: Vec<u32>,
-    /// Choice eliminated at the end of this round, or `None` for the final
-    /// round in which a majority winner was found.
-    pub eliminated: Option<u32>,
-    /// Choice that reached a majority in this round, if any.
-    pub winner: Option<u32>,
-}
-
-/// A stored commit-reveal commitment for a single voter.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Commitment {
-    /// `hash(voter ++ choice ++ salt)` submitted during the commit phase.
-    pub hash: BytesN<32>,
-    /// Ledger sequence at which the commitment was recorded.
-    pub committed_at: u32,
     // ── multi-ballot additions (#1127) ─────────────────────────────────────
     /// Number of ballots created so far; also the next ballot id to assign.
     BallotCount,
@@ -104,6 +67,18 @@ pub struct Commitment {
     BallotChoiceVotes(u32, u32),
     /// Whether the given voter has already voted in the given ballot.
     BallotVoter(u32, Address),
+    // ── voter eligibility whitelist (#1500) ─────────────────────────────────
+    /// Packed u128 BitSet word at the given word index (128-bit chunk).
+    ///
+    /// An address maps to a deterministic slot index via
+    /// `whitelist_slot_for(address)`.  Word index = slot / 128.
+    WhitelistWord(u32),
+    /// Total number of 128-bit words allocated in the BitSet.
+    WhitelistCapacity,
+    /// Mapping from an address to its assigned slot index in the BitSet.
+    WhitelistSlot(Address),
+    /// Counter tracking the next free slot index to assign.
+    WhitelistNextSlot,
 }
 
 /// A single instant-runoff elimination round result.

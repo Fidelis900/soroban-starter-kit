@@ -36,6 +36,12 @@ pub enum DataKey {
     TreasuryAddress,
     /// Carried-over prize pool balance from a no-winner rollover (instance storage, i128).
     RolloverBalance,
+    /// Total number of tickets sold across all participants (instance storage).
+    TotalTickets,
+    /// Per-index participant address entry (persistent storage).
+    Participant(u32),
+    /// Minimum number of distinct participants required for a draw (instance storage).
+    MinParticipants,
 }
 
 #[contracttype]

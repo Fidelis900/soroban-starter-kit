@@ -12,6 +12,10 @@ pub enum DataKey {
     MerkleRoot,
     /// Epoch-stamped Merkle root written by governance (instance). Key is the epoch number.
     MerkleRootEpoch(u32),
+    /// Current Merkle root as a 32-byte value stored as Bytes (instance).
+    MerkleRoot,
+    /// Per-epoch Merkle root keyed by epoch number (instance).
+    MerkleRoot(u32),
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
     /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).
@@ -40,6 +44,10 @@ pub enum DataKey {
     KycRequired,
     /// KYC attestation record for an address: set to `true` by the admin (persistent).
     KycAttestation(Address),
+    /// Token amount at or above which claims are routed into an internal vesting
+    /// schedule rather than paid out immediately. When absent, all claims are
+    /// liquid regardless of amount (instance, `i128`).
+    ClaimThreshold,
 }
 
 /// Time-decaying claim schedule.
