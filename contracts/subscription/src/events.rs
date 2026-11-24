@@ -312,3 +312,55 @@ pub fn keeper_charged(
         (plan_id.clone(), charged, bounty),
     );
 }
+
+/// Emitted when a subscriber pauses their subscription's billing.
+/// Topics: (Symbol, Address) — event name, subscriber
+pub fn paused(env: &Env, subscriber: &Address, plan_id: &Symbol) {
+    env.events().publish(
+        (Symbol::new(env, "paused"), subscriber.clone()),
+        plan_id.clone(),
+    );
+}
+
+/// Emitted when a subscriber resumes a paused subscription. The billing
+/// interval is shifted forward by the paused duration so paid days are kept.
+/// Topics: (Symbol, Address) — event name, subscriber
+pub fn resumed(env: &Env, subscriber: &Address, plan_id: &Symbol, frozen_ledgers: u32) {
+    env.events().publish(
+        (Symbol::new(env, "resumed"), subscriber.clone()),
+        (plan_id.clone(), frozen_ledgers),
+    );
+}
+
+/// Emitted when the provider schedules a plan price increase. The new price
+/// does not take effect until `effective_ledger`, giving subscribers a notice
+/// window during which they may cancel without penalty.
+/// Topics: (Symbol, Symbol) — event name, plan_id
+pub fn price_increase_scheduled(
+    env: &Env,
+    plan_id: &Symbol,
+    old_amount: i128,
+    new_amount: i128,
+    effective_ledger: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "price_increase_scheduled"), plan_id.clone()),
+        (old_amount, new_amount, effective_ledger),
+    );
+}
+
+/// Emitted when a scheduled price increase takes effect for a subscriber at
+/// their first charge after the notice window elapsed.
+/// Topics: (Symbol, Symbol) — event name, plan_id
+pub fn price_increase_applied(env: &Env, plan_id: &Symbol, new_amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "price_increase_applied"), plan_id.clone()), new_amount);
+}
+
+/// Emitted when the provider lowers (or keeps) a plan price, applied
+/// immediately to the plan for new subscribers.
+/// Topics: (Symbol, Symbol) — event name, plan_id
+pub fn plan_amount_updated(env: &Env, plan_id: &Symbol, new_amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "plan_amount_updated"), plan_id.clone()), new_amount);
+}

@@ -354,6 +354,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     client.set_paused(&true);
     assert!(client.is_paused());
     assert_eq!(
+        client.try_claim(&recipient, &token, &100, &TIER_1, &proof),
         client.try_claim(&recipient, &token, &100, &0u32, &proof),
         client.try_claim(&recipient, &token, &100, &1, &proof),
         Err(Ok(AirdropError::Paused))
@@ -363,6 +364,7 @@ fn pause_rejects_claims_and_resume_restores_them() {
     assert!(!client.is_paused());
     // Root is not set yet — pause is gone.
     assert_eq!(
+        client.try_claim(&recipient, &token, &100, &TIER_1, &proof),
         client.try_claim(&recipient, &token, &100, &0u32, &proof),
         client.try_claim(&recipient, &token, &100, &1, &proof),
         Err(Ok(AirdropError::RootNotSet))
@@ -428,14 +430,14 @@ fn decayed_payout_and_treasury_remainder() {
     assert_eq!(decay_bps(&config, 130), 5_000);
     // At ledger=500: same floor clamp.
     env.ledger().with_mut(|li| li.sequence_number = 50);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (1_000, 0));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (1_000, 0));
 
     env.ledger().with_mut(|li| li.sequence_number = 130);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (700, 300));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (700, 300));
     assert_eq!(decay_bps(&config, 130), 7_000);
 
     env.ledger().with_mut(|li| li.sequence_number = 500);
-    assert_eq!(decayed_amount(&env, 1_000).unwrap(), (500, 500));
+    assert_eq!(env.as_contract(&contract, || decayed_amount(&env, 1_000).unwrap()), (500, 500));
     assert_eq!(decay_bps(&config, 500), 5_000);
 
     // Verify 70/30 split with a config that has no floor.

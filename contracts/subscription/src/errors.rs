@@ -42,6 +42,12 @@ pub enum SubscriptionError {
     KeeperNotRegistered = 24,
     /// Keeper bounty is outside 0..=10_000 basis points.
     InvalidBounty = 25,
+    /// The subscription is paused; recurring billing is halted until resumed.
+    SubscriptionPaused = 26,
+    /// `pause_subscription` was called on a subscription that is already paused.
+    AlreadyPaused = 27,
+    /// `resume_subscription` was called on a subscription that is not paused.
+    NotPaused = 28,
 }
 
 impl_display_error!(
@@ -70,6 +76,9 @@ impl_display_error!(
     InvalidMaxBillingCycles => "max billing cycles must be at least one",
     KeeperNotRegistered    => "caller is not a registered keeper",
     InvalidBounty          => "invalid keeper bounty",
+    SubscriptionPaused    => "subscription is paused",
+    AlreadyPaused         => "subscription is already paused",
+    NotPaused             => "subscription is not paused",
 );
 
 #[cfg(test)]

@@ -9,6 +9,12 @@ use soroban_sdk::{Address, Bytes, Symbol, Vec, contracttype};
 /// retried before the subscription is suspended (issue #1485).
 pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 51_840;
 
+/// Minimum advance-notice window a provider must give before a plan price
+/// increase takes effect: 30 days at ~5 seconds per ledger
+/// (`30 * 24 * 60 * 60 / 5`). Subscribers may cancel without penalty during
+/// this window; the new price applies only once it has elapsed.
+pub const PRICE_NOTICE_LEDGERS: u32 = 518_400;
+
 /// Top-level storage keys used by [`SubscriptionContract`](crate::SubscriptionContract).
 #[contracttype]
 #[derive(Clone)]
@@ -44,6 +50,9 @@ pub enum DataKey {
     Keeper(Address),
     /// Keeper gas bounty in basis points of each charged amount (instance).
     KeeperBountyBps,
+    /// Scheduled plan price increase awaiting its notice window to elapse
+    /// (persistent): `(new_amount, effective_ledger)`.
+    PendingIncrease(Symbol),
 }
 
 /// Plan configuration that can be registered by the admin.
@@ -116,6 +125,12 @@ pub struct SubscriptionInfo {
     pub max_billing_cycles: Option<u32>,
     /// Whether the subscription is still active or has reached its term end.
     pub status: SubscriptionStatus,
+    /// Whether the subscriber has paused billing without cancelling. While
+    /// paused no recurring charge is collected and the billing interval is
+    /// frozen, so the paid period is not consumed by the pause.
+    pub paused: bool,
+    /// Ledger at which the current pause started, if any.
+    pub paused_at_ledger: Option<u32>,
 }
 
 /// Result of a single charge attempt that did not abort with an error.
