@@ -8,8 +8,10 @@ use soroban_sdk::{Address, contracttype};
 pub enum DataKey {
     /// Admin address (instance).
     Admin,
-    /// Merkle root as a 32-byte value stored as Bytes (instance).
+    /// Current Merkle root as a 32-byte value stored as Bytes (instance).
     MerkleRoot,
+    /// Per-epoch Merkle root keyed by epoch number (instance).
+    MerkleRoot(u32),
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
     /// Tier id under which `(recipient, token)` was claimed (persistent, `u32`).
@@ -32,6 +34,10 @@ pub enum DataKey {
     Governance,
     /// Current Merkle epoch (instance). Claimed bitmaps are shared across epochs.
     Epoch,
+    /// Token amount at or above which claims are routed into an internal vesting
+    /// schedule rather than paid out immediately. When absent, all claims are
+    /// liquid regardless of amount (instance, `i128`).
+    ClaimThreshold,
 }
 
 /// Time-decaying claim schedule.

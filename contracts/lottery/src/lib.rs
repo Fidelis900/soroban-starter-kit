@@ -18,8 +18,10 @@ mod storage;
 pub use errors::LotteryError;
 pub use storage::{Commit, DataKey, LotteryInfo, LotteryState};
 
-use soroban_common::{LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee, commit_hash,
-                     entropy_hash, entropy_index, BPS_DENOMINATOR};
+use soroban_common::{
+    BPS_DENOMINATOR, LEDGER_BUMP_AMOUNT, LEDGER_LIFETIME_THRESHOLD, apply_bps_fee, commit_hash,
+    entropy_hash, entropy_index,
+};
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -73,14 +75,11 @@ mod contract {
         ///
         /// `winner_count` sets how many distinct winners `draw` selects, and `prize_splits`
         /// gives each winner's share of the prize pool in basis points (must sum to 10 000).
-        /// `max_tickets_per_address`, if set, caps how many tickets a single address may buy.
+        /// `max_tickets_per_address`, if set, caps how many tickets a single address may buy
+        /// per round. Pass `Some(50)` to enforce the 50-ticket whale cap.
         /// `min_participants`, if set, is the minimum number of distinct participant addresses
         /// required before `draw` may succeed; if the threshold is not met the admin may call
         /// `rollover` to start a new round and carry the prize pool forward.
-        /// `fee_bps` is an optional operator rake in basis points (1–9 999). When set,
-        /// `fee_recipient` must also be provided; the fee is transferred to that address
-        /// at `draw` time before the winner prize pool is calculated.
-        ///
         /// `fee_bps` is an optional operator rake in basis points (1–9 999). When set,
         /// `fee_recipient` must also be provided; the fee is transferred to that address
         /// at `draw` time before the winner prize pool is calculated.
@@ -147,6 +146,11 @@ mod contract {
             env.storage().instance().set(&State, &LotteryState::Open);
             env.storage().instance().set(&WinnerCount, &winner_count);
             env.storage().instance().set(&PrizeSplits, &prize_splits);
+
+            // Seed the legacy Participants vec so get_required won't fail.
+            let empty: Vec<Address> = Vec::new(&env);
+            env.storage().instance().set(&Participants, &empty);
+
             if let Some(cap) = max_tickets_per_address {
                 env.storage().instance().set(&MaxTicketsPerAddress, &cap);
             }
@@ -222,24 +226,49 @@ mod contract {
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             let token_addr: Address = get_required(&env, &Token)?;
 
+            // Update legacy Participants vec (kept for backward-compat read access).
             let mut participants: Vec<Address> = get_required(&env, &Participants)?;
             participants.push_back(buyer.clone());
             env.storage().instance().set(&Participants, &participants);
 
-            // Update per-address ticket counter.
+            // Update per-address ticket counter — store the full new count, not +1.
             #[allow(clippy::arithmetic_side_effects)]
             let new_count = ticket_count + count;
             env.storage()
                 .persistent()
-                .set(&TicketCount(buyer.clone()), &(ticket_count + 1));
+                .set(&TicketCount(buyer.clone()), &new_count);
             env.storage().persistent().extend_ttl(
                 &TicketCount(buyer.clone()),
                 LEDGER_LIFETIME_THRESHOLD,
                 LEDGER_BUMP_AMOUNT,
             );
 
+            // Write indexed per-ticket entries to persistent storage.
+            let total_tickets: u32 = get_required(&env, &TotalTickets)?;
+            for offset in 0..count {
+                #[allow(clippy::arithmetic_side_effects)]
+                let idx = total_tickets + offset;
+                env.storage()
+                    .persistent()
+                    .set(&Participant(idx), &buyer.clone());
+                env.storage().persistent().extend_ttl(
+                    &Participant(idx),
+                    LEDGER_LIFETIME_THRESHOLD,
+                    LEDGER_BUMP_AMOUNT,
+                );
+            }
+
+            // Update global ticket counter.
+            #[allow(clippy::arithmetic_side_effects)]
+            let new_total = total_tickets + count;
+            env.storage().instance().set(&TotalTickets, &new_total);
+
             // Single token transfer for the whole batch.
-            #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::cast_possible_truncation,
+                clippy::as_conversions
+            )]
             let total_cost = ticket_price * count as i128;
             token::Client::new(&env, &token_addr).transfer(
                 &buyer,
@@ -409,19 +438,22 @@ mod contract {
 
             // Distribute the prize pool according to the configured splits.
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
-            #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::cast_possible_truncation,
+                clippy::as_conversions
+            )]
             let total_prize = ticket_price * total_tickets as i128;
             let token_addr: Address = get_required(&env, &Token)?;
             let token_client = token::Client::new(&env, &token_addr);
 
             // Deduct the operator rake if configured, then distribute the remainder.
-            let distributable_prize = if let Some(fee_bps) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&FeeBps)
+            let distributable_prize = if let Some(fee_bps) =
+                env.storage().instance().get::<DataKey, u32>(&FeeBps)
             {
                 #[allow(clippy::unwrap_used)] // fee_bps and fee_recipient are validated as a pair at initialize
-                let fee_recipient: Address = env.storage().instance().get(&FeeRecipient).unwrap();
+                let fee_recipient: Address =
+                    env.storage().instance().get(&FeeRecipient).unwrap();
                 let fee_amount = apply_bps_fee(total_prize, fee_bps).unwrap_or(0);
                 if fee_amount > 0 {
                     token_client.transfer(
@@ -432,7 +464,9 @@ mod contract {
                     events::fee_transferred(&env, &fee_recipient, fee_amount);
                 }
                 #[allow(clippy::arithmetic_side_effects)]
-                { total_prize - fee_amount }
+                {
+                    total_prize - fee_amount
+                }
             } else {
                 total_prize
             };
@@ -557,6 +591,9 @@ mod contract {
             let mut ticket_count: i128 = 0;
             let contract_addr = env.current_contract_address();
 
+            // Also rebuild participants vec excluding this buyer.
+            let mut remaining: Vec<Address> = Vec::new(&env);
+
             for idx in 0..total_tickets {
                 let key = Participant(idx);
                 #[allow(clippy::unwrap_used)]
@@ -566,17 +603,23 @@ mod contract {
                     {
                         ticket_count += 1;
                     }
+                    // Overwrite with sentinel so this slot is skipped on draw.
+                    env.storage().persistent().set(&key, &contract_addr);
                 } else {
-                    remaining.push_back(p);
+                    remaining.push_back(addr);
                 }
             }
 
             if ticket_count == 0 {
                 return Err(LotteryError::NothingToRefund);
             }
+
             env.storage().instance().set(&Participants, &remaining);
+
             // Clear the persistent TicketCount so this address can participate in future rounds.
-            env.storage().persistent().remove(&TicketCount(buyer.clone()));
+            env.storage()
+                .persistent()
+                .remove(&TicketCount(buyer.clone()));
 
             let ticket_price: i128 = get_required(&env, &TicketPrice)?;
             #[allow(clippy::arithmetic_side_effects)]

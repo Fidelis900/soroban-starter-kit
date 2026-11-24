@@ -40,6 +40,8 @@ pub enum AirdropError {
     Paused = 16,
     /// Decay parameters are out of range.
     InvalidDecayConfig = 17,
+    /// `reclaim_unclaimed` called before the claim deadline has passed.
+    ClaimNotExpired = 18,
 }
 
 #[cfg(test)]
