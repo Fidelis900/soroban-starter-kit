@@ -36,14 +36,29 @@ pub fn fee_transferred(env: &Env, recipient: &Address, amount: i128) {
     );
 }
 
+/// Emitted when the community treasury share is transferred at draw time.
+pub fn treasury_paid(env: &Env, treasury: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "treasury_paid"), treasury.clone()),
+        amount,
+    );
+}
+
 pub fn refund_claimed(env: &Env, buyer: &Address, amount: i128) {
     env.events()
         .publish((Symbol::new(env, "refund_claimed"), buyer.clone()), amount);
 }
 
-pub fn fee_transferred(env: &Env, recipient: &Address, amount: i128) {
-    env.events().publish(
-        (Symbol::new(env, "fee_transferred"), recipient.clone()),
-        amount,
-    );
+pub fn rolled_over(env: &Env, admin: &Address) {
+    env.events()
+        .publish((Symbol::new(env, "rolled_over"), admin.clone()), ());
+}
+
+/// Emitted on a no-winner rollover, carrying the accumulated balance forward.
+///
+/// `carried_balance` is the total prize pool (including any previously rolled
+/// over amounts) that will seed the next round's jackpot.
+pub fn jackpot_rollover(env: &Env, carried_balance: i128) {
+    env.events()
+        .publish((Symbol::new(env, "jackpot_rollover"),), carried_balance);
 }

@@ -147,34 +147,6 @@ pub(crate) fn push_history(env: &Env, price: i128, timestamp: u64) {
 /// where `now` == `timestamp`), the last price is returned unchanged.
 #[allow(clippy::arithmetic_side_effects, clippy::integer_division)]
 pub(crate) fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
-fn push_asset_history(env: &Env, asset: &Symbol, price: i128, timestamp: u64) {
-    let key = DataKey::AssetHistory(asset.clone());
-    let mut history: Vec<PriceObservation> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    history.push_back(PriceObservation { price, timestamp });
-    while history.len() > MAX_HISTORY {
-        history.pop_front();
-    }
-    env.storage().persistent().set(&key, &history);
-    env.storage().persistent().extend_ttl(
-        &key,
-        LEDGER_LIFETIME_THRESHOLD,
-        LEDGER_BUMP_AMOUNT,
-    );
-}
-
-fn exceeds_deviation(previous: i128, next: i128, max_deviation_bps: u32) -> bool {
-    if max_deviation_bps == 0 || previous <= 0 {
-        return false;
-    }
-    let difference = next.saturating_sub(previous).abs();
-    difference.saturating_mul(10_000) > previous.saturating_mul(i128::from(max_deviation_bps))
-}
-
-fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
     let len = observations.len();
     if len == 1 {
         return observations.get_unchecked(0).price;
@@ -205,6 +177,78 @@ fn twap(observations: &Vec<PriceObservation>, now: u64) -> i128 {
         return observations.get_unchecked(len - 1).price;
     }
     weighted_sum / total_weight
+}
+
+fn push_asset_history(env: &Env, asset: &Symbol, price: i128, timestamp: u64) {
+    let key = DataKey::AssetHistory(asset.clone());
+    let mut history: Vec<PriceObservation> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+    history.push_back(PriceObservation { price, timestamp });
+    while history.len() > MAX_HISTORY {
+        history.pop_front();
+    }
+    env.storage().persistent().set(&key, &history);
+    env.storage().persistent().extend_ttl(
+        &key,
+        LEDGER_LIFETIME_THRESHOLD,
+        LEDGER_BUMP_AMOUNT,
+    );
+}
+
+fn exceeds_deviation(previous: i128, next: i128, max_deviation_bps: u32) -> bool {
+    if max_deviation_bps == 0 || previous <= 0 {
+        return false;
+    }
+    let difference = next.saturating_sub(previous).abs();
+    difference.saturating_mul(10_000) > previous.saturating_mul(i128::from(max_deviation_bps))
+}
+
+/// Filter statistical outliers from a sorted price list using the
+/// interquartile range (IQR) method.
+///
+/// Prices outside `[Q1 - 1.5 * IQR, Q3 + 1.5 * IQR]` are dropped.  When
+/// fewer than four prices are present the data is too sparse for reliable
+/// outlier detection, so all values are returned unchanged.
+#[allow(clippy::arithmetic_side_effects, clippy::integer_division)]
+fn filter_outliers(env: &soroban_sdk::Env, sorted: &Vec<i128>) -> Vec<i128> {
+    let len = sorted.len();
+    // Need at least 4 data points to compute meaningful quartiles.
+    if len < 4 {
+        return sorted.clone();
+    }
+
+    let q1_idx = len / 4;
+    let q3_idx = (len * 3) / 4;
+    let q1 = sorted.get_unchecked(q1_idx);
+    let q3 = sorted.get_unchecked(q3_idx);
+
+    // IQR = Q3 - Q1 (always non-negative since `sorted` is ascending).
+    let iqr = q3.saturating_sub(q1);
+
+    // fence = 1.5 * IQR (integer arithmetic; multiply by 3 and divide by 2).
+    let fence = iqr.saturating_mul(3) / 2;
+
+    let lower = q1.saturating_sub(fence);
+    let upper = q3.saturating_add(fence);
+
+    let mut filtered: Vec<i128> = Vec::new(env);
+    for i in 0..len {
+        let v = sorted.get_unchecked(i);
+        if v >= lower && v <= upper {
+            filtered.push_back(v);
+        }
+    }
+
+    // Guard: if all prices are identical the IQR collapses to 0 and every
+    // price is within the fence — `filtered` will equal `sorted`.
+    if filtered.is_empty() {
+        return sorted.clone();
+    }
+
+    filtered
 }
 
 /// Compute the exponential moving average over `observations`, which must be
@@ -459,12 +503,19 @@ mod contract {
 
         /// Submit a price as an authorized publisher.
         ///
+        /// Rejects the submission if the publisher already submitted in the
+        /// current ledger (`SubmissionTooFrequent`), or if the number of
+        /// ledgers elapsed since the data was originated exceeds the configured
+        /// `max_submission_age` (`SubmissionTooOld`, issue #1501).
+        ///
         /// # Errors
         /// - [`OracleError::Unauthorized`] if `publisher` is not in the set configured
         ///   via `set_publishers`.
         /// - [`OracleError::SubmissionTooFrequent`] if `publisher` already submitted
         ///   in the current ledger (at least one ledger must pass between submissions).
-        pub fn submit_price(env: Env, publisher: Address, price: i128) -> Result<(), OracleError> {
+        /// - [`OracleError::SubmissionTooOld`] if `data_ledger` is older than the
+        ///   configured maximum ledger delta (issue #1501).
+        pub fn submit_price(env: Env, publisher: Address, price: i128, data_ledger: u32) -> Result<(), OracleError> {
             publisher.require_auth();
 
             let publishers: Vec<Address> = env
@@ -477,6 +528,20 @@ mod contract {
             }
 
             let ledger = env.ledger().sequence();
+
+            // Issue #1501: reject submissions whose originating ledger is older
+            // than the configured maximum delta.
+            if let Some(max_age) = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&MaxSubmissionAge)
+            {
+                let age = ledger.saturating_sub(data_ledger);
+                if age > max_age {
+                    return Err(OracleError::SubmissionTooOld);
+                }
+            }
+
             let ledger_key = LastSubmissionLedger(publisher.clone());
             if let Some(last) = env.storage().persistent().get::<_, u32>(&ledger_key) {
                 if ledger <= last {
@@ -512,6 +577,11 @@ mod contract {
         ///
         /// Submissions older than `max_staleness_seconds` are excluded from the median
         /// to prevent stale data from offline publishers from skewing the result.
+        ///
+        /// Statistical outliers are filtered using the interquartile range (IQR)
+        /// method before computing the median (issue #1502). Prices outside
+        /// `[Q1 - 1.5 * IQR, Q3 + 1.5 * IQR]` are dropped. When fewer than four
+        /// fresh submissions are available the outlier filter is bypassed.
         ///
         /// A minimum publisher quorum can be configured via [`Self::set_min_quorum`].
         /// When set, at least that many fresh submissions must be present, otherwise
@@ -556,7 +626,24 @@ mod contract {
                 return Err(OracleError::InsufficientQuorum);
             }
 
-            Ok(median(&mut prices))
+            // Sort prices for outlier filtering and median computation.
+            let mut sorted: Vec<i128> = prices.clone();
+            let sorted_len = sorted.len();
+            for i in 1..sorted_len {
+                let key_val = sorted.get_unchecked(i);
+                let mut j = i;
+                while j > 0 && sorted.get_unchecked(j - 1) > key_val {
+                    let prev = sorted.get_unchecked(j - 1);
+                    sorted.set(j, prev);
+                    j -= 1;
+                }
+                sorted.set(j, key_val);
+            }
+
+            // Issue #1502: remove statistical outliers via IQR before computing median.
+            let filtered = filter_outliers(&env, &sorted);
+
+            Ok(median(&mut filtered.clone()))
         }
 
         /// Compute the time-weighted average price over the last `window` seconds.
@@ -623,6 +710,8 @@ mod contract {
 
             bump_instance(&env);
             Ok(ema(&history, smoothing_bps))
+        }
+
         // -----------------------------------------------------------------------
         // Multi-asset price feed (#1259)
         // -----------------------------------------------------------------------
@@ -776,6 +865,8 @@ mod contract {
                 .instance()
                 .get(&History)
                 .unwrap_or(Vec::new(&env))
+        }
+
         /// Configure feed metadata without changing its current price.
         pub fn configure_asset_feed(
             env: Env,
@@ -941,6 +1032,169 @@ mod contract {
                 .persistent()
                 .get(&PublisherBond(publisher))
                 .unwrap_or(0)
+        }
+
+        // -----------------------------------------------------------------------
+        // Issue #1501 — Staleness threshold for publisher submissions
+        // -----------------------------------------------------------------------
+
+        /// Set the maximum number of ledgers between the current ledger and the
+        /// originating ledger of a publisher submission. Submissions whose
+        /// `data_ledger` falls more than `max_age` ledgers in the past are
+        /// rejected with [`OracleError::SubmissionTooOld`].
+        ///
+        /// A value of `0` disables the check (any ledger delta is accepted).
+        ///
+        /// # Errors
+        /// - [`OracleError::NotInitialized`] if not yet set up.
+        /// - [`OracleError::Unauthorized`] if caller is not the admin.
+        pub fn set_max_submission_age(env: Env, max_age: u32) -> Result<(), OracleError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+            env.storage().instance().set(&MaxSubmissionAge, &max_age);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------------
+        // Issue #1503 — Slash publishers whose prices deviate from consensus
+        // -----------------------------------------------------------------------
+
+        /// Set the consensus tolerance in basis points.
+        ///
+        /// A publisher whose latest submission deviates from the current
+        /// `get_median_price` by more than `tolerance_bps` basis points can be
+        /// slashed via [`Self::slash_publisher_for_deviation`].
+        ///
+        /// # Errors
+        /// - [`OracleError::NotInitialized`] if not yet set up.
+        /// - [`OracleError::Unauthorized`] if caller is not the admin.
+        /// - [`OracleError::InvalidDeviationThreshold`] if `tolerance_bps` exceeds 10 000.
+        pub fn set_consensus_tolerance_bps(
+            env: Env,
+            tolerance_bps: u32,
+        ) -> Result<(), OracleError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+            if tolerance_bps > 10_000 {
+                return Err(OracleError::InvalidDeviationThreshold);
+            }
+            env.storage()
+                .instance()
+                .set(&ConsensusToleranceBps, &tolerance_bps);
+            bump_instance(&env);
+            Ok(())
+        }
+
+        /// Slash a publisher's bond when their latest submission deviates beyond
+        /// the configured consensus tolerance (issue #1503).
+        ///
+        /// The caller provides `max_staleness_seconds` (forwarded to the
+        /// `get_median_price` logic) and `penalty`, which is transferred from the
+        /// publisher's bond to the insurance fund if the deviation check fails.
+        ///
+        /// # Errors
+        /// - [`OracleError::NotInitialized`] if not yet set up.
+        /// - [`OracleError::Unauthorized`] if caller is not the admin.
+        /// - [`OracleError::BondingNotConfigured`] if bonding has not been set up.
+        /// - [`OracleError::NoPublisherData`] if the publisher has no fresh submission.
+        /// - [`OracleError::InsufficientBond`] if the publisher's bond is below `penalty`.
+        /// - [`OracleError::InvalidPrice`] if `penalty` is zero or negative.
+        #[allow(clippy::arithmetic_side_effects)]
+        pub fn slash_publisher_for_deviation(
+            env: Env,
+            publisher: Address,
+            penalty: i128,
+            max_staleness_seconds: u64,
+        ) -> Result<(), OracleError> {
+            let admin: Address = get_required(&env, &Admin)?;
+            admin.require_auth();
+
+            if penalty <= 0 {
+                return Err(OracleError::InvalidPrice);
+            }
+
+            // If tolerance is 0, every submission is within tolerance — skip slash.
+            let tolerance_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&ConsensusToleranceBps)
+                .unwrap_or(0);
+            if tolerance_bps == 0 {
+                return Ok(());
+            }
+
+            // Retrieve bonding configuration.
+            let token_contract: Address = env
+                .storage()
+                .instance()
+                .get(&BondToken)
+                .ok_or(OracleError::BondingNotConfigured)?;
+            let insurance_fund: Address = env
+                .storage()
+                .instance()
+                .get(&InsuranceFund)
+                .ok_or(OracleError::BondingNotConfigured)?;
+
+            // Fetch the publisher's latest submission.
+            let submission: PublisherSubmission = env
+                .storage()
+                .persistent()
+                .get(&Submission(publisher.clone()))
+                .ok_or(OracleError::NoPublisherData)?;
+
+            // Verify the submission is fresh enough to be part of consensus.
+            let now = env.ledger().timestamp();
+            let age = now.saturating_sub(submission.timestamp);
+            if age > max_staleness_seconds {
+                return Err(OracleError::NoPublisherData);
+            }
+
+            // Compute the consensus median using fresh publisher submissions.
+            let publishers: Vec<Address> = get_required(&env, &Publishers)?;
+            let mut prices: Vec<i128> = Vec::new(&env);
+            for pub_addr in publishers.iter() {
+                if let Some(sub) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, PublisherSubmission>(&Submission(pub_addr))
+                {
+                    let sub_age = now.saturating_sub(sub.timestamp);
+                    if sub_age <= max_staleness_seconds {
+                        prices.push_back(sub.price);
+                    }
+                }
+            }
+            if prices.is_empty() {
+                return Err(OracleError::NoPublisherData);
+            }
+            let consensus = median(&mut prices);
+
+            // Check whether the publisher's submission deviates beyond tolerance.
+            let difference = submission.price.saturating_sub(consensus).abs();
+            let threshold =
+                consensus.saturating_mul(i128::from(tolerance_bps)) / i128::from(BPS_DENOMINATOR);
+
+            if difference <= threshold {
+                // Submission is within tolerance; no slash needed.
+                return Ok(());
+            }
+
+            // Slash: transfer `penalty` from publisher bond to insurance fund.
+            let bond_key = PublisherBond(publisher);
+            let bond: i128 = env.storage().persistent().get(&bond_key).unwrap_or(0);
+            if bond < penalty {
+                return Err(OracleError::InsufficientBond);
+            }
+            token::Client::new(&env, &token_contract).transfer(
+                &env.current_contract_address(),
+                &insurance_fund,
+                &penalty,
+            );
+            env.storage()
+                .persistent()
+                .set(&bond_key, &bond.saturating_sub(penalty));
+            Ok(())
         }
     }
 }

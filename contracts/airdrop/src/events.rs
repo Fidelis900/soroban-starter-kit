@@ -11,25 +11,29 @@ pub fn paused(env: &Env, paused: bool) {
 
 pub fn decay_config_set(env: &Env, treasury: &Address, config: &crate::DecayConfig) {
     env.events().publish(
-        (Symbol::new(env, "decay_config_set"),),
+        (Symbol::new(env, "decay_cfg_set"),),
         (treasury.clone(), config.clone()),
     );
 }
 
 pub fn epoch_root_updated(env: &Env, epoch: u32, root: &Bytes, deadline: u32) {
     env.events().publish(
-        (Symbol::new(env, "epoch_root_updated"), epoch),
+        (Symbol::new(env, "epoch_root_upd"), epoch),
         (root.clone(), deadline),
     );
 }
 
 pub fn decay_remainder(env: &Env, treasury: &Address, token: &Address, amount: i128) {
     env.events().publish(
-        (Symbol::new(env, "decay_remainder"),),
+        (symbol_short!("decay_rem"),),
         (treasury.clone(), token.clone(), amount),
     );
 }
 
+/// Emitted on every successful claim.
+///
+/// The tier id is included both as a topic (so indexers can filter claims per
+/// tier) and in the data payload.
 /// Emitted on every successful claim. The tier id is included both as a topic
 /// (so indexers can filter claims per tier) and in the data payload.
 pub fn claimed(env: &Env, recipient: &Address, token: &Address, amount: i128, tier: u32) {
@@ -50,5 +54,25 @@ pub fn released(env: &Env, recipient: &Address, token: &Address, amount: i128) {
     env.events().publish(
         (symbol_short!("released"),),
         (recipient.clone(), token.clone(), amount),
+    );
+}
+
+/// Emitted when the admin configures or updates the per-address rate limit.
+pub fn rate_limit_set(env: &Env, window_ledgers: u32, max_claims: u32) {
+    env.events().publish(
+        (Symbol::new(env, "rate_limit_set"),),
+        (window_ledgers, max_claims),
+    );
+}
+
+/// Emitted when the admin grants or revokes KYC attestation for an address.
+pub fn kyc_attestation_set(env: &Env, address: &Address, verified: bool) {
+    env.events().publish(
+        (Symbol::new(env, "kyc_attestation_set"), address.clone()),
+        verified,
+pub fn reclaimed(env: &Env, treasury: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("reclaimed"),),
+        (treasury.clone(), token.clone(), amount),
     );
 }

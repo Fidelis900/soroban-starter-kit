@@ -11,6 +11,13 @@ pub enum DataKey {
     /// Merkle root as a 32-byte value stored as Bytes, keyed by campaign epoch
     /// (instance). Epoch 0 is the root set by `set_root`; governance updates
     /// install later epochs while keeping prior ones for history.
+    /// Current Merkle root as 32-byte Bytes (instance).
+    MerkleRoot,
+    /// Epoch-stamped Merkle root written by governance (instance). Key is the epoch number.
+    MerkleRootEpoch(u32),
+    /// Current Merkle root as a 32-byte value stored as Bytes (instance).
+    MerkleRoot,
+    /// Per-epoch Merkle root keyed by epoch number (instance).
     MerkleRoot(u32),
     /// Whether `(recipient, token)` has already been claimed (persistent).
     Claimed(Address, Address),
@@ -34,6 +41,16 @@ pub enum DataKey {
     Governance,
     /// Current Merkle epoch (instance). Claimed bitmaps are shared across epochs.
     Epoch,
+    /// Rate-limit configuration applied to `claim` and `claim_batch` (instance).
+    RateLimitConfig,
+    /// Whether KYC attestation is required to claim (instance, bool).
+    KycRequired,
+    /// KYC attestation record for an address: set to `true` by the admin (persistent).
+    KycAttestation(Address),
+    /// Token amount at or above which claims are routed into an internal vesting
+    /// schedule rather than paid out immediately. When absent, all claims are
+    /// liquid regardless of amount (instance, `i128`).
+    ClaimThreshold,
 }
 
 /// Time-decaying claim schedule.
@@ -82,4 +99,18 @@ pub struct VestingSchedule {
     pub start_ledger: u32,
     /// Vesting duration in ledgers.
     pub duration_ledgers: u32,
+}
+
+/// Per-ledger rate-limit configuration for `claim` and `claim_batch`.
+///
+/// Each address is allowed at most `max_claims` claims within any sliding
+/// window of `window_ledgers` ledgers. The namespace used for
+/// `soroban_common::check_and_record` is `1u32` (airdrop-claim namespace).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateLimitConfig {
+    /// Size of the sliding window in ledgers (must be ≥ 1).
+    pub window_ledgers: u32,
+    /// Maximum number of claims allowed per address within one window.
+    pub max_claims: u32,
 }

@@ -26,6 +26,22 @@ pub enum DataKey {
     FeeBps,
     /// Recipient address for the fee amount.
     FeeRecipient,
+    /// Total number of tickets sold across all buys (instance storage).
+    TotalTickets,
+    /// Participant address stored at ticket index `n` (persistent storage).
+    Participant(u32),
+    /// Minimum number of distinct participant addresses required before draw.
+    MinParticipants,
+    /// Community treasury address that receives 10% of each prize pool.
+    TreasuryAddress,
+    /// Carried-over prize pool balance from a no-winner rollover (instance storage, i128).
+    RolloverBalance,
+    /// Total number of tickets sold across all participants (instance storage).
+    TotalTickets,
+    /// Per-index participant address entry (persistent storage).
+    Participant(u32),
+    /// Minimum number of distinct participants required for a draw (instance storage).
+    MinParticipants,
 }
 
 #[contracttype]
